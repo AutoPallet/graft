@@ -12,12 +12,12 @@
 //!   7. Exec real linker                 (with pruned .o's + scripts)
 //!   8. Package                          (M0.5: just write overlay.elf)
 //!
-//! This file does 1–4 + 6; pruning lives in `prune.rs`; step 7 shells
-//! out to `ld`.
+//! Steps 1–4 + 6 live here; pruning lives in `prune.rs`; step 7 shells
+//! out to the real `ld` via `$GRAFT_REAL_LD`.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -29,6 +29,7 @@ use crate::hash::TransHash;
 use crate::metadata::{
     self, GraftManifest, SCHEMA_VERSION, SECTION_MANIFEST, SECTION_SYMHASH, SymHashEntry,
 };
+use crate::prune;
 use crate::scan::{self, ScanResult};
 
 pub fn link(argv: Vec<String>) -> ExitCode {
@@ -60,21 +61,66 @@ fn run(argv: Vec<String>) -> Result<()> {
 
     let closure = compute_closure(&scan, &base)?;
 
+    // Scratch dir next to the output path. Cleaned and recreated each
+    // run so stale pruned .o's from a prior invocation don't confuse
+    // the real linker.
+    let work_dir = work_dir_for(&output);
+    if work_dir.exists() {
+        let _ = std::fs::remove_dir_all(&work_dir);
+    }
+    std::fs::create_dir_all(&work_dir)
+        .with_context(|| format!("create {}", work_dir.display()))?;
+
+    // Prune each source object; collect the pruned-.o paths.
+    let pruned = prune_all(&scan, &closure, &work_dir)?;
+    let renamed_total: usize = pruned.iter().map(|p| p.renamed_locals).sum();
+    let kept_sec_total: usize = pruned.iter().map(|p| p.kept_sections).sum();
+
+    // Write base_symbols.ld.
+    let ld_script = work_dir.join("base_symbols.ld");
+    write_base_symbols_ld(&closure, &ld_script)?;
+
+    // Path the real overlay ELF lands at (sidecar to cargo's output).
+    let overlay_elf = work_dir.join("overlay.elf");
+
+    if pruned.is_empty() {
+        // No closure → overlay is "no-op". Emit an empty ET_REL so
+        // downstream tooling has something valid to look at rather than
+        // invoking `ld -r` with zero inputs (it errors out).
+        write_empty_relocatable(&overlay_elf)?;
+    } else {
+        let ld_status = run_real_linker(&pruned, &ld_script, &overlay_elf)?;
+        if !ld_status.success() {
+            bail!(
+                "real linker exited with {ld_status} (see {})",
+                work_dir.display()
+            );
+        }
+    }
+
+    // Write a stub to cargo's `-o` path so cargo sees success. `graft
+    // combine` (M0.5.e) merges base.elf + overlay.elf → final artifact.
+    std::fs::write(&output, b"graft-overlay-stub\n")
+        .with_context(|| format!("write stub {}", output.display()))?;
+
     let summary = format!(
-        "graft overlay: base {} symhash entries · overlay {} objects / {} sections · \
-         closure {} sections · provides {} globals / {} locals · scan {:.1?}\n",
+        "graft overlay: base {} symhash · overlay {} objs / {} sections · \
+         closure {} sections · provides {} globals / {} locals · \
+         pruned {} objs / {} sections / {} renamed-locals · total {:.1?}\n\
+         overlay.elf: {}\n",
         base.symhash_by_name.len(),
         scan.objects.len(),
         scan.graph.nodes.len(),
         closure.closure.len(),
         closure.provide_globals.len(),
         closure.provide_locals.len(),
+        pruned.len(),
+        kept_sec_total,
+        renamed_total,
         t_start.elapsed(),
+        overlay_elf.display(),
     );
     eprint!("{summary}");
-
-    // Cargo swallows a successful linker's stderr, so optionally mirror
-    // to a file. `$GRAFT_LOG=path` turns it on.
     if let Ok(p) = std::env::var("GRAFT_LOG") {
         let _ = std::fs::write(&p, {
             let mut body = summary.into_bytes();
@@ -83,13 +129,110 @@ fn run(argv: Vec<String>) -> Result<()> {
         });
     }
 
-    // M0.5.d intermediate checkpoint: we stop here and write a marker
-    // file so cargo sees a successful build. Pruning + real link land
-    // in the next commit.
-    std::fs::write(&output, b"graft-overlay-stub\n")
-        .with_context(|| format!("write stub {}", output.display()))?;
-
     Ok(())
+}
+
+fn work_dir_for(output: &Path) -> PathBuf {
+    // `target/debug/app` → `target/debug/app.graft-work`
+    let mut p = output.as_os_str().to_os_string();
+    p.push(".graft-work");
+    PathBuf::from(p)
+}
+
+struct PrunedEntry {
+    path: PathBuf,
+    kept_sections: usize,
+    renamed_locals: usize,
+}
+
+fn prune_all(scan: &ScanResult, closure: &Closure, work_dir: &Path) -> Result<Vec<PrunedEntry>> {
+    // Group closure sections by object.
+    let mut by_obj: HashMap<u32, HashSet<u32>> = HashMap::new();
+    for &nid in &closure.closure {
+        let nm = &scan.graph.nodes[nid as usize];
+        by_obj.entry(nm.object).or_default().insert(nm.section);
+    }
+
+    let mut out: Vec<PrunedEntry> = Vec::new();
+    for (obj_idx, keep_set) in by_obj {
+        let input = &scan.inputs[obj_idx as usize];
+        let parsed = &scan.objects[obj_idx as usize];
+        let p = prune::prune_object(&input.bytes, parsed.tu_id, &keep_set)
+            .with_context(|| format!("prune {}", input.label()))?;
+        // Derive a stable filename — rcgu-object basename, flattened.
+        let stem = input
+            .member_name
+            .as_deref()
+            .map(|n| n.replace('/', "_"))
+            .unwrap_or_else(|| {
+                input
+                    .source_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("obj")
+                    .to_string()
+            });
+        let filename = format!("{obj_idx:04}_{stem}");
+        let path = work_dir.join(&filename);
+        std::fs::write(&path, &p.bytes)
+            .with_context(|| format!("write {}", path.display()))?;
+        out.push(PrunedEntry {
+            path,
+            kept_sections: p.kept_sections,
+            renamed_locals: p.renamed_locals,
+        });
+    }
+    // Sort for deterministic linker invocation order.
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+fn write_base_symbols_ld(closure: &Closure, path: &Path) -> Result<()> {
+    use std::fmt::Write;
+    let mut s = String::new();
+    writeln!(s, "/* Generated by graft overlay: PROVIDEs base addresses for overlay's UND refs. */").unwrap();
+    for (name, addr, _) in &closure.provide_globals {
+        writeln!(s, "PROVIDE({name} = {addr:#x});").unwrap();
+    }
+    for (name, tu, addr, _) in &closure.provide_locals {
+        let tu_hex: String = tu.iter().map(|b| format!("{b:02x}")).collect();
+        writeln!(s, "PROVIDE(\"{name}@{tu_hex}\" = {addr:#x});").unwrap();
+    }
+    std::fs::write(path, s).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+fn write_empty_relocatable(path: &Path) -> Result<()> {
+    use object::{Architecture, BinaryFormat, Endianness, write::Object as WObject};
+    let out = WObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+    let bytes = out.write().map_err(|e| anyhow!("write empty ET_REL: {e}"))?;
+    std::fs::write(path, bytes).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+fn run_real_linker(
+    pruned: &[PrunedEntry],
+    ld_script: &Path,
+    output: &Path,
+) -> Result<std::process::ExitStatus> {
+    let real = std::env::var("GRAFT_REAL_LD").unwrap_or_else(|_| "ld".into());
+    let mut cmd = Command::new(&real);
+    // `-r` = relocatable output, meaning ld produces an ET_REL-ish
+    // partial link instead of trying to build a full executable. That
+    // matches what overlay wants for M0.5: a self-contained chunk
+    // `graft combine` can splice into the final app.elf. No entry point,
+    // no libc, no program headers.
+    cmd.arg("-r");
+    cmd.arg("-o").arg(output);
+    cmd.arg("-T").arg(ld_script);
+    for p in pruned {
+        cmd.arg(&p.path);
+    }
+    // Suppress "cannot find entry symbol" style warnings that don't
+    // apply to a relocatable link.
+    cmd.env_remove("LD_PRELOAD");
+    let status = cmd.status().with_context(|| format!("exec {real}"))?;
+    Ok(status)
 }
 
 pub(crate) struct BaseMetadata {

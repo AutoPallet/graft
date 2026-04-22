@@ -86,6 +86,20 @@ pub fn build(objects: &[ParsedObject]) -> Graph {
         }
     }
 
+    // Per-object section-name → local section index. Used to resolve
+    // `<section:...>` reloc targets (STT_SECTION / RelocationTarget::
+    // Section) to the right NodeId within the same .o.
+    let section_by_name_per_obj: Vec<HashMap<&str, u32>> = objects
+        .iter()
+        .map(|obj| {
+            obj.sections
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.name.as_str(), i as u32))
+                .collect()
+        })
+        .collect();
+
     // Edges: walk each section's relocs, resolve targets.
     let mut edges: Vec<Vec<NodeId>> = vec![Vec::new(); nodes.len()];
     let mut external_counts: Vec<u32> = vec![0; nodes.len()];
@@ -93,10 +107,19 @@ pub fn build(objects: &[ParsedObject]) -> Graph {
         for (si, sec) in obj.sections.iter().enumerate() {
             let nid = node_of[&(oi as u32, si as u32)];
             for r in &sec.relocs {
-                // Try global first, then local with this object's tu_id.
-                let target = symbols.resolve_global(&r.target).or_else(|| {
-                    symbols.resolve_local(&r.target, obj.tu_id)
-                });
+                // STT_SECTION / direct-section targets are encoded as
+                // `<section:name>` by elf::parse. Resolve those within
+                // the current object's sections; everything else goes
+                // through the flat symbol index.
+                let target = if let Some(sec_name) = strip_section_marker(&r.target) {
+                    section_by_name_per_obj[oi]
+                        .get(sec_name)
+                        .map(|&s_i| node_of[&(oi as u32, s_i)])
+                } else {
+                    symbols
+                        .resolve_global(&r.target)
+                        .or_else(|| symbols.resolve_local(&r.target, obj.tu_id))
+                };
                 match target {
                     Some(t) if t != nid => edges[nid as usize].push(t),
                     Some(_) => {
@@ -193,6 +216,10 @@ pub fn tarjan_scc(graph: &Graph) -> SccResult {
     }
 
     SccResult { scc_of_node, members }
+}
+
+fn strip_section_marker(s: &str) -> Option<&str> {
+    s.strip_prefix("<section:").and_then(|t| t.strip_suffix('>'))
 }
 
 pub struct SccResult {
