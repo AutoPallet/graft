@@ -150,15 +150,12 @@ ICF-folded, COMDAT-deduped, weakly overridden) don't appear in
 will miss on them and include their defining section from its own
 inputs.
 
-**Name-collision detection.** ELF permits multiple `STB_LOCAL`
-symbols with the same name (different TUs). When publishing
-`.graft.symhash`, walk the joined table and check for duplicate
-names. On duplicates: disambiguate by appending `.<st_value:x>` to
-each colliding entry's name, and record the renaming in
-`.graft.manifest.collisions` so overlay mode can apply the same
-rewriting when looking up a reloc target. In practice rustc v0
-mangling hashes make collisions vanishingly rare, so the common path
-hits zero renames.
+**STB_LOCAL tagging.** For each entry joined into `.graft.symhash`,
+if the pre-scan recorded the symbol as STB_LOCAL, tag it with
+`tu = Some(tu_id)` where `tu_id = blake3(source_object_bytes)[:8]`.
+Globals get `tu = None`. This lets overlay mode disambiguate
+same-named locals from different TUs when they appear, without
+renaming anything in the published table.
 
 ### Attach `.graft.*` sections
 
@@ -183,7 +180,7 @@ graft::overlay::link(argv) →
     load_base_metadata()          // 2
     hash_and_graph_overlay()      // 3
     compute_closure()             // 4
-    assemble_consolidated_obj()   // 5
+    prune_per_input_obj()         // 5
     generate_base_symbols_ld()    // 6
     generate_overlay_header()     // 7
     real_link(...)                // 8
@@ -230,21 +227,50 @@ defined in the closure that `base.symhash` knows about (libc from
 prebuilt `.a`, linker-provided, etc.). Base's bind doesn't matter —
 PROVIDE defines a new global in the overlay's link regardless.
 
-### 5. Assemble consolidated object
+### 5. Prune each input `.o`
 
-Build one synthetic `.o` file containing every closure section, with
-relocations rewritten to point at internal section indices where the
-target is also in the closure, and left pointing at external symbol
-names where the target resolves via `base_symbols.ld`. `object` crate
-writes it directly — no intermediate `ld -r`.
+One pruned `.o` per source `.o`, each retaining only that file's
+closure-member sections. Feed them all to `ld` as separate inputs —
+easier to generate than a single consolidated object and it preserves
+each input's local-symbol namespace, which matters for STB_LOCAL
+disambiguation (below).
+
+Per file:
+
+- Read the source `.o`.
+- Keep every section in the closure; drop the rest.
+- For each surviving section's relocations, look at the target:
+  - **Target is STB_GLOBAL:** leave the reloc as-is; it becomes an
+    undefined external ref resolved by `base_symbols.ld` or by a
+    surviving section in another pruned `.o`.
+  - **Target is STB_LOCAL, *defining section also surviving in this
+    file:*** leave as-is. ld resolves intra-file via the file's
+    (trimmed) local symbol table.
+  - **Target is STB_LOCAL, defining section *pruned* (or target is a
+    base-only local we need to PROVIDE):** rename to
+    `<name>@<tu_id>` with STB_GLOBAL bind. Matching PROVIDE is
+    emitted in `base_symbols.ld`.
+- Trim the `.symtab` to entries referenced by surviving sections or
+  definitions within them.
+- Write the pruned `.o`.
+
+`tu_id` is the object file's content hash, computed during pre-scan
+(same value in base and overlay for byte-identical `.o`s — stable
+disambiguation).
 
 ### 6. Generate `base_symbols.ld`
 
-For each unique external symbol referenced by closure relocs, emit:
+For each unique external symbol referenced by any pruned `.o`'s
+unresolved relocs, emit:
+
 ```
-PROVIDE( symbol_name = 0xADDRESS );
+PROVIDE( <name> = 0x<address> );                   /* global case */
+PROVIDE( <name>@<tu_id> = 0x<address> );           /* local case */
 ```
-Read addresses from `.graft.symidx`. Typical size: 100-500 entries.
+
+Addresses come from `.graft.symhash`: globals match by `(name,
+tu=None)`; locals by `(name, tu=Some(tu_id))`. Typical size: 100-500
+entries.
 
 ### 7. Generate overlay header
 
@@ -260,7 +286,7 @@ binary. Populated with:
 
 ### 8. Real link
 
-Exec `GRAFT_REAL_LD` with: the consolidated object, `-T
+Exec `GRAFT_REAL_LD` with: the pruned `.o`s, `-T
 overlay_layout.ld`, `-T base_symbols.ld`, `-nostdlib`,
 `--build-id=sha1`, output at a side-channel path (e.g.
 `target/graft/overlay.elf`). Write a tiny stub ELF at argv's `-o`
@@ -318,9 +344,13 @@ One record per symbol live in base's final `.symtab`:
 #[derive(Serialize, Deserialize)]
 struct SymHashEntry {
     name: String,             // mangled symbol name, as in .symtab
-                               // (disambiguated with a hex-address
-                               // suffix if base had a STB_LOCAL
-                               // collision — see base-mode attach)
+    tu: Option<[u8; 8]>,      // None for STB_GLOBAL; Some(tu_id) for
+                               // STB_LOCAL. tu_id is the first 8 bytes
+                               // of blake3(source_object_bytes),
+                               // stable across runs for byte-identical
+                               // inputs. Overlay uses it to pick the
+                               // right local when multiple base .o's
+                               // define the same name.
     trans_hash: [u8; 16],     // truncated blake3 transitive hash of
                                // defining section (bytes +
                                // canonical relocs + SCC-successor
@@ -334,14 +364,23 @@ struct SymHashEntry {
 }
 ```
 
-Serialized as a `Vec<SymHashEntry>` sorted by `name` for binary search
-during overlay-mode lookups. Typical size: ~10k symbols × ~72 B =
-~720 KB. Truncated blake3 is fine — we're comparing known sections
-against cached hashes, not doing crypto.
+Serialized as `Vec<SymHashEntry>` sorted by `(name, tu)` for binary
+search. Typical size: ~10k symbols × ~80 B = ~800 KB. Truncated
+blake3 is fine — we're comparing known sections against cached
+hashes, not doing crypto.
 
-Both globals and locals appear in this table. `PROVIDE` in the
-overlay's linker script defines a new global regardless of what
-bind the symbol had in base, so the overlay doesn't care.
+Lookup during overlay mode:
+
+- Overlay's pruned-`.o` reloc targeting a global: look up `(name,
+  None)`. One entry, unambiguous.
+- Overlay's pruned-`.o` reloc targeting a local whose defining
+  section was pruned: look up `(name, Some(tu_id))` where `tu_id`
+  is the hash of the source `.o` that contained the reference.
+  If overlay's `.o` is byte-identical to base's corresponding `.o`,
+  the `tu_id`s match and the right local is picked.
+
+Globals and locals coexist in the table; names don't need
+disambiguation in storage because the tuple key is unique.
 
 ### Why in-ELF rather than sidecars
 

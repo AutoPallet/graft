@@ -225,14 +225,16 @@ Properties:
 
 ### 3. Overlay assembly
 
-Closure is materialized by reading each section's bytes + relocations
-from its source `.rcgu.o`, emitting a single consolidated input object,
-and handing that to `ld` alongside `-T overlay_layout.ld` and the
-minimal `base_symbols.ld`. Standard ELF surgery via the `object` crate —
-no persistent fallback archive, no pre-LTO caching, no custom resolution
-logic. Every section the overlay needs is present as either (a) a local
-definition in the consolidated object or (b) a PROVIDE'd address in the
-script.
+Closure is materialized by pruning each source `.rcgu.o` down to its
+closure-member sections, and handing the resulting set of pruned
+`.o`s to `ld` alongside `-T overlay_layout.ld` and the minimal
+`base_symbols.ld`. Per-file pruning (rather than consolidation into
+one object) preserves each file's local symbol namespace, which
+matters for disambiguating same-named STB_LOCAL symbols across TUs —
+overlay generates `name@<tu_id>` PROVIDEs when a pruned-away local
+needs to be reached. Every section the overlay needs is present as
+either (a) a local definition in one of the pruned inputs or (b) a
+PROVIDE'd address in the script.
 
 Properties:
 
@@ -246,7 +248,7 @@ Properties:
 
 Xtensa's `ld` is the slowest step of the tooling — minimize its work:
 
-1. **Hand `ld` exactly the closure.** A single consolidated input object
+1. **Hand `ld` exactly the closure.** A set of pruned `.o`s
    containing only closure sections, not every rlib with
    `--gc-sections`. Linker's job shrinks to "relocate N sections into
    overlay layout."
@@ -342,13 +344,12 @@ streams, or linker-script tricks required:
 
 `PROVIDE` creates a new global in the overlay's own link, so it
 works for any symbol name regardless of what bind that symbol had in
-base. The only snag is name collisions in base's `.symtab`: two
-`STB_LOCAL` symbols with identical mangled names (different TUs) are
-valid in ELF but ambiguous for our lookup-by-name PROVIDE. Base-mode
-detects collisions at attach time and either disambiguates by
-appending a hex address suffix or fails with a diagnostic — rustc v0
-mangling includes per-symbol hashes, so collisions are very rare in
-practice.
+base. STB_LOCALs with identical mangled names across different TUs
+are valid in ELF and disambiguated by storing a `tu_id` (source
+`.o` content hash) alongside the name in `.graft.symhash`. Overlay's
+per-`.o` pruning preserves each file's local namespace and generates
+PROVIDEs of the form `name@tu_id = address` for pruned-away locals
+it needs to reach.
 
 The only nonstandard linker flags we need on base are the section-
 granularity ones (`-ffunction-sections -fdata-sections`) plus keeping
@@ -375,12 +376,11 @@ in any section the overlay needs that GC removed from base.
    - Emit minimal `base_symbols.ld` — PROVIDE entries for every
      hash-hit symbol and for every external reloc target resolved via
      base's `.symtab`.
-   - Assemble one consolidated input object: concatenate closure section
-     bytes, carry their relocations (rewritten to be internally
-     consistent).
+   - Prune each input `.o` to its closure-member sections; rename
+     pruned-target locals to `name@tu_id` and globalize.
    - Invoke `ld` with: `-T overlay_layout.ld`, the generated minimal
-     `base_symbols.ld`, `-nostdlib`, and the consolidated object as the
-     sole input. Output: `overlay.elf`.
+     `base_symbols.ld`, `-nostdlib`, and the pruned `.o`s as inputs.
+     Output: `overlay.elf`.
    - Write an `OverlayHeader` into the image (a
      `#[link_section = ".overlay_header"] #[no_mangle] static` in
      whichever closure-resident crate owns it, or a post-link patcher).
