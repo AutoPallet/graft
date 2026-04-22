@@ -345,11 +345,13 @@ streams, or linker-script tricks required:
 `PROVIDE` creates a new global in the overlay's own link, so it
 works for any symbol name regardless of what bind that symbol had in
 base. STB_LOCALs with identical mangled names across different TUs
-are valid in ELF and disambiguated by storing a `tu_id` (source
-`.o` content hash) alongside the name in `.graft.symhash`. Overlay's
-per-`.o` pruning preserves each file's local namespace and generates
-PROVIDEs of the form `name@tu_id = address` for pruned-away locals
-it needs to reach.
+are valid in ELF and disambiguated by storing a `tu_id` alongside
+the name in `.graft.symhash` — a *structural* translation-unit
+identifier (derived from the `.o`'s canonical CGU name, not its
+bytes) so it's stable across in-TU edits. Overlay's per-`.o`
+pruning preserves each file's local namespace and generates PROVIDEs
+of the form `name@tu_id = address` for pruned-away locals it needs
+to reach.
 
 The only nonstandard linker flags we need on base are the section-
 granularity ones (`-ffunction-sections -fdata-sections`) plus keeping
@@ -675,7 +677,19 @@ pin rustc version in `rust-toolchain.toml`, strip `.llvm.<hash>`
 suffixes in canonical reloc encoding, exclude section names from
 hashes (already the case — noting it here for completeness).
 
-This is cheap to run and de-risks a foundational assumption.
+Also resolves: **what derives a stable `tu_id`.** Candidates in
+descending preference:
+
+1. `.o` filename with drifting hash segments stripped.
+2. First `STT_FILE` entry in the `.o`'s `.symtab`.
+3. Hash of sorted STB_GLOBAL symbol names defined in the `.o`.
+
+Verify that the chosen candidate is stable across: in-TU body edits,
+unrelated function additions in a different TU, and build
+reruns with no changes.
+
+This milestone is cheap to run and de-risks two foundational
+assumptions.
 
 ### M0.5 — x86-64 Linux prototype (~1 week)
 

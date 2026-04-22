@@ -152,10 +152,28 @@ inputs.
 
 **STB_LOCAL tagging.** For each entry joined into `.graft.symhash`,
 if the pre-scan recorded the symbol as STB_LOCAL, tag it with
-`tu = Some(tu_id)` where `tu_id = blake3(source_object_bytes)[:8]`.
-Globals get `tu = None`. This lets overlay mode disambiguate
-same-named locals from different TUs when they appear, without
-renaming anything in the published table.
+`tu = Some(tu_id)`. Globals get `tu = None`.
+
+`tu_id` is a *structural* identifier for the translation unit —
+stable across edits within that TU, so that overlay's rebuilt TU
+shares a tu_id with base's original TU. Working candidate:
+`blake3(canonical_tu_name)[:8]` where `canonical_tu_name` is derived
+from the `.o`'s rustc-assigned name (crate + CGU index, with any
+content-hash segments stripped). Exact derivation pinned down in
+M0.25 — it's one of the stability questions to answer
+empirically. Candidates in descending order of preference:
+
+1. The `.o`'s filename with known-drifting hash segments stripped
+   (e.g., `my_crate.foo-cgu.0` pulled from
+   `my_crate-abc123.foo-cgu.0-def456.rcgu.o`).
+2. The first `STT_FILE` entry in the `.o`'s `.symtab` (rustc
+   emits one naming the CGU).
+3. Hash of the sorted list of `STB_GLOBAL` symbol names defined in
+   the `.o` — stable under in-TU edits as long as the public
+   surface is unchanged.
+
+All three should agree for well-behaved builds; M0.25 verifies
+which is actually reliable.
 
 ### Attach `.graft.*` sections
 
@@ -254,9 +272,9 @@ Per file:
   definitions within them.
 - Write the pruned `.o`.
 
-`tu_id` is the object file's content hash, computed during pre-scan
-(same value in base and overlay for byte-identical `.o`s — stable
-disambiguation).
+`tu_id` is the structural TU identifier (see base-mode post-link) —
+stable across edits within the TU, so the same rebuilt TU keeps its
+tu_id across base and overlay builds.
 
 ### 6. Generate `base_symbols.ld`
 
@@ -345,12 +363,16 @@ One record per symbol live in base's final `.symtab`:
 struct SymHashEntry {
     name: String,             // mangled symbol name, as in .symtab
     tu: Option<[u8; 8]>,      // None for STB_GLOBAL; Some(tu_id) for
-                               // STB_LOCAL. tu_id is the first 8 bytes
-                               // of blake3(source_object_bytes),
-                               // stable across runs for byte-identical
-                               // inputs. Overlay uses it to pick the
-                               // right local when multiple base .o's
-                               // define the same name.
+                               // STB_LOCAL. tu_id is a *structural*
+                               // translation-unit identifier that's
+                               // stable across edits within a TU —
+                               // i.e., overlay's rebuilt TU keeps the
+                               // same tu_id as base's original.
+                               // Derivation: blake3(canonical_tu_name)
+                               // truncated to 8 bytes; canonical_tu_name
+                               // is the .o's rustc-assigned CGU name
+                               // with hash suffixes stripped. See
+                               // M0.25 for the stability audit.
     trans_hash: [u8; 16],     // truncated blake3 transitive hash of
                                // defining section (bytes +
                                // canonical relocs + SCC-successor
@@ -375,9 +397,11 @@ Lookup during overlay mode:
   None)`. One entry, unambiguous.
 - Overlay's pruned-`.o` reloc targeting a local whose defining
   section was pruned: look up `(name, Some(tu_id))` where `tu_id`
-  is the hash of the source `.o` that contained the reference.
-  If overlay's `.o` is byte-identical to base's corresponding `.o`,
-  the `tu_id`s match and the right local is picked.
+  is the structural id of the source `.o` that contained the
+  reference. Because `tu_id` is derived from the TU's canonical
+  name (not its contents), overlay's rebuilt TU shares a tu_id
+  with base's original — even after in-TU edits — so the right
+  local is picked.
 
 Globals and locals coexist in the table; names don't need
 disambiguation in storage because the tuple key is unique.
