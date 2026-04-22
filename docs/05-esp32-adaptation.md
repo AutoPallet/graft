@@ -589,8 +589,8 @@ subcommand or a separate `dx-esp-combine` binary.
 
 Works for the non-stacked case too: `combine(base, single_overlay)`
 gives you a debuggable ELF for the current edit cycle even without
-stacking landed. Natural to build in M4 as a quality-of-life tool, then
-extend to n-overlay when stacking ships.
+stacking landed. On x86 (M0.5) this is the *primary* build output and
+gets the tool written first; extends to n-overlay when stacking ships.
 
 ## Milestones
 
@@ -607,41 +607,49 @@ exercises the interesting parts with a fast iteration loop.
 
 Shape:
 
-- Two-crate workspace: `base/` (launcher) and `app/` (user code =
-  overlay contents).
-- Base built with `relocation-model=static` (non-PIE) so its symbols
-  have fixed link-time addresses. System ASLR left alone globally.
-- Base launcher:
-  - Reads `./overlay.bin`.
-  - `mmap(MAP_FIXED_NOREPLACE | MAP_ANONYMOUS | MAP_PRIVATE)` at a high
-    fixed address (e.g. `0x5_0000_0000`) — well clear of executable,
-    heap, and default mmap placements.
-  - Copies bytes in, `mprotect` R+X, validates header, calls
-    `header.entry`.
-- Overlay linked at the mmap address via a small linker script; header
-  at offset 0.
-- `dx-esp` shim in base + overlay modes: emits content hashes, computes
-  closure, consolidates sections, invokes `ld`.
+- Two-crate workspace: `base/` + `app/` (user code = overlay contents).
+- Both built with `relocation-model=static` (non-PIE) so the linker
+  chooses absolute addresses. Overlay linked against a
+  `base_symbols.ld` extracted from base's symbol table, and at an
+  overlay address range disjoint from base's (e.g. `0x5_0000_0000`).
+- **Primary build output is a combined ELF** (`app.elf`), synthesized
+  from the two linked ELFs by the same host tool that builds the
+  snapshot artifact on embedded. Matching sections merged; DWARF
+  concatenated; `.symtab` collapsed shadow-chain-newest-wins.
+- Base defines `main`; `main` calls through an `extern "C"` entry
+  symbol that the overlay provides — the exact shape we use on
+  embedded (`OverlayHeader.entry` there, a plain symbol here).
+- No launcher, no runtime `mmap`, no `MAP_FIXED`, no ASLR fight.
+  `./app.elf` is just a static ELF the OS loader places normally.
+- `dx-esp` shim in base + overlay modes: emits content hashes,
+  computes closure, consolidates sections, invokes `ld`, then runs
+  the combine step.
 
 Deliverables:
 
-- Edit `app/src/main.rs` → `DX_ESP=overlay cargo build` rewrites
-  `overlay.bin` → re-run base → new code executes.
+- Edit `app/src/main.rs` → `DX_ESP=overlay cargo build` rewrites the
+  overlay ELF and the combined `app.elf` → `./app.elf` runs new code.
 - Instrument shim to print closure members. Characterize closure sizes
   on representative edits (leaf edit, mid-graph edit, top-of-graph
   edit). Compare overlay size to full-app size.
 - Validate that resolved symbols go to the right place: base symbols
-  resolve via `base_symbols.ld`, overlay-internal resolve locally. Make
-  sure returning-from-overlay-into-base works for standard library
-  calls.
+  resolve via `base_symbols.ld`, overlay-internal resolve locally,
+  returning-from-overlay-into-base works for standard library calls.
+- `gdb ./app.elf` works out of the box — breakpoints on overlay
+  functions land correctly (forcing-function for the combined-ELF
+  tool's correctness).
 
 What it does not exercise: `-mlongcalls`, esptool, partition tables,
-ESP-IDF startup, reboot cycles, XIP mapping. Those all come back at M1.
+ESP-IDF startup, reboot cycles, XIP mapping, on-device delivery.
+Those all come back at M1.
 
-Faithfulness to the embedded model: non-PIE base + `MAP_FIXED` means
-`base_symbols.ld` has identical format across prototype and embedded —
-absolute addresses chosen by the linker. No ASLR-rebasing pass, no
-runtime fixups.
+Why combined-ELF-as-primary-output is a better fit than a runtime
+launcher on x86: no ASLR workarounds, no `mmap`/`mprotect` ceremony,
+native debuggability, and the combined-ELF code — which we want to
+build for embedded debugging anyway — gets tested on the critical
+path from day one. On embedded, the delivered artifact is still a raw
+overlay blob (bytes-on-wire minimization); the combined ELF there
+remains a host-side byproduct.
 
 ### M1 — two-region boot, hard split (3-5 days)
 
@@ -686,8 +694,9 @@ containing only that function's closure up to `main`.
 - Profile `ld`; if it exceeds ~40% of loop time, replace with an
   in-driver linker.
 - `BASE_ABI_VERSION` mismatch UX.
-- `dx-esp snapshot` combined-ELF tool (base + single overlay first;
-  extends to n-overlay when stacking ships).
+- `dx-esp snapshot` combined-ELF tool for embedded debugging — port of
+  the M0.5 x86 combine step to emit the snapshot as a byproduct of
+  the embedded build.
 - Optional: start exploring the hot-patch extension.
 
 ## Open questions
