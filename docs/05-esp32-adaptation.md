@@ -374,15 +374,17 @@ proceeds.
   "ready for overlay" prompt, push bytes, have base jump. No flash
   write.
 
-## Xtensa specifics
+## ESP32-S3 and Xtensa specifics
 
-### `-mlongcalls` is non-negotiable
+Most of this plan is generic ELF/object work. A short enumeration of
+what isn't, tagged by scope:
 
-`call8` is PC-relative ±512 KB. Overlay-to-base distances routinely
-exceed this; base-internal calls might too after `-ffunction-sections`
-since sections are not guaranteed contiguous.
+### ISA-level (Xtensa, one flag)
 
-`-mlongcalls` makes the compiler emit:
+**`-mlongcalls` is non-negotiable.** `call8` is PC-relative ±512 KB;
+overlay-to-base distances routinely exceed this and base-internal calls
+might too once `-ffunction-sections` scatters functions. `-mlongcalls`
+makes the compiler emit:
 
 ```
 l32r   a8, .L_literal   ; 3 bytes, reads abs addr from literal pool
@@ -394,26 +396,46 @@ at every call site. No separate trampoline; the sequence is inline. 5
 bytes and ~1 cycle overhead vs. a direct `call8`. This is the ISA floor —
 there is no longer-reach direct call instruction on Xtensa.
 
-### Literals are per-image
+Analogues on other ISAs if we ever target them: ARM `-mlong-calls`,
+AArch64 `-mcmodel=large`, RISC-V `-mcmodel=medany`, x86-64 needs nothing
+(`call rel32` already reaches ±2 GB).
 
-Each image (base, overlay) generates its own literal pool. Overlay
-literals live in overlay's `.literal` section; base literals in base's.
-Cross-image calls resolve via linker-written literals (our
-`base_symbols.ld` PROVIDEs feed directly into the `R_XTENSA_32`
-relocation on the overlay's literal word).
+### ISA-level (bookkeeping, not implementation)
 
-### Windowed ABI
+**Literal pools are per-image.** Overlay literals live in overlay's
+`.literal`; base's in base's. Cross-image calls resolve via linker-
+written literals — our `base_symbols.ld` PROVIDEs feed the
+`R_XTENSA_32` relocation on the overlay's literal word. We don't touch
+literal pool layout; `ld` handles it.
 
-Shared across images by construction — same rustc, same toolchain, same
-target. Calls cross the base/overlay boundary with zero ABI friction.
+**Windowed ABI.** Shared across images by construction — same rustc,
+same toolchain, same target. No ABI friction at the boundary.
 
-### `#[ram]` / `.iram0.text`
+### ESP-family-level (all ESP chips, not just S3)
 
-Anything that runs with the instruction cache disabled (flash-touching
-drivers, critical ISRs) lives in base, in internal IRAM, as usual for
-ESP-IDF apps. Overlay shouldn't need IRAM placement in normal
-development. If it does, extend `OverlayHeader` with an IRAM
-`(load_src, dest_start, dest_end)` triple and have the launcher copy.
+- `esptool elf2image` + `esptool write_flash` for delivery.
+- Partition-table format and ESP-IDF 2nd-stage bootloader conventions.
+- ESP-IDF startup hook where our launcher runs after `app_main`.
+- `#[ram]` / `.iram0.text` section conventions for code that runs with
+  the instruction cache disabled. Base keeps IRAM-resident code; overlay
+  should not need IRAM placement in normal dev. If it does, extend
+  `OverlayHeader` with an IRAM `(load_src, dest_start, dest_end)` triple
+  and have the launcher copy.
+
+### SoC-level (ESP32-S3 specifically)
+
+- XIP instruction window base: `0x4200_0000`.
+- XIP data window base: `0x3C00_0000`.
+- Flash layout offsets.
+- IRAM/DRAM address ranges if we use option C (SRAM, flash-backed).
+
+### Generalization footprint
+
+Extracting the ISA/ESP-family/SoC knobs into a small `TargetProfile`
+struct would let the same `dx-esp` binary support ESP32-C3/C6 (RISC-V)
+and other microcontrollers with ELF outputs. Not on the path for v1,
+but the locked-in surface area is narrow — a handful of constants and
+one compiler flag.
 
 ## What we reuse from Dioxus
 
@@ -477,6 +499,50 @@ future.
 Plain ESP32-S3 Rust project, one partition, `cargo run`. Measure full
 edit→running time. Record the "before."
 
+### M0.5 — x86-64 Linux prototype (~1 week)
+
+Validate the core mechanism on native hardware before fighting any
+embedded-specific quirks. Most of the plan is generic ELF work, so this
+exercises the interesting parts with a fast iteration loop.
+
+Shape:
+
+- Two-crate workspace: `base/` (launcher) and `app/` (user code =
+  overlay contents).
+- Base built with `relocation-model=static` (non-PIE) so its symbols
+  have fixed link-time addresses. System ASLR left alone globally.
+- Base launcher:
+  - Reads `./overlay.bin`.
+  - `mmap(MAP_FIXED_NOREPLACE | MAP_ANONYMOUS | MAP_PRIVATE)` at a high
+    fixed address (e.g. `0x5_0000_0000`) — well clear of executable,
+    heap, and default mmap placements.
+  - Copies bytes in, `mprotect` R+X, validates header, calls
+    `header.entry`.
+- Overlay linked at the mmap address via a small linker script; header
+  at offset 0.
+- `dx-esp` shim in base + overlay modes: emits content hashes, computes
+  closure, consolidates sections, invokes `ld`.
+
+Deliverables:
+
+- Edit `app/src/main.rs` → `DX_ESP=overlay cargo build` rewrites
+  `overlay.bin` → re-run base → new code executes.
+- Instrument shim to print closure members. Characterize closure sizes
+  on representative edits (leaf edit, mid-graph edit, top-of-graph
+  edit). Compare overlay size to full-app size.
+- Validate that resolved symbols go to the right place: base symbols
+  resolve via `base_symbols.ld`, overlay-internal resolve locally. Make
+  sure returning-from-overlay-into-base works for standard library
+  calls.
+
+What it does not exercise: `-mlongcalls`, esptool, partition tables,
+ESP-IDF startup, reboot cycles, XIP mapping. Those all come back at M1.
+
+Faithfulness to the embedded model: non-PIE base + `MAP_FIXED` means
+`base_symbols.ld` has identical format across prototype and embedded —
+absolute addresses chosen by the linker. No ASLR-rebasing pass, no
+runtime fixups.
+
 ### M1 — two-region boot, hard split (3-5 days)
 
 Pick a destination (probably A or B). Hand-split the project into base
@@ -486,13 +552,15 @@ analysis yet.
 
 Deliverable: "hello world from overlay" with the handoff proven.
 
-### M2 — content-hash + reverse-reloc + closure (1 week)
+### M2 — content-hash + forward-reloc + closure (1 week)
 
-- Parse base's `.elf` post-build: per-section content hashes, reverse-reloc
-  graph, symbol-address map — all cached to disk.
-- Implement transitive-hash-with-Tarjan-SCC.
-- Implement closure computation.
-- Replace the manual split with an automatic one.
+- Base shim caches pre-link per-section content hashes and
+  `(symbol → defining_section)` index; post-link caches the final
+  symbol→address table.
+- Implement the memoized `needs_overlay` walk from `main` over forward
+  relocations.
+- Implement the dropped-symbols fixed-point post-pass.
+- Replace the manual split with the automatic one.
 - `-ffunction-sections -fdata-sections` on both builds.
 
 Deliverable: editing one tip-crate function produces an overlay
