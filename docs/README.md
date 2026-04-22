@@ -39,6 +39,9 @@ plan.
    websocket. **We don't use this** — `esptool` + serial instead.
 5. [`05-esp32-adaptation.md`](./05-esp32-adaptation.md) — **our actual
    plan**.
+6. [`06-graft-wrapper.md`](./06-graft-wrapper.md) — detailed design of
+   the `graft` binary: wrapper contract, mode-by-mode steps, `.graft.*`
+   ELF metadata schema, and test harnesses.
 
 ## TL;DR
 
