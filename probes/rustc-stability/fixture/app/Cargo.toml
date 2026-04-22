@@ -1,0 +1,8 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+crate_a = { path = "../crate_a" }
+crate_b = { path = "../crate_b" }

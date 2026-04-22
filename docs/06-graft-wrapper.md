@@ -156,24 +156,15 @@ if the pre-scan recorded the symbol as STB_LOCAL, tag it with
 
 `tu_id` is a *structural* identifier for the translation unit —
 stable across edits within that TU, so that overlay's rebuilt TU
-shares a tu_id with base's original TU. Working candidate:
-`blake3(canonical_tu_name)[:8]` where `canonical_tu_name` is derived
-from the `.o`'s rustc-assigned name (crate + CGU index, with any
-content-hash segments stripped). Exact derivation pinned down in
-M0.25 — it's one of the stability questions to answer
-empirically. Candidates in descending order of preference:
-
-1. The `.o`'s filename with known-drifting hash segments stripped
-   (e.g., `my_crate.foo-cgu.0` pulled from
-   `my_crate-abc123.foo-cgu.0-def456.rcgu.o`).
-2. The first `STT_FILE` entry in the `.o`'s `.symtab` (rustc
-   emits one naming the CGU).
-3. Hash of the sorted list of `STB_GLOBAL` symbol names defined in
-   the `.o` — stable under in-TU edits as long as the public
-   surface is unchanged.
-
-All three should agree for well-behaved builds; M0.25 verifies
-which is actually reliable.
+shares a tu_id with base's original TU. Concrete derivation (pinned
+in M0.25): `tu_id = blake3(stt_file_name)[:8]`, where `stt_file_name`
+is the first `STT_FILE` symbol in the `.o`'s `.symtab`. rustc emits
+one naming the CGU (e.g. `"66jii80ryvbi4xaubak5ll468"` — a 24-char
+base36 CGU hash). The probe verified this is stable across pristine
+re-runs, unrelated-crate additions, same-crate additions, and in-TU
+body edits (4/4 TUs matched in every scenario). It changes correctly
+when CGU partitioning changes (e.g. `codegen-units=1`) — those are
+genuinely different TUs.
 
 ### Attach `.graft.*` sections
 
@@ -368,11 +359,9 @@ struct SymHashEntry {
                                // stable across edits within a TU —
                                // i.e., overlay's rebuilt TU keeps the
                                // same tu_id as base's original.
-                               // Derivation: blake3(canonical_tu_name)
-                               // truncated to 8 bytes; canonical_tu_name
-                               // is the .o's rustc-assigned CGU name
-                               // with hash suffixes stripped. See
-                               // M0.25 for the stability audit.
+                               // Derivation (pinned in M0.25):
+                               // blake3(first STT_FILE symbol in the
+                               // .o's .symtab)[:8].
     trans_hash: [u8; 16],     // truncated blake3 transitive hash of
                                // defining section (bytes +
                                // canonical relocs + SCC-successor

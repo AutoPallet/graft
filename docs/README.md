@@ -24,6 +24,13 @@ Clone of Dioxus at `../dioxus/` (shallow, default branch) — our reference.
 See [`05-esp32-adaptation.md`](./05-esp32-adaptation.md) for the concrete
 plan.
 
+## Status
+
+- Workspace scaffold (`graft/`, `probes/`) in place.
+- **M0.25 (rustc stability probe) — done.** Findings folded into doc 05
+  & 06; `tu_id` pinned to `blake3(STT_FILE)[:8]`. Run with
+  `cargo run -p rustc-stability`.
+
 ## Reading order
 
 1. [`01-architecture.md`](./01-architecture.md) — end-to-end mental model of

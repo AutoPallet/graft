@@ -1,6 +1,9 @@
 # Third-party research clone — not our code
 /dioxus/
 
+# Rust
+/target/
+
 # Python
 __pycache__/
 *.pyc

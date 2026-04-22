@@ -649,47 +649,50 @@ gets the tool written first; extends to n-overlay when stacking ships.
 Plain ESP32-S3 Rust project, one partition, `cargo run`. Measure full
 edit→running time. Record the "before."
 
-### M0.25 — rustc stability probe (~1 day)
+### M0.25 — rustc stability probe (~1 day) — **done, see `probes/rustc-stability/`**
 
 Empirical check that the symbol/section stability assumptions hold,
 before committing implementation time to the content-hash mechanism.
+Ran on rustc 1.94.1 against a small multi-crate fixture (crate_a,
+crate_b, app) with scenarios for pristine re-runs, unrelated-crate
+and same-crate noop additions, in-TU body edits, and `codegen-units=1`
+toggles.
 
-On a representative small Rust project (maybe a stripped-down
-esp-hal-template or even a pure x86 workspace — the target
-architecture doesn't matter for this):
+Findings (`cargo run -p rustc-stability`):
 
-- Build twice back-to-back with no source changes.
-  `sha256sum target/.../deps/*.o` → are the hashes identical?
-- Add an unrelated `fn noop() {}` to an untouched module, rebuild.
-  Do symbol names of unaffected functions change? Do their mangled
-  names or `.llvm.<hash>` suffixes shift? Do their section bytes
-  drift?
-- Bump `codegen-units` from default to 1 and back. Does anything
-  meaningful move?
-- Toggle LTO off/thin/fat. Record how much drift each introduces.
+- **Whole-file `.o` bytes drift across back-to-back identical builds**
+  (all 4 TUs differ). The drift is in ELF metadata / symtab ordering,
+  not codegen.
+- **`SHF_ALLOC` section bytes are byte-identical** across those same
+  re-runs (4/4 matched TUs agree on every alloc section). Graft's
+  `trans_hash(s)` hashes section bytes + canonical relocs + out-edges
+  — not the full `.o`. The design is safe against this form of
+  non-determinism by construction.
+- **Cross-crate isolation holds at the section level.** Editing crate_a
+  leaves every `SHF_ALLOC` section in crate_b's 3 TUs byte-identical
+  to baseline. Editing crate_b the same.
+- **In-TU body edits are maximally local.** `a_one`'s body change
+  touches only `.text._ZN7crate_a5a_one...`. Nothing else drifts.
+- **Adding a new global in a TU** (e.g. `pub fn noop_na`) creates the
+  new function's `.text` section and shifts the hash segments in
+  `.Lanon.<hash>.N` rodata section *names* — but the bytes of those
+  sections are identical. Benign for `trans_hash`.
+- **No `.llvm.<hash>` suffixes** observed in this build configuration.
+- **`tu_id` = first `STT_FILE` symbol in the `.o`'s `.symtab`.**
+  Stable across every scenario that preserves CGU partitioning (4/4
+  TUs match): pristine re-runs, unrelated-crate additions, same-crate
+  additions, in-TU body edits. Changes correctly only when CGU
+  partitioning itself changes (`cgu=16 → cgu=1`). Candidate 1
+  (stripped filename) agrees with STT_FILE whenever both apply but is
+  redundant — the middle segment of the `.rcgu.o` filename *is* the
+  STT_FILE value. Candidate 3 (sorted-globals hash) breaks on any
+  API-adding edit as expected.
 
-Expected outcome: with LTO off and default rustc, byte-identical
-rebuilds and stable symbol names across unrelated edits.
+Implication: `tu_id = blake3(stt_file_name)[:8]`. Concrete derivation
+pinned; design locked.
 
-If the picture isn't clean, the mitigation menu is: require
-`-Cllvm-args=-import-instr-limit=0` (disable cross-module inlining),
-pin rustc version in `rust-toolchain.toml`, strip `.llvm.<hash>`
-suffixes in canonical reloc encoding, exclude section names from
-hashes (already the case — noting it here for completeness).
-
-Also resolves: **what derives a stable `tu_id`.** Candidates in
-descending preference:
-
-1. `.o` filename with drifting hash segments stripped.
-2. First `STT_FILE` entry in the `.o`'s `.symtab`.
-3. Hash of sorted STB_GLOBAL symbol names defined in the `.o`.
-
-Verify that the chosen candidate is stable across: in-TU body edits,
-unrelated function additions in a different TU, and build
-reruns with no changes.
-
-This milestone is cheap to run and de-risks two foundational
-assumptions.
+Untested: LTO modes and randomize-layout. LTO is discouraged in base
+regardless (see linker-minimization § 4); revisit if we ever want it.
 
 ### M0.5 — x86-64 Linux prototype (~1 week)
 

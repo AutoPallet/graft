@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = [
+    "graft",
+    "probes/rustc-stability",
+]
+exclude = [
+    "probes/rustc-stability/fixture",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.90"
+
+[workspace.dependencies]
+object = { version = "0.37", default-features = false, features = ["read", "write", "std", "elf"] }
+blake3 = "1.8"
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
