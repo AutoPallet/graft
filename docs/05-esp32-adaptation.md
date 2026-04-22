@@ -492,6 +492,53 @@ write-accessible from base since they live in `.rodata` or a writable
 Not on the critical path, but the present design is compatible with that
 future.
 
+## Future: stacked overlays
+
+Instead of replacing the overlay on each edit, *append* a new one to the
+same region. Overlay N can resolve symbols from base ∪ overlay[0..N-1],
+newest-definition-wins. Each edit is strictly smaller — we only emit the
+sections that changed since the *most recently live* version of them,
+not since base.
+
+Shape:
+
+- Overlay region becomes a bump arena with a persisted write cursor
+  (small sidecar in flash, or the tail of the region itself).
+- Per-overlay manifest kept alongside the bytes: `(section_name,
+  content_hash, final_address)` triples. On boot, the launcher walks
+  manifests newest-first and builds the effective symbol table in RAM,
+  then indirects through it if we have a jump table — or via the
+  `l32r` literals already written if we want linked-in resolution.
+- `base_symbols.ld` generation stacks: when building overlay N, the
+  shim loads base's cache *plus* every prior overlay's manifest, with
+  newer entries shadowing older ones. Closure walk compares each
+  section's content hash to whatever version is currently live (base's
+  or the newest overlay's), not just base's.
+- When the region fills, compact by rebuilding base from source — the
+  shadow chain collapses back to an empty stack.
+
+Interactions:
+
+- **Destination.** Nudges firmly toward option A (dedicated partition
+  with a bump cursor) or B (slack at end of app partition). C/D stay
+  viable for single-shot overlays but don't benefit from stacking.
+- **Closure size.** Typical edit changes the same tip function
+  repeatedly during development; stacked mode means each repeat costs
+  only the diff from the previous overlay, not from base. In practice
+  expect 2-10× smaller per edit than non-stacked for tight iteration.
+- **Literal-pool resolution** still works unchanged — each overlay's
+  `l32r` literals point at whatever address the shadow chain resolved
+  at its link time. Older literals keep pointing at older versions,
+  which is correct: those call sites are themselves shadowed.
+- **Debuggability cost.** A given symbol now lives at whichever address
+  the newest defining overlay put it at; tooling that reads a single
+  ELF breaks. Fix is a combined-ELF dump produced from base + manifest
+  stack on demand, not continuously.
+
+Not on the critical path. The M2 closure machinery composes with this
+directly — the only new work is manifest persistence and the
+newest-first shadow walk during `base_symbols.ld` generation.
+
 ## Milestones
 
 ### M0 — baseline (1 day)
