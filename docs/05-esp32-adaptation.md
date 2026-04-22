@@ -189,8 +189,8 @@ Why walk down rather than up from a diff set:
   propagation.
 - Trivially parallelizable on independent callees.
 
-Post-pass for sections dropped from base at link time (COMDAT dedup, ICF,
-weak resolution, anything the linker pruned even with `--no-gc-sections`):
+Post-pass for sections dropped from base at link time (`--gc-sections`,
+COMDAT dedup, ICF, weak resolution — anything the linker pruned):
 
 ```
 changed = True
@@ -282,7 +282,6 @@ rustflags = [
     "-C", "link-arg=-mlongcalls",
     "-C", "link-arg=-ffunction-sections",
     "-C", "link-arg=-fdata-sections",
-    "-C", "link-arg=-Wl,--no-gc-sections",
     "-C", "link-arg=-T",  "-C", "link-arg=layout.ld",
 ]
 ```
@@ -337,10 +336,11 @@ locally) rather than fight the linker — the closure-inclusion path
 already exists for the dropped-at-link-time case, same machinery.
 
 The only nonstandard linker flags we need on base are the section-
-granularity ones we already require (`-ffunction-sections
--fdata-sections -Wl,--no-gc-sections`) plus keeping the symbol table
-(i.e. don't pass `-s`/`--strip-all`). Everything else is "the
-defaults."
+granularity ones (`-ffunction-sections -fdata-sections`) plus keeping
+the symbol table (don't pass `-s`/`--strip-all`). `--gc-sections`
+stays on — base ships tighter, and the closure post-pass naturally
+pulls in any section the overlay later references that GC pruned,
+same path as COMDAT/ICF dedup.
 
 ### Overlay build (`DX_ESP=overlay cargo build`)
 
