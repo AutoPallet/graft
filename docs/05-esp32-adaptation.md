@@ -268,16 +268,16 @@ measure `ld` as a significant fraction of the loop time — M3 decision.
 
 ## Build pipeline
 
-`dx-esp` is a **linker shim**, nothing else. Cargo drives the build;
+`graft` is a **linker shim**, nothing else. Cargo drives the build;
 rustc produces the object files; our shim intercepts the final link and
-is where all the real work happens. Mode is selected via a `DX_ESP`
+is where all the real work happens. Mode is selected via a `GRAFT`
 environment variable: `base`, `overlay`, or unset (passthrough).
 
 `.cargo/config.toml`:
 
 ```toml
 [target.xtensa-esp32s3-none-elf]
-linker = "dx-esp"
+linker = "graft"
 rustflags = [
     "-C", "link-arg=-mlongcalls",
     "-C", "link-arg=-ffunction-sections",
@@ -286,19 +286,19 @@ rustflags = [
 ]
 ```
 
-### Base build (`DX_ESP=base cargo build`)
+### Base build (`GRAFT=base cargo build`)
 
 1. Cargo resolves deps, invokes rustc as usual. Every crate compiles
    with `-ffunction-sections -fdata-sections -mlongcalls`.
-2. Final bin: rustc invokes `dx-esp` (via `linker = "dx-esp"`) with the
+2. Final bin: rustc invokes `graft` (via `linker = "graft"`) with the
    complete link command.
 3. Shim in `base` mode:
    - Parse all input `.rcgu.o`s: per-section content hashes +
      `(symbol_name → defining_section)` index + per-section forward
-     relocations. Write to `target/dx-esp/base-graph.bin`.
+     relocations. Write to `target/graft/base-graph.bin`.
    - Run the real linker (`xtensa-esp-elf-ld`) against all inputs to
      produce `base.elf` at `-o`'s path.
-   - Read base.elf's final symbol table → `target/dx-esp/base-syms.bin`
+   - Read base.elf's final symbol table → `target/graft/base-syms.bin`
      (the authoritative address map for `base_symbols.ld` generation).
    - Compute `BASE_ABI_VERSION` from exported signature hashes.
    - Convert to `base.bin` via `esptool elf2image`.
@@ -342,12 +342,12 @@ stays on — base ships tighter, and the closure post-pass naturally
 pulls in any section the overlay later references that GC pruned,
 same path as COMDAT/ICF dedup.
 
-### Overlay build (`DX_ESP=overlay cargo build`)
+### Overlay build (`GRAFT=overlay cargo build`)
 
 1. Cargo's fingerprint walk detects what changed and re-invokes rustc
    for those crates — rustc's own incremental handles within-crate
    selectivity. Any unchanged crate is skipped entirely by cargo.
-2. If anything was rebuilt, cargo invokes `dx-esp` for the final link
+2. If anything was rebuilt, cargo invokes `graft` for the final link
    with the complete command (all `.rcgu.o`s + all transitive rlibs,
    resolved paths, correct order).
 3. Shim in `overlay` mode:
@@ -389,7 +389,7 @@ Simple orchestration on top of `cargo build`:
 ```
 notify-watch workspace
 on change:
-    run `DX_ESP=overlay cargo build --target xtensa-esp32s3-none-elf`
+    run `GRAFT=overlay cargo build --target xtensa-esp32s3-none-elf`
     if shim emitted {status:linked}:
         deliver overlay per destination:
             A/B: esptool write_flash <addr> overlay.bin → reset
@@ -404,7 +404,7 @@ No rustc wrapper, no per-crate arg capture, no replay. Cargo's
 fingerprint walk (~50-200 ms on a small workspace) is cheap enough.
 Cargo's own invalidation handles Cargo.toml / feature / toolchain
 changes automatically — a rebuild that needs to rebuild base (because
-deps graph shifted) just invokes the linker with `DX_ESP=base` and
+deps graph shifted) just invokes the linker with `GRAFT=base` and
 proceeds.
 - Destination D: open a USB-JTAG/UART session, wait for base to reach its
   "ready for overlay" prompt, push bytes, have base jump. No flash
@@ -468,7 +468,7 @@ same toolchain, same target. No ABI friction at the boundary.
 ### Generalization footprint
 
 Extracting the ISA/ESP-family/SoC knobs into a small `TargetProfile`
-struct would let the same `dx-esp` binary support ESP32-C3/C6 (RISC-V)
+struct would let the same `graft` binary support ESP32-C3/C6 (RISC-V)
 and other microcontrollers with ELF outputs. Not on the path for v1,
 but the locked-in surface area is narrow — a handful of constants and
 one compiler flag.
@@ -620,8 +620,8 @@ base + overlay ELF; the tool is pure offline assembly. Reasonable
 target: ~100ms for a ten-overlay stack.
 
 Implementation: `object` crate to parse/write ELF, `gimli` for DWARF
-section merging. ~500 lines of Rust. Could live as a `dx-esp snapshot`
-subcommand or a separate `dx-esp-combine` binary.
+section merging. ~500 lines of Rust. Could live as a `graft snapshot`
+subcommand or a separate `graft-combine` binary.
 
 Works for the non-stacked case too: `combine(base, single_overlay)`
 gives you a debuggable ELF for the current edit cycle even without
@@ -657,13 +657,13 @@ Shape:
   embedded (`OverlayHeader.entry` there, a plain symbol here).
 - No launcher, no runtime `mmap`, no `MAP_FIXED`, no ASLR fight.
   `./app.elf` is just a static ELF the OS loader places normally.
-- `dx-esp` shim in base + overlay modes: emits content hashes,
+- `graft` shim in base + overlay modes: emits content hashes,
   computes closure, consolidates sections, invokes `ld`, then runs
   the combine step.
 
 Deliverables:
 
-- Edit `app/src/main.rs` → `DX_ESP=overlay cargo build` rewrites the
+- Edit `app/src/main.rs` → `GRAFT=overlay cargo build` rewrites the
   overlay ELF and the combined `app.elf` → `./app.elf` runs new code.
 - Instrument shim to print closure members. Characterize closure sizes
   on representative edits (leaf edit, mid-graph edit, top-of-graph
@@ -710,16 +710,16 @@ Deliverable: "hello world from overlay" with the handoff proven.
 Deliverable: editing one tip-crate function produces an overlay
 containing only that function's closure up to `main`.
 
-### M3 — `dx-esp` driver (1 week)
+### M3 — `graft` driver (1 week)
 
-- Implement `dx-esp` as a linker shim with `DX_ESP={base,overlay}` modes.
-- Install via `.cargo/config.toml` `linker = "dx-esp"` — no
+- Implement `graft` as a linker shim with `GRAFT={base,overlay}` modes.
+- Install via `.cargo/config.toml` `linker = "graft"` — no
   `RUSTC_WRAPPER`.
 - Base mode: real link + post-process (graph + hashes + `esptool
   elf2image`).
 - Overlay mode: closure computation + minimal `base_symbols.ld` + link +
   package.
-- Dev driver: `notify` watcher → `DX_ESP=overlay cargo build` → parse
+- Dev driver: `notify` watcher → `GRAFT=overlay cargo build` → parse
   shim stdout → deliver per destination → stream serial.
 - End-to-end timing. Aim: 1-3 seconds edit-to-running.
 
@@ -730,7 +730,7 @@ containing only that function's closure up to `main`.
 - Profile `ld`; if it exceeds ~40% of loop time, replace with an
   in-driver linker.
 - `BASE_ABI_VERSION` mismatch UX.
-- `dx-esp snapshot` combined-ELF tool for embedded debugging — port of
+- `graft snapshot` combined-ELF tool for embedded debugging — port of
   the M0.5 x86 combine step to emit the snapshot as a byproduct of
   the embedded build.
 - Optional: start exploring the hot-patch extension.

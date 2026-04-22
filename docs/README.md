@@ -1,7 +1,8 @@
-# Incremental Compilation Research — ESP32-S3
+# graft — Incremental Compilation for ESP32-S3
 
 Research notes on Dioxus's "Subsecond" hot-patching system, and a port plan
-for fast incremental edit-flash-reboot cycles on ESP32-S3.
+for fast incremental edit-flash-reboot cycles on ESP32-S3. Project name:
+**graft** — overlay grafted onto base.
 
 Clone of Dioxus at `../dioxus/` (shallow, default branch) — our reference.
 
@@ -46,7 +47,7 @@ global `AtomicPtr<JumpTable>`, an undefined-symbol stub object of
 hand-assembled jump trampolines, a fat+thin build split, and a devtools
 websocket carrying the table to the running app.
 
-**Our ESP32-S3 plan** (doc 05) keeps the fat+thin *build* idea but resolves
+**graft** (doc 05) keeps the fat+thin *build* idea but resolves
 everything at link time. Base is built once with
 `-ffunction-sections -fdata-sections` and emits a cached per-section
 content-hash table + symbol→section index + final-ELF symbol addresses.
