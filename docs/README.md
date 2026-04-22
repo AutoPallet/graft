@@ -1,46 +1,56 @@
-# Incremental Compilation Research — Dioxus Subsecond
+# Incremental Compilation Research — ESP32-S3
 
-Research notes on Dioxus's "Subsecond" hot-patching system, produced to inform
-an adaptation for a Rust ESP32 project.
+Research notes on Dioxus's "Subsecond" hot-patching system, and a port plan
+for fast incremental edit-flash-reboot cycles on ESP32-S3.
 
-Clone of Dioxus at `../dioxus/` (shallow, default branch).
+Clone of Dioxus at `../dioxus/` (shallow, default branch) — our reference.
+
+## Project scope
+
+- **Target**: ESP32-S3 only (Xtensa LX7).
+- **Goal**: fast edit → flash → reboot. **Not** live hot-patching.
+- **Strategy**: two flash partitions (base + per-edit overlay). Overlay
+  links statically against a symbol table exported from base, so all
+  inter-partition calls resolve at link time to absolute flash addresses.
+  No runtime jump table, no in-process patching.
+- **Greenfield** — not constrained by Subsecond's u64s or existing code.
+
+See [`05-esp32-adaptation.md`](./05-esp32-adaptation.md) for the concrete
+plan.
 
 ## Reading order
 
-1. [`01-architecture.md`](./01-architecture.md) — end-to-end mental model
-2. [`02-runtime-patching.md`](./02-runtime-patching.md) — how the running app
-   redirects calls (JumpTable, `HotFn`, `call()`, `apply_patch`)
-3. [`03-build-pipeline.md`](./03-build-pipeline.md) — how the CLI produces
-   patches (fat build → thin link → undefined-symbol stubs → `.so` patch)
-4. [`04-wire-protocol.md`](./04-wire-protocol.md) — how patches get from the
-   CLI to the running process (websocket / devtools)
-5. [`05-esp32-adaptation.md`](./05-esp32-adaptation.md) — what applies to
-   ESP32, what has to change, and a concrete port plan
+1. [`01-architecture.md`](./01-architecture.md) — end-to-end mental model of
+   *Dioxus's* system (reference research)
+2. [`02-runtime-patching.md`](./02-runtime-patching.md) — Dioxus's runtime
+   mechanism (JumpTable, `HotFn`, `call()`, `apply_patch`). **We don't use
+   this** — kept for context.
+3. [`03-build-pipeline.md`](./03-build-pipeline.md) — Dioxus's CLI side
+   (fat → thin → undefined-symbol stubs). **We reuse the build-capture and
+   symbol-parse halves.**
+4. [`04-wire-protocol.md`](./04-wire-protocol.md) — Dioxus's devtools
+   websocket. **We don't use this** — `esptool` + serial instead.
+5. [`05-esp32-adaptation.md`](./05-esp32-adaptation.md) — **our actual
+   plan**.
 
 ## TL;DR
 
-Subsecond does **real Rust code hot-patching**, not just template/asset reload.
-Three moving parts:
+**Dioxus's Subsecond** (docs 01-04) does in-process Rust hot-patching via a
+global `AtomicPtr<JumpTable>`, an undefined-symbol stub object of
+hand-assembled jump trampolines, a fat+thin build split, and a devtools
+websocket carrying the table to the running app.
 
-- **Runtime** (`subsecond` crate): a global `AtomicPtr<JumpTable>` plus a
-  `HotFn` wrapper that checks the jump table on every call and trampolines to
-  the new function pointer if present. Wrap your hot loop bodies in
-  `subsecond::call(|| …)` and any change below that call redirects; changes
-  *above* the call force an unwind (panic-and-retry) back up the stack to the
-  nearest `call()`.
-- **Compile** (`dioxus-cli`, aka `dx`): a "fat build" up front compiles
-  everything with `--export-dynamic`, `--no-gc-sections`, and captures the
-  exact rustc/linker commands for every workspace crate. On a file change, dx
-  re-runs rustc for only the changed crates (replaying the captured command),
-  then links the resulting object files into a small `.so`/`.dylib` *patch*
-  that jumps back into the original binary's absolute addresses via a
-  hand-assembled stub object.
-- **Protocol** (`devtools-types`, `devtools`): a websocket carrying a
-  `HotReloadMsg` containing the `JumpTable`. Client dlopen's the patch,
-  rebases addresses using the `main` symbol as an ASLR anchor, and swaps the
-  global `AtomicPtr<JumpTable>`.
+**Our ESP32-S3 plan** (doc 05) keeps the fat+thin *build* idea but resolves
+everything at link time instead of runtime. Base partition holds all
+dependencies and emits a `base_symbols.ld` (thousands of `PROVIDE(sym =
+0xaddr)` entries) after its build. Overlay partition holds just the tip
+crate and links with `-T base_symbols.ld` — the linker fills in every
+cross-partition call via `-mlongcalls` trampolines. Flash the overlay,
+reset, run. Target loop: 2-3 seconds edit-to-running.
 
-End result: sub-second Rust edit-compile-run on desktop, mobile and web.
+The two-partition design is structurally a subset of hot-patching — same
+address table idea, resolved earlier. Adding live patching later is
+additive.
 
 ## Key file map (into `../dioxus/`)
 

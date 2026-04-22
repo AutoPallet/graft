@@ -1,273 +1,371 @@
-# 05 — Adapting Subsecond to ESP32
+# 05 — Port plan: ESP32-S3 incremental flash (no hot-patching)
 
-This is the part you actually care about. Split into:
+Revised plan. Substantially simpler than a Subsecond port because we drop
+the in-process patching goal entirely.
 
-1. What maps cleanly.
-2. What breaks and why.
-3. A concrete port plan, ordered by risk.
+## Scope
 
-## First: which ESP32?
+- **Target**: ESP32-S3 only (Xtensa LX7, `xtensa-esp32s3-none-elf`).
+- **Goal**: fast edit → flash → reboot → running code. Not hot-patching.
+  A reset between edits is acceptable.
+- **Strategy**: two flash partitions.
+  - **Base**: all dependency code + runtime. Rarely re-flashed.
+  - **Overlay**: just the tip-crate code. Re-flashed per edit.
+  - Overlay links against a symbol table exported from base, so all its
+    references into base resolve to absolute flash addresses at *link
+    time*. No runtime resolution, no jump table, no `dlopen`-equivalent.
+- **Greenfield project**. No legacy `u64` addresses, no existing runtime
+  to be compatible with. Design for simplicity. Addresses are `u32`.
 
-The ESP32 family ships two ISAs, and the port is meaningfully different
-for each:
+## What "incremental" buys us
 
-| Chip | ISA | Rust target | Notes |
-|---|---|---|---|
-| ESP32 (classic), S2, S3 | Xtensa LX6/LX7 | `xtensa-esp32-none-elf` etc. | Needs a custom LLVM fork (`esp-rs/rust`). `object` crate doesn't know xtensa. |
-| ESP32-C3, C6, H2, P4 | RISC-V 32-bit (IMAC) | `riscv32imac-unknown-none-elf` / `riscv32imc-*` | Upstream Rust. `object` crate has riscv support. |
+The speedup decomposes into four things:
 
-**Recommendation**: if you have a choice, start with a RISC-V variant
-(C3/C6). Everything downstream — stub trampoline assembly, object file
-parsing, linker support — is easier.
+1. `rustc` incremental codegen — only codegen units that actually changed
+   get recompiled. (This is rustc's feature, not ours.)
+2. Link only the overlay, not the whole app.
+3. Flash only the overlay partition (~100-500 KB) instead of the whole
+   app image (2-4 MB).
+4. No OTA, no A/B bootloader dance — one partition write + one reset.
 
-## What maps cleanly
+Target loop time: **2-3 seconds** edit-to-running, mostly flash-write
+bound. For comparison a full rebuild+flash cycle today is typically
+20-60 seconds on this silicon.
 
-The runtime ideas port almost verbatim:
+## Flash layout
 
-- **`JumpTable`** (HashMap<u64, u64>) is target-agnostic. On a 32-bit
-  target the top 32 bits are always zero; just cast at lookup time, which
-  is already how `subsecond` handles `target_pointer_width = "32"`
-  (`subsecond/src/lib.rs:906-929`).
-- **`HotFn` / `call()`** work without modification. The function-pointer
-  lookup is pure arithmetic; `catch_unwind` is the only piece that
-  requires unwinding, and Rust's xtensa/riscv targets do support panic =
-  "unwind" if you enable it — though most embedded projects set
-  `panic = "abort"`. More on that below.
-- **Undefined-symbol stub concept** — hard-coded absolute-address jump
-  trampolines embedded in an object file — is exactly what you want on a
-  chip with no dynamic linker. In fact it's a better fit on ESP32 than
-  on desktop: there is **no ASLR**, so the "rebase by `main` delta" step
-  collapses to a no-op. The absolute addresses compiled into the stubs
-  *are* the addresses the patch should call.
-- **Fat build → thin build pipeline** is independent of target. The
-  captured rustc args + replay-then-link approach works anywhere rustc
-  works.
+```
+0x00000000  bootloader
+0x00009000  partition table
+0x00010000  base.bin          (large, rarely changed — say 2 MB budget)
+0x00210000  overlay.bin       (small, per-edit — say 512 KB budget)
+```
 
-## What breaks, and why
+XIP (execute-in-place) mapping on ESP32-S3:
 
-### 1. There is no `dlopen`
+- Instruction XIP window: `0x42000000` base.
+- Data XIP window: `0x3C000000` base.
 
-ESP-IDF / `esp-rs` don't ship a dynamic linker. `libloading` won't link.
-The patch has to be loaded by *you* into a RAM region where code can be
-executed, with manual relocation.
+Same physical flash, two virtual views. We run code from the instruction
+window and read overlay header/rodata via the data window.
 
-Three sub-problems:
+## The two-partition model
 
-- **Where does the patched code live?** Flash (XIP from IROM) is
-  effectively immutable at runtime without OTA operations. IRAM and DRAM
-  are candidates; on ESP32-S3 there's additionally PSRAM but you can't
-  execute from PSRAM by default. **Answer**: reserve a sized IRAM region
-  at link time for patches. Size it generously (32–128 KB).
-- **Which relocation model?** Desktop uses `-shared` and applies
-  relocations at `dlopen` time. We need either:
-  - (a) **Fully absolute code**: patch object has all call targets
-    resolved at link time, plus we link it *at the known load address*
-    of our patch RAM region. Simplest, but each new patch has to be
-    linked against the specific load address.
-  - (b) **Position-independent code**: compile patch with
-    `relocation-model=pic` (RISC-V supports this; Xtensa less well),
-    apply a few relocation types at load time.
-- **How do patches reference the fat binary's code and data?** Same
-  trick Dioxus uses: undefined-symbol stubs with absolute-address jump
-  trampolines. Both RISC-V and Xtensa can do this trivially.
+### Base partition
 
-### 2. `object` crate doesn't know Xtensa
+Contains:
 
-Looking at `build/patch.rs:884-889`:
+- ESP-IDF 2nd-stage bootloader and startup (`app_main` path).
+- `esp-hal`, `esp-wifi`, allocator, logger, panic handler, any crate the
+  overlay might want to use.
+- A small launcher that runs after ESP-IDF init and hands control to the
+  overlay.
+- (Build artifact) a generated `base_symbols.ld` file listing every
+  global symbol and its absolute address.
+
+Base is its own `no_std` bin crate. It's completely self-contained and
+will boot and idle even with no overlay flashed (useful for recovery).
+
+### Overlay partition
+
+Contains:
+
+- The user's tip-crate code, compiled as a separate bin crate.
+- Linked at overlay partition's XIP address (`0x42210000` for the layout
+  above — `0x42000000` base + `0x210000` partition offset).
+- Links in `-T base_symbols.ld` so all references to base symbols bind
+  to their absolute flash addresses.
+- Its own `.text`, `.rodata`, `.data`, `.bss` sections inside the
+  overlay partition.
+- An `OverlayHeader` struct at a known offset (offset 0 is easiest).
+
+### Handoff protocol
 
 ```rust
-match triple.architecture {
-    Architecture::Aarch64(_) => object::Architecture::Aarch64,
-    Architecture::Wasm32 => object::Architecture::Wasm32,
-    Architecture::X86_64 => object::Architecture::X86_64,
-    _ => return Err(PatchError::UnsupportedPlatform(triple.to_string())),
+#[repr(C)]
+pub struct OverlayHeader {
+    pub magic: u32,             // e.g. 0xEC37_1A00
+    pub abi_version: u32,       // bumped when base's ABI changes
+    pub entry: unsafe extern "C" fn() -> !,
+    pub bss_start: *mut u8,
+    pub bss_end: *mut u8,
+    pub data_load: *const u8,   // source in flash
+    pub data_start: *mut u8,    // dest in RAM
+    pub data_end: *mut u8,
+}
+
+// Base's launcher, after ESP-IDF init is done:
+pub fn launch_overlay() -> ! {
+    const OVERLAY_HDR: *const OverlayHeader = 0x3C210000 as _; // data XIP view
+    unsafe {
+        let h = &*OVERLAY_HDR;
+        assert_eq!(h.magic, OVERLAY_MAGIC, "no overlay flashed");
+        assert_eq!(h.abi_version, BASE_ABI_VERSION, "overlay/base ABI mismatch");
+
+        // zero overlay BSS
+        let bss_len = h.bss_end.offset_from(h.bss_start) as usize;
+        core::ptr::write_bytes(h.bss_start, 0, bss_len);
+
+        // copy overlay .data from flash to RAM
+        let data_len = h.data_end.offset_from(h.data_start) as usize;
+        core::ptr::copy_nonoverlapping(h.data_load, h.data_start, data_len);
+
+        (h.entry)()
+    }
 }
 ```
 
-We'd need to:
+## Generating `base_symbols.ld`
 
-- Add a RISC-V arm to this match (`object` already knows
-  `object::Architecture::Riscv32`). Straightforward.
-- Add stub-asm generation for RISC-V. See below.
-- For Xtensa: `object` crate has no Xtensa ELF support. Either vendor
-  enough ELF parsing/writing to emit an Xtensa relocatable, or use
-  `goblin` which does have Xtensa. Bigger lift.
+After the base image is linked, a post-build step parses its ELF and
+emits a linker script full of `PROVIDE` entries:
 
-### 3. Stub trampolines need new ISAs
-
-Absolute-address jump trampoline to synthesize. RISC-V 32-bit:
-
-```
-# Load 32-bit immediate into t0, then JALR
-lui   t0, %hi(abs_addr)    # 0b0000000000000000000_00101_0110111 | imm[31:12]<<12
-addi  t0, t0, %lo(abs_addr) # or use AUIPC+JALR for PIC variant
-jalr  x0, 0(t0)            # jump, don't save return addr (tail call)
+```ld
+/* Auto-generated from base.elf — do not edit */
+PROVIDE(_ZN6esp_hal4gpio6Output3new17h... = 0x420012a4);
+PROVIDE(_ZN7esp_wifi4init17h...           = 0x42005a80);
+PROVIDE(__rust_alloc                      = 0x42001130);
+PROVIDE(rust_begin_unwind                 = 0x4200b7ac);
+/* ... thousands more */
 ```
 
-Three 4-byte instructions = 12 bytes. Encoding is simple.
+The overlay passes `-T base_symbols.ld` to the linker. Xtensa `ld`
+treats these as defined symbols at those exact addresses; overlay
+relocations resolve against them cleanly; no undefined symbols remain.
 
-Xtensa is more awkward because of its windowed registers and
-variable-length encoding; the `j.l` (long jump) instruction takes an 18-bit
-absolute offset and isn't sufficient. You'd probably emit a literal-pool
-load:
+This is the *static* equivalent of Dioxus's `create_undefined_symbol_stub`
+— same idea (satisfy missing symbols with fixed addresses) but done by
+the linker instead of by us hand-assembling jump trampolines in object
+files. Huge simplification.
+
+Extraction logic reuses `HotpatchModuleCache::new` for ELF from
+`dioxus/packages/cli/src/build/patch.rs:262-344`, minus the TLS handling.
+Output format is the `.ld` above rather than an in-memory HashMap.
+
+## Build pipeline
+
+### `dx-esp build --base`
+
+1. `cargo build` the base crate with:
+   - `-C link-arg=-T base_layout.ld` — places `.text` at `0x42010000`,
+     `.rodata` adjacent, RAM sections in DRAM.
+   - `-C link-arg=-Wl,--no-gc-sections` — keep every symbol, since
+     overlay might want any of them.
+   - `-mlongcalls` — so intra-base calls also use the long-call form,
+     making symbol addresses stable regardless of overlay's call
+     distance (more below).
+2. Post-link:
+   - Parse `base.elf` → write `base_symbols.ld`.
+   - Record `BASE_ABI_VERSION` (e.g. hash of the symbol table) into a
+     `base_manifest.json`.
+   - `esptool elf2image base.elf -o base.bin`.
+3. Flash bootloader + partition table + `base.bin` once (or whenever
+   base changes).
+
+### `dx-esp build --overlay`
+
+1. **Replay tip-crate rustc** using the command captured by the rustc
+   wrapper during the base build (exactly Dioxus's mechanism — see
+   `03-build-pipeline.md`).
+2. Link with:
+   - `-T overlay_layout.ld` (places overlay `.text` at overlay
+     partition's XIP address, e.g. `0x42210000`).
+   - `-T base_symbols.ld` (provides base symbol addresses).
+   - `-mlongcalls` (mandatory — see next section).
+   - `-nostdlib` (no libstd, no libcore reimplementation — they're in
+     base).
+   - Pass only the tip crate's fresh `.rcgu.o` files + any rlibs that
+     are *genuinely new* (a dep the overlay added that base doesn't
+     have — rare; typically forces a base rebuild).
+3. Post-link: write `OverlayHeader` into the overlay ELF at offset 0
+   of the overlay partition. Can be done with a pre-reserved section
+   in the linker script and a Rust `#[link_section = ".overlay_header"]
+   #[no_mangle] static OVERLAY_HEADER: OverlayHeader = …` declaration
+   in the overlay crate.
+4. `esptool elf2image overlay.elf -o overlay.bin`.
+
+### Flash loop
+
+1. `notify` crate sees a file change.
+2. Walk workspace graph (`file_to_workspace_crate` from Dioxus). If the
+   change touches a base-partition crate, mark base as stale and do a
+   full rebuild + full reflash; else overlay-only.
+3. Build overlay.
+4. `esptool --before default-reset --after hard-reset
+   write_flash 0x210000 overlay.bin`.
+5. Stream serial, watch for the app's log output.
+
+With `esptool`'s `--no-stub` flag and a persistent ROM-downloader session
+you can shave the per-flash overhead further; worth investigating only
+if the 2-3 second target isn't met.
+
+## Xtensa specifics (ESP32-S3)
+
+### `-mlongcalls` is non-negotiable
+
+Xtensa's `call8` instruction has a ±512 KB PC-relative range. The
+overlay's code lives at `0x42210000`; many base symbols live far below
+`0x42200000`. The distance regularly exceeds 512 KB in both directions.
+
+`-mlongcalls` tells the compiler to emit calls as:
 
 ```
-       l32r  a8, .Laddr
-       jx    a8
-.Laddr: .word abs_addr
+l32r   a8, .Literal     # load 32-bit absolute address from literal pool
+callx8 a8               # call via register
 ```
 
-`l32r` is PC-relative with a 16-bit offset; the literal needs to be
-within range, which means emitting it in a `.rodata` section of the
-same patch — fine, since the patch object gets linked as a unit.
+instead of direct `call8`. The `.Literal` entry can be any absolute
+address — including one provided by `PROVIDE()` in `base_symbols.ld`.
+This is how overlay calls into base work without any runtime fixup.
 
-### 4. Shipping the patch to the device
+Both base and overlay should be compiled `-mlongcalls`-wide for symbol
+stability.
 
-No filesystem. Options, from easiest to most work:
+### Literal pools
 
-- **Wired**: UART or USB-CDC. Cheap and stupid: send the raw .o/.bin bytes
-  with a framed protocol (length prefix + CRC). For a 20-200 KB patch at
-  921600 baud that's sub-second.
-- **Wifi**: TCP or HTTP(S) PUT. Requires the device be connected.
-- **JTAG / SWD**: only useful if you already have a probe and the RAM
-  region is writable via the debug interface. Lets you keep the existing
-  breakpoint + resume workflow.
+Xtensa literal-pool placement (`-mtext-section-literals` vs.
+`.literal`-section-based) doesn't cross partition boundaries either
+way — each partition generates its own literals. Default toolchain
+behavior is fine; call it out in the `.ld` layout so overlay's
+literals land in overlay partition, not dangling near base.
 
-The wire protocol can mirror Dioxus's `HotReloadMsg`, but with `jump_table`
-inlined (no filesystem path) and the patch *bytes* either in the same
-message or fetched separately via a follow-up frame.
+### Windowed ABI
 
-### 5. `catch_unwind` / `panic = "unwind"`
+Xtensa uses a register-windowed calling convention. Since both base and
+overlay are compiled by the same rustc + the same toolchain, they share
+the ABI. Calls across the partition boundary behave exactly like any
+other function call — the ABI is not a concern.
 
-Dioxus uses the panic-and-retry trick to unwind to the nearest enclosing
-`call()`. If your project uses `panic = "abort"` (typical for ESP32), that
-mechanism does nothing and every patch is effectively "call the new
-function at the inner-most hot point and hope state is compatible."
+### `#[ram]` / `.iram0.text`
 
-Two options:
+Functions that must execute from RAM (flash-touching drivers, ISRs
+marked with `#[ram]` in `esp-hal`) should live in **base**. Overlay
+code should not need IRAM placement in normal circumstances. If an
+overlay edit needs IRAM, we can extend the overlay header with an
+IRAM copy block, but punt that to later.
 
-- Enable `panic = "unwind"` in dev profile. `esp-rs` supports it on RISC-V
-  targets; on Xtensa it's experimental. This costs code size.
-- Live without it: require all edits to occur strictly *within* a
-  `call()`-wrapped function. This is a real constraint but not a crippling
-  one for a firmware — edit the loop body, not the initializer.
+## What we reuse from Dioxus
 
-### 6. Statics, globals, heap state
-
-Same caveats as desktop but more punishing:
-
-- Peripheral handles (e.g. `esp_hal::gpio::Output<'static>`) are almost
-  never safe to re-instantiate on patch. Treat them as `register_handler`
-  victims: on patch, **don't** rebuild them — keep them in `static`s that
-  persist across the patch, and have the hot code re-read them by name.
-- Heap allocators: okay as long as the allocator type doesn't change
-  layout. Don't edit the allocator's code.
-- TLS: not meaningful on bare-metal single-core/multi-core-without-threads
-  setups. Ignore.
-
-### 7. Cache coherence
-
-When we load new instructions into IRAM, we must invalidate the
-instruction cache before executing them. ESP32 has an instruction cache;
-on RISC-V cores you need a `fence.i`, on Xtensa a `isync` (and possibly
-`dhwbi` if the region is cached for data writes). Trivially one function
-call into `esp_hal` but *must not be forgotten*, or you'll hit ghost calls
-to old code at random.
-
-## Port plan, ordered
-
-Milestones in escalating difficulty. Stop at whatever level is "good
-enough" for your use case.
-
-### M0 — Proof that the runtime links (1-2 days)
-
-Compile `subsecond` for your target with `libloading` gated out. The apply
-side is shot, but `call()` / `HotFn` / `APP_JUMP_TABLE` should compile
-no_std-ish. If not, vendor the crate and strip it down to the bits that
-matter (essentially `HotFunction` macro + `APP_JUMP_TABLE` + a new
-`apply_patch_from_bytes(&[u8])`).
-
-### M1 — Manual, on-device one-shot patch (1 week)
-
-Skip the CLI entirely. Hand-craft a patch object file, flash it to a
-reserved IRAM region at a known address, hand-craft a `JumpTable`, call a
-stripped-down `apply_patch`. This proves the in-process mechanism works on
-your silicon. Target: swap a single function body by hand.
-
-### M2 — CLI that produces a patch for one architecture (2-3 weeks)
-
-Fork `dx` or start a minimal driver. Reuse as much of
-`build/patch.rs`'s `create_undefined_symbol_stub` as possible:
-
-- Add a RISC-V arm (or Xtensa if you have to).
-- Instead of `dlopen`-style `.so`, produce a flat blob suitable for
-  direct upload — either a true relocatable `.o` that you relocate
-  on-device, or a fully-linked blob against a known load address.
-- Skip the websocket. UART transport first.
-- Reuse `rustcwrapper.rs` and `link.rs` as-is; they don't care about
-  target.
-- Reuse `HotpatchModuleCache::new` on the fat ELF.
-
-### M3 — File watcher + iterative patches (1 week)
-
-Wrap M2 in a `notify`-based loop. This is the Dioxus `serve/` equivalent
-and is target-agnostic.
-
-### M4 — Framework integration (open-ended)
-
-Decide where `subsecond::call(|| …)` boundaries go in your firmware:
-
-- Main loop body — almost always.
-- Input/event handlers.
-- Network handlers.
-- State-machine transitions.
-
-Register a `subsecond::register_handler` that tears down anything whose
-layout might have changed (task queues, animation state).
-
-### Stretch: PIC patches
-
-Compile patches with `relocation-model=pic` so they can be loaded to any
-RAM address. Requires implementing a few relocation types
-(`R_RISCV_CALL`, `R_RISCV_HI20`, `R_RISCV_LO12_I`, etc.) in the on-device
-loader. Makes multi-patch without reflashing feasible.
-
-## Risks and unknowns
-
-- **Xtensa tooling**: the Rust-for-Xtensa LLVM is a separate fork; some
-  `-C` flags may behave differently. The fat build's `--export-dynamic`
-  etc. need validation.
-- **Monomorphization explosion**: Subsecond only patches the tip crate
-  reliably because dep code gen is non-deterministic under rustc. On
-  firmware codebases that lean heavily on generic drivers (`embedded-hal`
-  trait everywhere) you will eat a lot of changed CGUs per edit.
-- **Code-size budget for stubs**: each undefined symbol = 12-16 bytes of
-  IRAM. A large patch could reference thousands of symbols; at 16B ×
-  3000 = 48 KB. IRAM is typically 128 KB. Monitor this.
-- **Flash-side constants**: if a patched function references a new `&str`
-  literal, the literal lives in the patch, not the fat binary's
-  `.rodata`. That's fine as long as the patch RAM region holds ro-data
-  too (it does if you link it as a complete blob).
-- **Interrupts and patches**: applying a patch while an ISR is running
-  one of the replaced functions is a crash. Easy mitigation: disable
-  interrupts across `apply_patch`, or gate patching on a known-safe
-  quiescent point in the main loop.
-
-## What to steal vs. write fresh
-
-| Piece | Verdict |
+| Piece | Reuse? |
 |---|---|
-| `subsecond::{call, HotFn, HotFunction}` | **Reuse verbatim.** |
-| `subsecond::apply_patch` | Rewrite — it's ~40 lines and the `dlopen` half is replaced. |
-| `subsecond-types::JumpTable` | **Reuse verbatim.** |
-| `HotpatchModuleCache` | Reuse the symbol-table half; TLS/wasm bits drop. |
-| `create_undefined_symbol_stub` | Reuse structure; add RISC-V/Xtensa arms. |
-| `rustcwrapper.rs` | **Reuse verbatim.** |
-| `cli::link.rs` (the shim) | **Reuse verbatim** for NoLink mode. |
-| `build/link.rs` (thin link) | Reuse; swap the final linker invocation for one that targets your chip's format. |
-| `serve/` websocket | Don't port — UART/TCP frame protocol instead. |
-| `devtools-types::HotReloadMsg` | Simplify — keep `jump_table`, drop the RSX/asset fields, add `patch_bytes: Vec<u8>`. |
+| `rustcwrapper.rs` (capture rustc args per crate) | Yes, unchanged. |
+| `cli/link.rs` linker shim (capture linker args) | Yes, unchanged. |
+| Workspace graph walk / change detection | Yes. |
+| `HotpatchModuleCache::new` ELF symbol parsing | Yes; output format changes from HashMap to `.ld`. |
+| `BuildMode` enum | Yes; redefine as `Base` / `Overlay` / `Full`. |
+| `serve/` watch loop | Yes, swap websocket broadcast for `esptool` calls. |
 
-The leverage is enormous: well over half of the Dioxus code is directly
-reusable, and the parts that need rewriting (`apply_patch`, stub asm for a
-new ISA, transport) are small and well-scoped.
+## What we don't need
+
+| Piece | Why not |
+|---|---|
+| `subsecond` runtime crate | Nothing patches in-process. |
+| `JumpTable` / `apply_patch` / `HotFn` | Not applicable. |
+| `subsecond::call` wrapping user code | Not applicable. |
+| Undefined-symbol stub assembler | Linker's `PROVIDE()` does it. |
+| ASLR anchor (`main` lookup) | No ASLR on ESP32. |
+| `catch_unwind` / `HotFnPanic` | No live patching, no unwinding needed. Ship `panic = "abort"`. |
+| Websocket devtools protocol | `esptool` + serial monitor. |
+| Template / asset hot-reload | Out of scope for firmware. |
+
+## Design constraints
+
+- **Base ABI is load-bearing.** Any change to a pub signature, struct
+  layout, or `#[inline]` attribute in base-partition code can change
+  every caller's codegen and requires a base rebuild + full reflash.
+  The `BASE_ABI_VERSION` in the manifest makes this a loud assertion
+  rather than a silent crash.
+- **Adding a new dep**: if the dep is new to the tip crate but already
+  present in base's crate graph, overlay just references it. If the
+  dep is wholly new (neither partition has it), it must be added to
+  base.
+- **Editing a dep**: full base rebuild.
+- **Generic monomorphization**: new specializations of a base-defined
+  generic instantiate in the overlay (standard rustc behavior) —
+  transparently handled, as long as the generic's public contract in
+  base is unchanged.
+- **Overlay size budget**: we reserve ~512 KB for the overlay partition
+  in the layout above. For a realistic application that's roughly
+  10-20k lines of tip-crate Rust after optimization. If the overlay
+  keeps growing, either bump the partition size or move code into
+  base.
+
+## Future: hot-patching on top of this
+
+Worth naming for completeness. The two-partition design above is
+structurally a subset of Dioxus-style hot-patching:
+
+- Both resolve overlay→base references through a fixed address table.
+- Ours resolves at *link* time (generate `.ld`, feed to linker).
+- Dioxus resolves at *runtime* (generate jump table, apply in-process).
+
+Adding hot-patching later is additive, not a rewrite:
+
+1. Add a tiny subsecond-style runtime to base.
+2. Change the overlay loader to copy overlay `.text` into RAM (instead
+   of XIP from flash) so subsequent patches can overwrite it in place.
+3. Add a UART/USB channel for streaming new overlay images without
+   reset.
+
+But until the edit-flash-boot loop feels slow, there's no reason to add
+the complexity.
+
+## Milestones
+
+### M0 — baseline (1 day)
+
+Plain `esp32s3` Rust project, one partition, one `cargo run`. Measure
+full-cycle time. This is the "before."
+
+### M1 — two-partition boot (3-5 days)
+
+- Manually split the project into `base/` and `overlay/` crates.
+- Write the layout `.ld` files for both partitions.
+- Base launcher reads overlay header, zeros BSS, calls entry.
+- Both partitions rebuilt fully every time. No symbol-table export yet.
+- Prove the handoff. Get "hello world from overlay" printing.
+
+### M2 — symbol-table export (3-4 days)
+
+- Post-base-build step parses `base.elf` and emits `base_symbols.ld`.
+- Overlay links with `-T base_symbols.ld`, `-nostdlib`.
+- Verify overlay binary shrinks dramatically.
+- Add `BASE_ABI_VERSION` check in the handoff.
+
+### M3 — `dx-esp` dev driver (1 week)
+
+- Vendor Dioxus's `rustcwrapper.rs` + `cli/link.rs`.
+- Implement Base / Overlay build modes that replay tip-crate rustc.
+- File watcher + workspace dep graph + dep-change → base-rebuild
+  detection.
+- Wire up `esptool write_flash` for overlay, `esptool write_flash` for
+  base when needed.
+- Stream serial output.
+- Measure: hit the 2-3 second target.
+
+### M4 — polish
+
+- Size budget warnings.
+- Nice diagnostics when overlay references a base symbol that no
+  longer exists.
+- Possibly: ROM-downloader session pooling in esptool for faster
+  flashes.
+- Possibly: overlay IRAM copy block.
+
+## Open questions
+
+- Is 512 KB enough overlay headroom for realistic apps? Instrument the
+  first real project and adjust.
+- Does `esp-hal`'s startup sequence play nicely with a second
+  "application entry" distinct from `esp_idf_entry`? May need to
+  intercept at a specific point in ESP-IDF init.
+- How do panics propagate? If overlay panics, base's panic handler
+  runs (since it's linked only into base). Good — we want that. But
+  the panic info includes source locations from overlay's DWARF, which
+  base doesn't know about. Probably fine, since the serial output just
+  prints numbers and we decode on the host.
+- Do we want to support *deliberately* running without an overlay
+  (e.g. "safe mode" stub) for recovery? The launcher already handles
+  this via the magic-number check; just pick a reasonable fallback
+  behavior (log + sleep forever, or wait for serial command to boot
+  into overlay once flashed).
