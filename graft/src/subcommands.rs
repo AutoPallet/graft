@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::{elf_attach, metadata};
+use crate::{combine, elf_attach, metadata};
 
 pub fn cache_info(args: &[String]) -> ExitCode {
     let path = match args.first() {
@@ -50,4 +50,58 @@ fn run_cache_info(path: &Path) -> anyhow::Result<()> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn combine(args: &[String]) -> ExitCode {
+    // Positional: graft combine <base.elf> <overlay.elf> -o <out.elf>
+    let mut base: Option<&str> = None;
+    let mut overlay: Option<&str> = None;
+    let mut out: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" => {
+                if let Some(v) = args.get(i + 1) {
+                    out = Some(v.as_str());
+                    i += 2;
+                    continue;
+                }
+            }
+            a if a.starts_with("-o") => {
+                out = Some(&a[2..]);
+            }
+            other if !other.starts_with('-') => {
+                if base.is_none() {
+                    base = Some(other);
+                } else if overlay.is_none() {
+                    overlay = Some(other);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let (Some(base), Some(overlay), Some(out)) = (base, overlay, out) else {
+        eprintln!("usage: graft combine <base.elf> <overlay.elf> -o <out.elf>");
+        return ExitCode::from(2);
+    };
+    match combine::combine(Path::new(base), Path::new(overlay), Path::new(out)) {
+        Ok(stats) => {
+            eprintln!(
+                "graft combine: overlay {} bytes at {:#x} · {} trampolines · combined {} bytes",
+                stats.overlay_load_size,
+                stats.overlay_vaddr,
+                stats.trampolines.len(),
+                stats.combined_size,
+            );
+            for t in &stats.trampolines {
+                eprintln!("  {:#x} → {:#x}  {}", t.base_addr, t.overlay_addr, t.name);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("graft combine: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
 }

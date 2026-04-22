@@ -7,7 +7,8 @@ fn main() -> ExitCode {
     if let Some(cmd) = args.get(1) {
         match cmd.as_str() {
             "cache-info" => return graft::subcommands::cache_info(&args[2..]),
-            "snapshot" | "combine" | "clean" => {
+            "combine" => return graft::subcommands::combine(&args[2..]),
+            "snapshot" | "clean" => {
                 eprintln!("graft: subcommand `{cmd}` not yet implemented");
                 return ExitCode::from(2);
             }
