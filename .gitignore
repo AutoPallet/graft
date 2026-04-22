@@ -1,8 +1,8 @@
 # Third-party research clone — not our code
 /dioxus/
 
-# Rust
-/target/
+# Rust — target/ at any depth (workspaces nest under e2e/, probes/, etc.)
+target/
 
 # Python
 __pycache__/
