@@ -31,8 +31,9 @@ plan.
    mechanism (JumpTable, `HotFn`, `call()`, `apply_patch`). **We don't use
    this** — kept for context.
 3. [`03-build-pipeline.md`](./03-build-pipeline.md) — Dioxus's CLI side
-   (fat → thin → undefined-symbol stubs). **We reuse the build-capture and
-   symbol-parse halves.**
+   (fat → thin → undefined-symbol stubs). **We reuse the linker-shim and
+   ELF symbol-parse halves; we skip the rustc-wrapper/argv-capture half
+   and let cargo drive.**
 4. [`04-wire-protocol.md`](./04-wire-protocol.md) — Dioxus's devtools
    websocket. **We don't use this** — `esptool` + serial instead.
 5. [`05-esp32-adaptation.md`](./05-esp32-adaptation.md) — **our actual

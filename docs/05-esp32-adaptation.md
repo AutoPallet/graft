@@ -235,53 +235,98 @@ measure `ld` as a significant fraction of the loop time — M3 decision.
 
 ## Build pipeline
 
-### Base build (`dx-esp build --base`)
+`dx-esp` is a **linker shim**, nothing else. Cargo drives the build;
+rustc produces the object files; our shim intercepts the final link and
+is where all the real work happens. Mode is selected via a `DX_ESP`
+environment variable: `base`, `overlay`, or unset (passthrough).
 
-1. `cargo build` the base crate.
-2. Link with:
-   - `-C link-arg=-T base_layout.ld` placing `.text` at the base
-     partition's XIP address, one function per section
-     (`-ffunction-sections -fdata-sections`).
-   - `-C link-arg=-mlongcalls` so calls to out-of-range targets use the
-     `l32r`+`callx8` form. Applied to both base and overlay for call-site
-     stability.
-   - `-C link-arg=-Wl,--no-gc-sections`. We decide what lives — not the
-     linker.
-3. Post-link side effects (run once, cached for every overlay build):
-   - Parse `base.elf` → per-section content hashes, reverse-reloc graph,
-     symbol-address table.
-   - Compute `BASE_ABI_VERSION` = hash over exported-symbol signatures.
-   - `esptool elf2image base.elf -o base.bin`.
-4. Flash bootloader + partition table + `base.bin`.
+`.cargo/config.toml`:
 
-### Overlay build (`dx-esp build --overlay`)
+```toml
+[target.xtensa-esp32s3-none-elf]
+linker = "dx-esp"
+rustflags = [
+    "-C", "link-arg=-mlongcalls",
+    "-C", "link-arg=-ffunction-sections",
+    "-C", "link-arg=-fdata-sections",
+    "-C", "link-arg=-Wl,--no-gc-sections",
+    "-C", "link-arg=-T",  "-C", "link-arg=layout.ld",
+]
+```
 
-1. **Replay rustc** for any crates whose source files changed, using the
-   commands captured by the rustc wrapper during the base build. rustc
-   incremental handles within-crate selectivity.
-2. **Compute content hashes** for every section in the new object set,
-   plus any base sections they reference.
-3. **Diff** transitive hashes against the cached per-symbol map from the
-   base build → seed set.
-4. **Closure walk** over the cached reverse-reloc graph → must-rebuild
-   set.
-5. **External-dependency walk** → minimal `base_symbols.ld` content.
-6. **Link the closure**:
-   - `-T overlay_layout.ld` (`OVERLAY_DEST` address).
-   - `-T base_symbols.ld` (minimal, generated this build).
-   - `-mlongcalls`, `-nostdlib`, no LTO, no `--gc-sections`.
-   - Inputs: just the closure's object files.
-7. **Emit `OverlayHeader`** into the image (via a
-   `#[link_section = ".overlay_header"] #[no_mangle] static` in whichever
-   closure-resident crate wants it, or via a post-link patcher).
-8. **Package** per the destination choice — `esptool elf2image` for
-   flash-backed, a raw binary blob for SRAM-copied, etc.
+### Base build (`DX_ESP=base cargo build`)
+
+1. Cargo resolves deps, invokes rustc as usual. Every crate compiles
+   with `-ffunction-sections -fdata-sections -mlongcalls`.
+2. Final bin: rustc invokes `dx-esp` (via `linker = "dx-esp"`) with the
+   complete link command.
+3. Shim in `base` mode:
+   - Runs the real linker (`xtensa-esp-elf-ld`) against all inputs to
+     produce `base.elf` at `-o`'s path.
+   - Post-link: parse `base.elf` → per-section content hashes,
+     reverse-reloc graph, symbol-address table. Write to
+     `target/dx-esp/base-graph.bin`.
+   - Compute `BASE_ABI_VERSION` from exported signature hashes.
+   - Convert to `base.bin` via `esptool elf2image`.
+4. Flash bootloader + partition table + `base.bin` once (or whenever
+   base changes).
+
+### Overlay build (`DX_ESP=overlay cargo build`)
+
+1. Cargo's fingerprint walk detects what changed and re-invokes rustc
+   for those crates — rustc's own incremental handles within-crate
+   selectivity. Any unchanged crate is skipped entirely by cargo.
+2. If anything was rebuilt, cargo invokes `dx-esp` for the final link
+   with the complete command (all `.rcgu.o`s + all transitive rlibs,
+   resolved paths, correct order).
+3. Shim in `overlay` mode:
+   - Parse the link command to get the full input set.
+   - Load the cached `base-graph.bin`.
+   - Compute content hashes for every section in the current input set.
+   - Transitive-hash diff against the cache → changed seed set.
+   - Reverse-reloc walk from seed → must-rebuild closure.
+   - Forward-reloc walk from closure → minimal `base_symbols.ld`
+     content (only the base symbols the overlay actually references).
+   - Invoke `ld` with: `-T overlay_layout.ld`, the generated minimal
+     `base_symbols.ld`, `-nostdlib`, and only the closure's objects as
+     input. Output: `overlay.elf`.
+   - Write an `OverlayHeader` into the image (a
+     `#[link_section = ".overlay_header"] #[no_mangle] static` in
+     whichever closure-resident crate owns it, or a post-link patcher).
+   - Package per destination: `esptool elf2image` for flash-backed, raw
+     binary for SRAM-copied.
+   - Emit a machine-readable metadata line on stdout
+     (`{"status":"linked","overlay":"…","size":…,"abi":"…"}`) for the
+     dev driver.
+   - Write a stub ELF at `-o`'s path so cargo is satisfied with the
+     link output. The real artifact lives at the side-channel path.
+4. If cargo skipped the link (no inputs changed), the shim isn't
+   invoked — dev driver sees no metadata, skips flashing.
 
 ### Delivery loop
 
-- Destination A/B: `esptool write_flash <addr> overlay.bin` then reset.
-- Destination C: `write_flash` then reset; base's launcher does the
-  flash→SRAM copy.
+Simple orchestration on top of `cargo build`:
+
+```
+notify-watch workspace
+on change:
+    run `DX_ESP=overlay cargo build --target xtensa-esp32s3-none-elf`
+    if shim emitted {status:linked}:
+        deliver overlay per destination:
+            A/B: esptool write_flash <addr> overlay.bin → reset
+            C:   esptool write_flash <flash_src> overlay.bin → reset
+            D:   open USB-JTAG, wait for base-ready, push bytes
+        stream serial
+    else:
+        (nothing changed — skip)
+```
+
+No rustc wrapper, no per-crate arg capture, no replay. Cargo's
+fingerprint walk (~50-200 ms on a small workspace) is cheap enough.
+Cargo's own invalidation handles Cargo.toml / feature / toolchain
+changes automatically — a rebuild that needs to rebuild base (because
+deps graph shifted) just invokes the linker with `DX_ESP=base` and
+proceeds.
 - Destination D: open a USB-JTAG/UART session, wait for base to reach its
   "ready for overlay" prompt, push bytes, have base jump. No flash
   write.
@@ -331,16 +376,17 @@ development. If it does, extend `OverlayHeader` with an IRAM
 
 | Piece | Reuse? |
 |---|---|
-| `rustcwrapper.rs` — capture rustc args per crate | Yes, unchanged. |
-| `cli/link.rs` — linker shim for arg capture | Yes, unchanged. |
-| `serve/` watch loop | Yes; delivery step replaces websocket broadcast. |
+| `cli/link.rs` — linker shim structure and `NoLink`-style arg capture | Yes; adapted for our modes. |
 | ELF symbol/section parsing from `HotpatchModuleCache::new` | As input to reverse-reloc graph + content-hash computation. |
-| `BuildMode`-style dispatch | Conceptually, as `Base` / `Overlay` / `Full`. |
+| `notify`-based file watcher from `serve/` | Yes. |
 
 ## What we don't need
 
 | Piece | Why not |
 |---|---|
+| `rustcwrapper.rs` + per-crate JSON args capture | Cargo drives rustc; we don't need to know what rustc ran with. |
+| `WorkspaceRustcArgs` replay + topo sort | Cargo does it. |
+| "Cold-cache" fallback detection (Cargo.toml watch, etc.) | Cargo self-invalidates. |
 | `subsecond` runtime crate, `JumpTable`, `apply_patch`, `HotFn` | Nothing patches in-process. |
 | Undefined-symbol stub assembler | `ld` resolves from PROVIDE entries. |
 | ASLR anchor | No ASLR on bare metal. |
@@ -411,11 +457,15 @@ containing only that function's closure up to `main`.
 
 ### M3 — `dx-esp` driver (1 week)
 
-- Vendor Dioxus's `rustcwrapper.rs` and `cli/link.rs`.
-- File watcher, workspace graph, dep-add detection.
-- Linker-minimization wiring (minimal `base_symbols.ld`, prune
-  `--gc-sections`, etc.).
-- Delivery step per destination choice.
+- Implement `dx-esp` as a linker shim with `DX_ESP={base,overlay}` modes.
+- Install via `.cargo/config.toml` `linker = "dx-esp"` — no
+  `RUSTC_WRAPPER`.
+- Base mode: real link + post-process (graph + hashes + `esptool
+  elf2image`).
+- Overlay mode: closure computation + minimal `base_symbols.ld` + link +
+  package.
+- Dev driver: `notify` watcher → `DX_ESP=overlay cargo build` → parse
+  shim stdout → deliver per destination → stream serial.
 - End-to-end timing. Aim: 1-3 seconds edit-to-running.
 
 ### M4 — polish
