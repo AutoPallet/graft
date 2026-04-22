@@ -8,12 +8,17 @@ Clone of Dioxus at `../dioxus/` (shallow, default branch) — our reference.
 ## Project scope
 
 - **Target**: ESP32-S3 only (Xtensa LX7).
-- **Goal**: fast edit → flash → reboot. **Not** live hot-patching.
-- **Strategy**: two flash partitions (base + per-edit overlay). Overlay
-  links statically against a symbol table exported from base, so all
-  inter-partition calls resolve at link time to absolute flash addresses.
-  No runtime jump table, no in-process patching.
-- **Greenfield** — not constrained by Subsecond's u64s or existing code.
+- **Goal**: fast edit → rebuild → deliver → reboot → running code. **Not**
+  live hot-patching.
+- **Shape**: two-region split — a large stable **base** + a small per-edit
+  **overlay**. Overlay membership is the transitive closure of callers of
+  every function whose content-hash changed (section granularity, not
+  crate granularity).
+- **Overlay destination is open** — dedicated flash partition, slack at
+  the end of the app partition, or SRAM (flash-backed or host-pushed) are
+  all viable. Design is parametric on that choice.
+- **Greenfield** — u32 addresses, no compatibility constraints with
+  Subsecond or any existing runtime.
 
 See [`05-esp32-adaptation.md`](./05-esp32-adaptation.md) for the concrete
 plan.
@@ -41,16 +46,22 @@ hand-assembled jump trampolines, a fat+thin build split, and a devtools
 websocket carrying the table to the running app.
 
 **Our ESP32-S3 plan** (doc 05) keeps the fat+thin *build* idea but resolves
-everything at link time instead of runtime. Base partition holds all
-dependencies and emits a `base_symbols.ld` (thousands of `PROVIDE(sym =
-0xaddr)` entries) after its build. Overlay partition holds just the tip
-crate and links with `-T base_symbols.ld` — the linker fills in every
-cross-partition call via `-mlongcalls` trampolines. Flash the overlay,
-reset, run. Target loop: 2-3 seconds edit-to-running.
+everything at link time. Base is built once with
+`-ffunction-sections -fdata-sections` and emits a cached per-section
+content-hash map + reverse-relocation graph. On edit, we recompute
+content hashes, diff transitively (Tarjan SCC for cycles), and walk the
+reverse-reloc graph to compute the closure of callers up to `main` —
+that closure is the overlay. Overlay is linked at `OVERLAY_DEST` with a
+*minimal* `base_symbols.ld` containing only the PROVIDE entries the
+closure actually references. `-mlongcalls` inlines `l32r`+`callx8` at
+each cross-region call site — the ISA floor, no separate trampoline.
 
-The two-partition design is structurally a subset of hot-patching — same
-address table idea, resolved earlier. Adding live patching later is
-additive.
+Target loop: **1-3 seconds** edit-to-running. The destination (flash
+partition, app-partition slack, or SRAM) is left open and picked at M1.
+
+The design is structurally a subset of hot-patching — same
+address-resolution idea, done at link time instead of runtime. Adding
+live patching later would reuse the closure machinery unchanged.
 
 ## Key file map (into `../dioxus/`)
 
