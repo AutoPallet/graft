@@ -49,13 +49,16 @@ websocket carrying the table to the running app.
 **Our ESP32-S3 plan** (doc 05) keeps the fat+thin *build* idea but resolves
 everything at link time. Base is built once with
 `-ffunction-sections -fdata-sections` and emits a cached per-section
-content-hash map + reverse-relocation graph. On edit, we recompute
-content hashes, diff transitively (Tarjan SCC for cycles), and walk the
-reverse-reloc graph to compute the closure of callers up to `main` —
-that closure is the overlay. Overlay is linked at `OVERLAY_DEST` with a
-*minimal* `base_symbols.ld` containing only the PROVIDE entries the
-closure actually references. `-mlongcalls` inlines `l32r`+`callx8` at
-each cross-region call site — the ISA floor, no separate trampoline.
+content-hash table + symbol→section index + final-ELF symbol addresses.
+On edit, the overlay shim walks forward from `main` with a memoized
+`needs_overlay(s)` — true if `s`'s bytes changed OR any target it
+forward-relocs to needs overlay. Closure = memoized truthy set. A
+post-pass folds in any sections referenced but dropped from base at link
+time. Overlay is linked at `OVERLAY_DEST` from a consolidated
+closure-sections object + a *minimal* `base_symbols.ld` containing only
+the PROVIDE entries the closure actually references. `-mlongcalls`
+inlines `l32r`+`callx8` at each cross-region call site — the ISA floor,
+no separate trampoline.
 
 Target loop: **1-3 seconds** edit-to-running. The destination (flash
 partition, app-partition slack, or SRAM) is left open and picked at M1.

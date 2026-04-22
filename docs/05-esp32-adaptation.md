@@ -114,7 +114,7 @@ against the old base refuse to boot.
 
 Three steps: hash, graph, closure.
 
-### 1. Content-hash change detection
+### 1. Per-section content hashing
 
 For every section in every object file (base's `.rcgu.o`s cached from its
 build, plus overlay-candidate objects this build):
@@ -123,23 +123,12 @@ build, plus overlay-candidate objects this build):
   where `sorted_relocs` is a canonical encoding of each relocation as
   `(target_symbol_name, offset, reloc_type, addend)`. Symbolic — stable
   across rustc versions and CGU repartitioning.
-- **Transitive hash** accounts for the content hash of everything this
-  section reaches through relocations. Cycles (mutual recursion) handled
-  by collapsing strongly-connected components via Tarjan's, hashing each
-  SCC as the sorted combination of its members' content hashes, then
-  hashing SCCs in reverse-topological DAG order:
 
-  ```
-  transitive(scc) = blake3(
-      scc.canonical_content_hash
-      || sorted(transitive(succ) for succ in scc.successors)
-  )
-  ```
+Per-section only. No transitive hash, no SCC handling — the closure
+walk in step 3 propagates changes transitively via recursion, so we
+don't need to precompute it.
 
-- **Changed set** = symbols whose transitive hash differs from the
-  last-build cache.
-
-Properties we get for free:
+Properties:
 
 - Whitespace or reformatting edits that don't affect codegen produce
   identical hashes — no cascade.
@@ -148,11 +137,13 @@ Properties we get for free:
 - Strictly more precise than rustc's incremental fingerprints, which can
   be conservative across compiler upgrades and CGU boundary shifts.
 
-### 2. Reverse-relocation graph
+### 2. Forward-relocation graph
 
-For each object file we parse, enumerate its relocation records; for each
-record targeting symbol `T` from section `S`, add a reverse edge
-`T ← S` to the graph.
+Each section's relocation records — as they come out of ELF parsing,
+uninverted — are the call graph. For section `S`, `forward_relocs(S)` is
+the list of `(target_symbol, offset, reloc_type, addend)` tuples emitted
+by the compiler for that section. That's the raw data we already have;
+no separate graph construction step.
 
 This captures:
 
@@ -175,22 +166,60 @@ live" in a sidecar allowlist.
 
 ### 3. Closure computation
 
-- Seed = changed set from step 1.
-- Walk the reverse graph upward from seed to collect every section that
-  reaches a changed section. That's the "must-rebuild" set.
-- Then walk **forward** from the must-rebuild set (via forward
-  relocations — the original relocation edges) to collect everything
-  reachable from the overlay-resident code: functions the overlay calls,
-  data it references. These are the overlay's *external dependencies*,
-  which split into:
-  - Already present in base → referenced via `base_symbols.ld`.
-  - Also in the must-rebuild set → linked into overlay directly.
-- `main` is always in the must-rebuild set (seed or reached from seed;
-  if seed is empty, no overlay is needed at all).
+Walk forward from `main` with a memoized per-section "needs overlay?"
+predicate:
 
-The overlay is exactly the must-rebuild set, laid out at `OVERLAY_DEST`
-with relocations resolved either internally (closure-member addresses)
-or externally (base symbol addresses via a minimal PROVIDE file).
+```
+def needs_overlay(s):
+    if s in memo: return memo[s]
+    result = (content_hash(s) != cached[s.name]) or \
+             any(needs_overlay(reloc.target) for reloc in forward_relocs(s))
+    memo[s] = result
+    return result
+
+needs_overlay(main)    # populates memo for everything reachable from main
+closure = {s for s, v in memo.items() if v}
+```
+
+Why walk down rather than up from a diff set:
+
+- Natural anchoring — unreachable changes don't bloat the overlay.
+- Uses the forward-reloc graph as it comes out of ELF, no inversion.
+- O(V+E) with memoization; whole no-change subtrees cost one `False`
+  propagation.
+- Trivially parallelizable on independent callees.
+
+Post-pass for sections dropped from base at link time (COMDAT dedup, ICF,
+weak resolution, anything the linker pruned even with `--no-gc-sections`):
+
+```
+changed = True
+while changed:
+    changed = False
+    for s in closure:
+        for reloc in forward_relocs(s):
+            t = reloc.target
+            if t.section in closure: continue        # internal to overlay
+            if t in base_symbols: continue           # PROVIDE covers it
+            closure.add(t.section)                   # dropped; pull it in
+            changed = True
+```
+
+The added sections are resolved the same way as primary closure members
+— bytes + relocations carried into the overlay. Since we work at
+section granularity (`-ffunction-sections -fdata-sections`), pulling in
+a dropped symbol adds only its own section, not the enclosing .rcgu.o.
+
+### 4. Overlay assembly
+
+Closure is materialized by reading each section's bytes + relocations
+from its source `.rcgu.o`, emitting a single consolidated input object,
+and handing that to `ld` alongside `-T overlay_layout.ld` and the
+minimal `base_symbols.ld`. Standard ELF surgery via the `object` crate —
+no persistent fallback archive, no pre-LTO caching, no custom resolution
+logic. Every section the overlay needs is present as either (a) a local
+definition in the consolidated object or (b) a PROVIDE'd address in the
+script.
 
 Properties:
 
@@ -204,9 +233,9 @@ Properties:
 
 Xtensa's `ld` is the slowest step of the tooling — minimize its work:
 
-1. **Pre-compute the closure.** Hand `ld` only the objects that belong in
-   overlay, not every rlib with `--gc-sections`. Linker goes from
-   "whole-program GC over 2MB of base" to "relocate N sections into
+1. **Hand `ld` exactly the closure.** A single consolidated input object
+   containing only closure sections, not every rlib with
+   `--gc-sections`. Linker's job shrinks to "relocate N sections into
    overlay layout."
 2. **Emit a minimal `base_symbols.ld`.** Only PROVIDE entries for the
    specific base symbols the overlay's relocations target. Typical case
@@ -214,11 +243,15 @@ Xtensa's `ld` is the slowest step of the tooling — minimize its work:
 3. **Turn off `--gc-sections` on the overlay link.** We've already done
    the GC ourselves, more precisely. The linker shouldn't re-walk
    relocations.
-4. **No LTO in the overlay build.** ThinLTO in base is fine; overlay
-   must be a straight relocatable link.
-5. **Cache base's reverse-reloc graph + content-hash table** once per
-   base build. Re-parsing `base.elf` on every overlay build would dwarf
-   the link time.
+4. **LTO discouraged in base.** Correctness is preserved — content-hash
+   diff is robust to cross-module inlining, since any byte change picks
+   up via the walk — but LTO re-runs from scratch on every base rebuild
+   and its non-local inlining heuristics can balloon closure sizes
+   unpredictably on small edits. Cargo's default (`lto = false`) is the
+   good dev-loop setting.
+5. **Cache base's per-section content hashes + symbol-address table**
+   once per base build. Re-parsing `base.elf` + all `.rcgu.o`s on every
+   overlay build would dwarf the link time.
 6. **Pre-resolve literals we know.** Every `l32r` literal addressing a
    base symbol has a known value from `base_symbols.ld` — we can write
    those bytes ourselves and hand `ld` pre-resolved input, skipping one
@@ -261,11 +294,13 @@ rustflags = [
 2. Final bin: rustc invokes `dx-esp` (via `linker = "dx-esp"`) with the
    complete link command.
 3. Shim in `base` mode:
-   - Runs the real linker (`xtensa-esp-elf-ld`) against all inputs to
+   - Parse all input `.rcgu.o`s: per-section content hashes +
+     `(symbol_name → defining_section)` index + per-section forward
+     relocations. Write to `target/dx-esp/base-graph.bin`.
+   - Run the real linker (`xtensa-esp-elf-ld`) against all inputs to
      produce `base.elf` at `-o`'s path.
-   - Post-link: parse `base.elf` → per-section content hashes,
-     reverse-reloc graph, symbol-address table. Write to
-     `target/dx-esp/base-graph.bin`.
+   - Read base.elf's final symbol table → `target/dx-esp/base-syms.bin`
+     (the authoritative address map for `base_symbols.ld` generation).
    - Compute `BASE_ABI_VERSION` from exported signature hashes.
    - Convert to `base.bin` via `esptool elf2image`.
 4. Flash bootloader + partition table + `base.bin` once (or whenever
@@ -280,16 +315,24 @@ rustflags = [
    with the complete command (all `.rcgu.o`s + all transitive rlibs,
    resolved paths, correct order).
 3. Shim in `overlay` mode:
-   - Parse the link command to get the full input set.
-   - Load the cached `base-graph.bin`.
+   - Parse the link command to get the full input set (all `.rcgu.o`s
+     and rlibs for this build).
+   - Load cached `base-graph.bin` and `base-syms.bin`.
    - Compute content hashes for every section in the current input set.
-   - Transitive-hash diff against the cache → changed seed set.
-   - Reverse-reloc walk from seed → must-rebuild closure.
-   - Forward-reloc walk from closure → minimal `base_symbols.ld`
-     content (only the base symbols the overlay actually references).
+   - Walk forward from `main`, memoized: `needs_overlay(s)` = section
+     changed OR any forward-reloc target needs overlay. Closure = memo's
+     truthy set.
+   - Post-pass: for any closure reloc targeting a symbol not in base's
+     symbol table (dropped at link time), add that symbol's section to
+     the closure. Iterate to fixed point.
+   - Emit minimal `base_symbols.ld` — PROVIDE entries for every symbol
+     targeted by a closure reloc that isn't in the closure itself.
+   - Assemble one consolidated input object: concatenate closure section
+     bytes, carry their relocations (rewritten to be internally
+     consistent).
    - Invoke `ld` with: `-T overlay_layout.ld`, the generated minimal
-     `base_symbols.ld`, `-nostdlib`, and only the closure's objects as
-     input. Output: `overlay.elf`.
+     `base_symbols.ld`, `-nostdlib`, and the consolidated object as the
+     sole input. Output: `overlay.elf`.
    - Write an `OverlayHeader` into the image (a
      `#[link_section = ".overlay_header"] #[no_mangle] static` in
      whichever closure-resident crate owns it, or a post-link patcher).
