@@ -1,0 +1,7 @@
+# Third-party research clone — not our code
+/dioxus/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
