@@ -306,6 +306,42 @@ rustflags = [
 4. Flash bootloader + partition table + `base.bin` once (or whenever
    base changes).
 
+### What base's linked ELF gives us
+
+Everything the overlay needs about base's layout comes from stock ELF
+fields the linker already writes. No custom symbols, sidecar debug
+streams, or linker-script tricks required:
+
+- **Symbol → address** via `.symtab`: `Elf*_Sym.st_value` is the final
+  link-time address of every symbol. We read it through the `object`
+  crate and drop it into `base-syms.bin`. That's the entire input to
+  `base_symbols.ld` generation.
+- **Symbol size** via `st_size`: LLVM emits `.size foo, .-foo`
+  directives for every function, which become `st_size` in the object
+  file and survive through link. Useful for size accounting and for
+  the combined-ELF tool; not load-bearing for correctness.
+- **Section addresses and ranges** via `Elf*_Shdr.sh_addr` / `sh_size`.
+  Tells us where base's `.text`, `.rodata`, `.bss`, etc. live so we
+  can allocate a disjoint overlay range.
+- **Entry point** via `e_entry` (for the combined-ELF tool to copy
+  through on x86).
+- **Build ID** via standard `--build-id=sha1` → `NT_GNU_BUILD_ID` note.
+  Seed for `BASE_ABI_VERSION` without hand-rolling anything.
+
+One caveat: `PROVIDE` in the overlay link script can only target
+`STB_GLOBAL` symbols. Rust `pub` items and `extern "C"` symbols land
+as global; monomorphized internal helpers occasionally land as
+`STB_LOCAL`. If the closure walk finds a reloc into a base-local
+symbol, the policy is to pull that section into the overlay (re-emit
+locally) rather than fight the linker — the closure-inclusion path
+already exists for the dropped-at-link-time case, same machinery.
+
+The only nonstandard linker flags we need on base are the section-
+granularity ones we already require (`-ffunction-sections
+-fdata-sections -Wl,--no-gc-sections`) plus keeping the symbol table
+(i.e. don't pass `-s`/`--strip-all`). Everything else is "the
+defaults."
+
 ### Overlay build (`DX_ESP=overlay cargo build`)
 
 1. Cargo's fingerprint walk detects what changed and re-invokes rustc
