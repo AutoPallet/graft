@@ -155,32 +155,35 @@ fn full_cycle() {
     let base_env = base_elf.to_string_lossy().into_owned();
     let overlay_env = [("GRAFT", "overlay"), ("GRAFT_BASE_ELF", base_env.as_str())];
 
-    // A. Leaf: edit compute. Cascades up to mix, app.main, main → 4 trampolines.
+    // A. Leaf: edit compute. Cascades up to mix, app::main, main. Every
+    //    nonempty-closure rebuild yields exactly 1 trampoline — at base's
+    //    entry symbol (main). All inner cross-section calls are resolved
+    //    inside overlay's own link.
     fx.edit("base/src/lib.rs", "wrapping_mul(7)", "wrapping_mul(13)");
     fx.cargo_build(&overlay_env);
     let stderr = combine(&base_elf, &fx.overlay_elf(), &combined);
-    assert!(stderr.contains("4 trampolines"), "A: {stderr}");
+    assert!(stderr.contains("1 trampolines"), "A: {stderr}");
     let out = run_combined(&combined);
     assert!(out.contains("sum = 195"), "A: {out}");
     assert!(out.contains("mixed = 26520"), "A: {out}");
     fx.edit("base/src/lib.rs", "wrapping_mul(13)", "wrapping_mul(7)");
 
-    // B. Mid-graph: edit mix only (compute stays). 3 trampolines — compute
-    //    is NOT in the closure because its trans_hash is unchanged.
+    // B. Mid-graph: edit mix only (compute stays). `compute` is NOT in
+    //    the closure because its trans_hash is unchanged.
     fx.edit("base/src/lib.rs", "rotate_left(3)", "rotate_left(5)");
     fx.cargo_build(&overlay_env);
     let stderr = combine(&base_elf, &fx.overlay_elf(), &combined);
-    assert!(stderr.contains("3 trampolines"), "B: {stderr}");
+    assert!(stderr.contains("1 trampolines"), "B: {stderr}");
     let out = run_combined(&combined);
     assert!(out.contains("sum = 105"), "B (compute unchanged): {out}");
     assert!(out.contains("mixed = 57120"), "B: {out}");
     fx.edit("base/src/lib.rs", "rotate_left(5)", "rotate_left(3)");
 
-    // C. Top: edit app only. 2 trampolines — nothing in base changed.
+    // C. Top: edit app only. Base unchanged.
     fx.edit("app/src/main.rs", r#"greet("graft")"#, r#"greet("world")"#);
     fx.cargo_build(&overlay_env);
     let stderr = combine(&base_elf, &fx.overlay_elf(), &combined);
-    assert!(stderr.contains("2 trampolines"), "C: {stderr}");
+    assert!(stderr.contains("1 trampolines"), "C: {stderr}");
     let out = run_combined(&combined);
     assert!(out.contains("hello, world!"), "C: {out}");
     fx.edit("app/src/main.rs", r#"greet("world")"#, r#"greet("graft")"#);

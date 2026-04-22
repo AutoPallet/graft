@@ -244,18 +244,34 @@ const OVERLAY_BASE_ADDR: u64 = 0x1000_0000;
 fn write_overlay_layout_ld(path: &Path, base_addr: u64) -> Result<()> {
     // Bump-allocate overlay's alloc sections starting at `base_addr`.
     // Orphan rules let us glob by prefix, so new `.text.<symbol>`
-    // sections need no explicit entry. `/DISCARD/` drops sections
-    // that base already provides (notes, eh_frame hdr).
+    // sections need no explicit entry.
+    //
+    // Unwind info gap (deferred): `.eh_frame` is currently dropped by
+    // `prune::prune_object` before ld ever sees it, because rustc
+    // emits one `.eh_frame` per .o covering every `.text.*` in that
+    // .o — keeping it would leave FDE relocs pointing at sections the
+    // pruner removed, which ld would reject. A proper fix needs
+    // per-FDE splitting so only FDEs whose target `.text` is in the
+    // closure survive. Until that lands, overlay code's `.eh_frame`
+    // is synthesized on-the-fly by ld from what little escapes
+    // pruning, and a panic through overlay IPs won't unwind (runtime
+    // will abort). The fixture deliberately exercises no panic path.
+    // `.gcc_except_table` has the same shape and the same gap.
+    // `.eh_frame_hdr` is discarded because it would be a partial
+    // header covering only overlay's FDEs and would confuse the
+    // runtime unwinder if ever discovered via a new GNU_EH_FRAME phdr.
     let script = format!(
         "/* graft overlay layout: disjoint from base's address range. */\n\
          SECTIONS {{\n\
          \x20  . = {base_addr:#x};\n\
-         \x20  .text        : {{ *(.text .text.*) }}\n\
-         \x20  .rodata      : {{ *(.rodata .rodata.* .rodata..L*) }}\n\
-         \x20  .data.rel.ro : {{ *(.data.rel.ro .data.rel.ro.* .data.rel.ro..L*) }}\n\
-         \x20  .data        : {{ *(.data .data.*) }}\n\
-         \x20  .bss         : {{ *(.bss .bss.* COMMON) }}\n\
-         \x20  /DISCARD/    : {{ *(.eh_frame .eh_frame_hdr .note.* .comment .gnu_debuglink) }}\n\
+         \x20  .text             : {{ *(.text .text.*) }}\n\
+         \x20  .rodata           : {{ *(.rodata .rodata.* .rodata..L*) }}\n\
+         \x20  .data.rel.ro      : {{ *(.data.rel.ro .data.rel.ro.* .data.rel.ro..L*) }}\n\
+         \x20  .data             : {{ *(.data .data.*) }}\n\
+         \x20  .bss              : {{ *(.bss .bss.* COMMON) }}\n\
+         \x20  .eh_frame         : {{ KEEP(*(.eh_frame)) }}\n\
+         \x20  .gcc_except_table : {{ *(.gcc_except_table .gcc_except_table.*) }}\n\
+         \x20  /DISCARD/         : {{ *(.eh_frame_hdr .note.* .comment .gnu_debuglink) }}\n\
          }}\n"
     );
     std::fs::write(path, script).with_context(|| format!("write {}", path.display()))?;
