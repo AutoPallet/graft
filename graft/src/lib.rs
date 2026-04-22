@@ -11,6 +11,7 @@ pub mod elf_attach;
 pub mod graph;
 pub mod hash;
 pub mod metadata;
+pub mod overlay;
 pub mod scan;
 pub mod subcommands;
 

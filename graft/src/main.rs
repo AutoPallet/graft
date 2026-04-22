@@ -17,10 +17,7 @@ fn main() -> ExitCode {
 
     match env::var("GRAFT").as_deref() {
         Ok("base") => graft::base::link(args),
-        Ok("overlay") => {
-            eprintln!("graft: overlay mode not yet implemented");
-            ExitCode::from(2)
-        }
+        Ok("overlay") => graft::overlay::link(args),
         _ => passthrough(&args[1..]),
     }
 }
