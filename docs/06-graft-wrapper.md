@@ -85,64 +85,70 @@ Unused.
 
 ## Base mode
 
+Pre-scan and real-link run concurrently — hashing every `.o` and
+running the real linker touch the same inputs but are independent
+operations. `ld` is the slow part; hashing hides under its runtime.
+
 ```
-graft::base::link(argv) →
-    pre_scan_inputs(argv)     // 1
-    real_link(argv)           // 2
-    post_link_metadata()      // 3
-    attach_sections()         // 4
-    elf2image()               // 5 (optional)
+graft::base::link(argv):
+    let (pre_scan_tx, ld_tx) = spawn2(
+        || pre_scan_inputs(argv),          // thread A
+        || exec_real_ld(argv + build_id),  // thread B
+    );
+    let pre = pre_scan_tx.join()?;
+    ld_tx.join()?;                          // must succeed for the rest
+    let post = post_link_metadata();
+    attach_graft_sections(pre, post);
+    if dest_is_flashable() { elf2image(); }
 ```
 
-### 1. Pre-scan inputs
+### Pre-scan (concurrent)
 
 Walk every `.rcgu.o`, `.o`, and every member of every `.rlib` in argv.
 For each section (`SHT_PROGBITS` or `SHT_NOBITS` with `SHF_ALLOC`):
 
 - Canonicalize relocations: replace target symbol indices with symbol
   names; sort by (offset, name).
-- Compute `blake3(section_bytes || postcard(canon_relocs))`. This hash
-  is the section's content identity, independent of link-time layout.
-- Record `(obj_id, section_name, hash, relocs, defined_symbols)`.
+- Compute `blake3(section_bytes || postcard(canon_relocs))`.
+- Record `(obj_id, section_name, hash, defined_symbols, st_bind)` per
+  symbol. (We only need `section_hash` per symbol for the table we
+  publish — no need to persist reloc lists or section bytes; overlay
+  has its own copies of the input objects.)
 
-Walk every symbol table entry: record `(symbol_name → (obj_id,
-section_name, st_bind))`. `st_bind` matters for PROVIDE eligibility
-later (only `STB_GLOBAL`/`STB_WEAK` can be PROVIDE'd into the overlay
-link).
+Time budget: blake3 hashing 10-15 MB of `.rcgu.o` is ~50 ms on a
+modern laptop. Parallelized across files. `xtensa-esp-elf-ld` on the
+same inputs is typically 500-2000 ms — pre-scan hides entirely under
+ld's runtime, adding 0 ms to wall-clock base build.
 
-Time budget: hashing 10-15 MB of `.rcgu.o` with blake3 is ~50 ms on a
-modern laptop. Parallel per file.
-
-### 2. Real link
+### Real link (concurrent)
 
 Append `--build-id=sha1` if not already present. Exec `GRAFT_REAL_LD`
-with the argv. Wait for it; propagate nonzero exits.
+with the argv. Wait; propagate nonzero exits.
 
-### 3. Post-link metadata
+### Post-link metadata
 
 Re-open the produced ELF. From standard fields:
 
 - `.symtab` → `(name → st_value, st_size, st_bind)`.
 - `NT_GNU_BUILD_ID` note → `BASE_ABI_VERSION` (20 bytes).
-- Section headers → `(.text, .rodata, .bss, …)` address ranges, for
-  overlay region placement.
+- Section headers → address ranges of `.text`, `.rodata`, `.bss`, for
+  overlay-region placement.
 
-Check for the "dropped symbols" set: symbols that existed in the
-pre-scan `(symbol_name → defining_section)` but aren't in the final
-`.symtab`. Those got GC'd, ICF-folded, or COMDAT-deduped. We still need
-their bytes available for the overlay closure post-pass, so their
-source sections stay in `.graft.objects`.
+Join with pre-scan output: for every symbol present in the final
+`.symtab`, look up its pre-scan `section_hash`. Symbols that were
+dropped (GC'd, ICF-folded, COMDAT-deduped, weakly overridden) don't
+appear in `.symtab` and are simply absent from the published table —
+overlay will miss on them and include their defining section from its
+own inputs.
 
-### 4. Attach sections
+### Attach `.graft.*` sections
 
-Construct the `.graft.*` metadata sections (schema below) and attach
-via `object` crate (write a new ELF directly) or shell out to
-`objcopy --add-section`. Direct-write is faster and gives us control
-over section flags; use that. All sections `SHF_ALLOC=0` so they live
-in the file but not in any `PT_LOAD` — `esptool elf2image` ignores
-them, base.bin stays lean.
+Build the two metadata sections (schema below) and write a new ELF
+directly via the `object` crate. All metadata sections `SHF_ALLOC=0`
+so they live in the file but not in any `PT_LOAD` — `esptool
+elf2image` ignores them, base.bin stays lean.
 
-### 5. elf2image (optional)
+### elf2image (optional)
 
 If `GRAFT_DEST` indicates a flashable destination, invoke `esptool
 elf2image` to produce `base.bin`. Otherwise stop at the ELF.
@@ -168,42 +174,47 @@ Same as base-mode argv parsing: identify inputs, output path, scripts.
 
 ### 2. Load base metadata
 
-Read `GRAFT_BASE_ELF`. Validate `.graft.manifest` version. Extract:
+Read `GRAFT_BASE_ELF`. Validate `.graft.manifest` version + the
+toolchain stamp. Extract:
 
-- `.graft.hashes` → `(obj_id, section_name) → hash`
-- `.graft.symidx` → `symbol_name → (obj_id, section_name, st_bind,
-  final_address)`
-- `.graft.graph` → `(obj_id, section_name) → [reloc_target_symbol, …]`
-- `.graft.objects` → archived bytes of every input object file, for
-  re-emission of dropped-at-link-time sections
-- `.graft.manifest.base_abi` → must match what the overlay records
+- `.graft.symhash` → `symbol_name → (section_hash, address, size,
+  bind)` for every symbol live in base's final `.symtab`.
+- `.graft.manifest.base_abi` — must match what the overlay records.
 
-Cache these in memory for the duration of the link.
+That's it. No archived object bytes (overlay has its own inputs),
+no forward-reloc graph from base (overlay builds its own from its
+own inputs), no pre-link section index (redundant with the symbol
+table).
 
 ### 3. Hash and graph the overlay inputs
 
-Same pre-scan as base mode, but over this link's inputs. This gives
-us the current `(section → hash)` to compare against base's cached
-hashes, plus this link's forward-reloc graph.
-
-Classification per section:
-- **Unchanged**: same name appears in base with same hash.
-- **Changed**: same name appears in base with different hash.
-- **New**: name not in base at all.
+Pre-scan this link's inputs: per-section content hash and per-section
+forward-reloc list. Build `symbol_name → defining_section` from
+overlay's own inputs.
 
 ### 4. Compute closure
 
-Memoized forward-reloc walk from `main` (doc 05 § 167). `needs_overlay(s)`
-= `changed/new` OR any reloc target needs overlay. Closure = memo's
-truthy set.
+Forward-reloc walk from `main`, as in doc 05 § 2. For each section:
+`needs_overlay` = (no matching hash in base.symhash for any symbol
+defined in this section) OR (any forward-reloc-target section needs
+overlay).
 
-Post-pass for dropped-at-link-time: for each closure reloc targeting a
-symbol not in base's post-link `.symtab` and not in the closure, add
-the defining section from `.graft.objects` to the closure. Iterate to
-fixed point.
+Cycles: run Tarjan's SCC over the forward-reloc graph first, then the
+walk operates on the SCC DAG (each SCC is changed iff any member is
+locally changed or any successor SCC is changed). O(V+E) total. If
+Tarjan is deferred for v0, fall back to fixed-point iteration over
+per-section flags — correct but O(V·depth).
 
-Also: for each closure reloc targeting a `STB_LOCAL` symbol in base,
-pull the defining section into the closure (can't PROVIDE locals).
+Special case: reloc target is a symbol defined in base's `.symtab`
+with `st_bind == STB_LOCAL`. `PROVIDE` can't bind locals, so treat as
+a miss and include the defining section in the overlay (overlay has
+the bytes in its own inputs).
+
+After the walk: closure = sections with `needs_overlay == True`.
+PROVIDE entries = symbols defined in unchanged sections (memo entry
+False) that are transitively referenced by closure sections, plus
+any external reloc target (e.g. libc symbols) that base's `.symtab`
+carries.
 
 ### 5. Assemble consolidated object
 
@@ -263,10 +274,10 @@ without `GRAFT` set use cargo normally.
 
 ## Metadata in ELF sections
 
-All stored with `SHF_ALLOC=0` / `SHT_PROGBITS`. None appear in any
-`PT_LOAD`, so `esptool elf2image` ignores them and `base.bin` stays
-lean. `objdump -h base.elf` lists them; `objdump -s -j .graft.manifest
-base.elf` hex-dumps contents.
+Two sections, both `SHF_ALLOC=0` / `SHT_PROGBITS`. Neither appears in
+any `PT_LOAD`, so `esptool elf2image` ignores them and `base.bin`
+stays lean. `objdump -h base.elf` lists them; `objdump -s -j
+.graft.manifest base.elf` hex-dumps contents.
 
 ### `.graft.manifest` (~256 B)
 
@@ -276,52 +287,42 @@ Fixed-offset root record. `postcard`-serialized for stable binary layout.
 #[derive(Serialize, Deserialize)]
 struct GraftManifest {
     magic: [u8; 4],          // b"GRFT"
-    version: u16,            // schema version, currently 1
-    base_abi: [u8; 20],      // sha1 matching NT_GNU_BUILD_ID
-    entry_symbol: String,    // "main" by convention
-    toolchain_stamp: String, // rustc -Vv hash; prevents cross-toolchain overlays
-    // Offsets/sizes are standard ELF section headers, not duplicated here.
+    version: u16,             // schema version, currently 1
+    base_abi: [u8; 20],       // sha1 matching NT_GNU_BUILD_ID
+    entry_symbol: String,     // "main" by convention
+    toolchain_stamp: String,  // rustc -Vv hash; prevents cross-toolchain overlays
+    overlay_region: (u64, u64), // link-time [start, end) address range
+                                 // reserved for overlay (informational)
 }
 ```
 
-### `.graft.objects` (~1-15 MB)
+### `.graft.symhash` (~500 KB-2 MB)
 
-A thin-ar archive of every input `.rcgu.o` / `.o` / `.rlib` member that
-contributed to base. Enables overlay mode to re-emit sections that got
-dropped from base at link time (`--gc-sections`, COMDAT dedup, ICF,
-weak-overridden). Indexed by `obj_id` — a monotonic u32 assigned at
-pre-scan time.
+One record per symbol live in base's final `.symtab`:
 
-### `.graft.hashes` (~500 KB)
+```rust
+#[derive(Serialize, Deserialize)]
+struct SymHashEntry {
+    name: String,             // mangled symbol name, as in .symtab
+    section_hash: [u8; 16],   // truncated blake3 of defining section
+                               // (bytes + canonicalized relocs), or
+                               // all-zeros if sourced from a
+                               // non-hashable input (prebuilt lib,
+                               // linker-provided symbol)
+    address: u64,             // st_value from .symtab
+    size: u32,                // st_size from .symtab
+    bind: u8,                 // STB_GLOBAL / STB_LOCAL / STB_WEAK
+}
+```
 
-Dense table of `(obj_id: u32, section_name_offset: u32, hash: [u8; 16])`.
-`section_name_offset` indexes into a string pool in `.graft.strings`.
-Sorted by `(obj_id, section_name)` for `O(log n)` lookup during overlay.
+Serialized as a `Vec<SymHashEntry>` sorted by `name` for binary search
+during overlay-mode lookups. Typical size: ~10k symbols × ~80 B =
+~800 KB. Truncated blake3 is fine — we're comparing known sections
+against cached hashes, not doing crypto.
 
-Truncated blake3 (first 16 bytes) is fine — we're comparing against
-cached hashes of the same sections, not doing crypto.
-
-### `.graft.symidx` (~200 KB)
-
-`(symbol_name_offset: u32, obj_id: u32, section_name_offset: u32,
-st_bind: u8, final_address: u64, st_size: u32)`. Sorted by
-`symbol_name`. Covers every symbol that has a `.symtab` entry after
-link, plus *surviving-in-some-form* symbols that were folded into
-another (so ICF-folded addresses resolve correctly).
-
-### `.graft.graph` (~1 MB)
-
-For each section in `.graft.objects`: the list of `(offset:
-u32, target_symbol_name_offset: u32, reloc_type: u16)` tuples. This is
-what the forward-reloc walk consumes directly — no re-parsing of object
-files needed for the common-case closure computation.
-
-### `.graft.strings` (~200 KB)
-
-Interned string pool: symbol names, section names, object file paths.
-All other sections reference strings by offset into this pool.
-Deterministic ordering (sort + dedup at build time) so byte-identical
-inputs produce byte-identical `.graft.strings`.
+`bind == STB_LOCAL` entries are included so overlay knows it *can't*
+PROVIDE them (linker script can only bind globals) and should re-emit
+the defining section from its own inputs.
 
 ### Why in-ELF rather than sidecars
 
@@ -333,8 +334,8 @@ inputs produce byte-identical `.graft.strings`.
 - Build-ID match is enforced by matching the same file's own ID.
 - Cache directory layout stops being part of graft's ABI.
 
-Cost: `base.elf` grows by ~10 MB on a non-trivial firmware. Host-only
-artifact, never flashed — totally fine.
+Cost: ~1 MB of metadata on a non-trivial firmware. Negligible for a
+host-only artifact that's never flashed.
 
 ## Test harnesses
 
@@ -351,7 +352,7 @@ subprocess.
 - `graph::tests`: forward-reloc walk on synthetic graphs
   (`Vec<(section, Vec<target>)>`) produces expected closures. Covers:
   no-change full leaf, changed-leaf bubbling to root, shared subtree
-  hit once, cycle handling, post-pass fixed point.
+  hit once, cycles (self-loop, 2-cycle, nested SCCs).
 - `metadata::tests`: manifest round-trips postcard cleanly; string
   pool deduplicates.
 - `base_symbols_ld::tests`: generator emits syntactically valid ld
@@ -419,15 +420,17 @@ serial timing); runs on-demand, not in CI.
 ## Open questions
 
 - **`.rlib` handling.** `.rlib` is `ar` archive of `.rmeta` + `.o`s.
-  Extract eagerly at pre-scan, or only on-demand when the closure
-  pulls a member? Eager is simpler; lazy saves a few MB of memory.
-  Punt: eager for v1, revisit if memory pressure appears.
-- **Cross-link parallelism.** Hashing N object files is embarrassingly
-  parallel; closure walk is serial. Start with single-threaded and
-  profile.
-- **`.graft.objects` dedup.** Many `.rcgu.o`s share template
-  instantiations — content-addressed storage inside `.graft.objects`
-  would shrink base.elf further. Probably not worth v1 complexity.
+  In overlay mode we need to hash sections in every member; extract
+  eagerly or lazy-seek? Punt: eager for v1, revisit if memory
+  pressure appears.
+- **Cycle handling: Tarjan SCC vs. fixed-point iteration.** Tarjan
+  is O(V+E), clean, and worth the ~80 lines. Fixed-point is O(V·d)
+  but takes 10 lines and handles arbitrary graphs. Ship fixed-point
+  for v0, upgrade to Tarjan when an actual build shows cycle depth
+  matters.
+- **Parallelism beyond the ld/pre-scan overlap.** Closure walk is
+  serial; overlay's input hashing is parallel. Start with
+  single-threaded overlay walk and profile.
 - **Deterministic builds.** Every artifact should be byte-identical
   for identical inputs. Postcard is deterministic; `ld` has
   `--sort-section=name` and `--hash-style=gnu` for stability; rustc

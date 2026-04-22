@@ -64,8 +64,9 @@ destination-agnostic.
   SRAM, or wherever `OVERLAY_DEST` is), optionally copies bytes from
   `OVERLAY_SRC`, zeroes overlay BSS, copies overlay `.data`, jumps to
   `OVERLAY_ENTRY`.
-- Build artifact: a section-level reverse-relocation graph + per-symbol
-  content-hash map, cached for reuse by every subsequent overlay build.
+- Build artifact: a `symbol → (section_hash, address)` table embedded
+  in base.elf itself (as custom ELF sections), consumed by every
+  subsequent overlay build.
 
 ### Overlay
 
@@ -112,21 +113,20 @@ against the old base refuse to boot.
 
 ## Determining overlay membership
 
-Three steps: hash, graph, closure.
+Two steps: hash, then a single walk from `main`.
 
 ### 1. Per-section content hashing
 
-For every section in every object file (base's `.rcgu.o`s cached from its
-build, plus overlay-candidate objects this build):
+For every section in every object file (for base: its inputs at base
+link time; for overlay: this build's inputs):
 
 - **Content hash** of a section = `blake3(section_bytes || sorted_relocs)`
   where `sorted_relocs` is a canonical encoding of each relocation as
   `(target_symbol_name, offset, reloc_type, addend)`. Symbolic — stable
   across rustc versions and CGU repartitioning.
 
-Per-section only. No transitive hash, no SCC handling — the closure
-walk in step 3 propagates changes transitively via recursion, so we
-don't need to precompute it.
+Per-section only. No transitive hash, no SCC handling — the walk in
+step 2 propagates changes transitively via recursion.
 
 Properties:
 
@@ -137,80 +137,80 @@ Properties:
 - Strictly more precise than rustc's incremental fingerprints, which can
   be conservative across compiler upgrades and CGU boundary shifts.
 
-### 2. Forward-relocation graph
+### 2. Walk from `main`
 
-Each section's relocation records — as they come out of ELF parsing,
-uninverted — are the call graph. For section `S`, `forward_relocs(S)` is
-the list of `(target_symbol, offset, reloc_type, addend)` tuples emitted
-by the compiler for that section. That's the raw data we already have;
-no separate graph construction step.
+Base publishes one table: `symbol_name → (section_hash, address)` for
+every symbol live in its final `.symtab`. That's all the overlay needs
+from base.
 
-This captures:
+The overlay builds its own forward-reloc graph from its own inputs
+(overlay has every object file cargo handed it — the same inputs that
+went into base, plus whatever rustc just rebuilt).
 
-- **Direct calls** — call instruction emits a code-section relocation
-  against the callee.
-- **Address-taken, stored in rodata** — static function tables, const
-  `fn` arrays. The rodata section has a relocation to the function.
-- **Vtables for `dyn Trait`** — compiled as rodata constants with one
-  relocation per entry.
-- **FFI callback registration** — address production requires a
-  relocation at the site passing the pointer.
-- **Closures** — the closure's captured fn-pointer field is populated via
-  a relocation somewhere in the constructing function.
+**Key invariant.** A section must go in the overlay iff it is changed
+*or* it forward-reaches any changed section. The "or" is load-bearing:
+if section `X` is unchanged but calls `A` and `A` changed, then `X`'s
+call site — as linked in base — still points at base's stale `A`
+bytes. So `X` must be re-emitted in overlay too, with its call site
+relinked against overlay's new `A`.
 
-The only hole is inline assembly that computes absolute addresses
-arithmetically with no relocation (`movi a8, 0x42001234; callx8 a8`).
-Document as a constraint: base must not do that. If it must (e.g.
-bootloader-style low-level code), mark the affected sections as "always
-live" in a sidecar allowlist.
-
-### 3. Closure computation
-
-Walk forward from `main` with a memoized per-section "needs overlay?"
-predicate:
+The walk computes that transitive closure:
 
 ```
 def needs_overlay(s):
     if s in memo: return memo[s]
-    result = (content_hash(s) != cached[s.name]) or \
-             any(needs_overlay(reloc.target) for reloc in forward_relocs(s))
-    memo[s] = result
-    return result
+    locally_changed = not base.has_matching(s, content_hash(s))
+    transitively_changed = any(
+        needs_overlay(t) for t in forward_reloc_target_sections(s)
+    )
+    memo[s] = locally_changed or transitively_changed
+    return memo[s]
 
-needs_overlay(main)    # populates memo for everything reachable from main
+needs_overlay(section_of(main))
 closure = {s for s, v in memo.items() if v}
+for s in memo:
+    if not memo[s]:        # unchanged, all descendants unchanged
+        for sym in s.defined_symbols:
+            if sym in base.symtab:
+                provides[sym] = base.symtab[sym].address
 ```
 
-Why walk down rather than up from a diff set:
+`base.has_matching(s, h)` = any symbol defined in `s` has an entry in
+base's table with that same `section_hash`. Hash miss ⇒ either
+content changed or the section was dropped from base (GC, COMDAT,
+ICF, weak-overridden) — same handling either way: include in overlay.
 
-- Natural anchoring — unreachable changes don't bloat the overlay.
-- Uses the forward-reloc graph as it comes out of ELF, no inversion.
-- O(V+E) with memoization; whole no-change subtrees cost one `False`
-  propagation.
-- Trivially parallelizable on independent callees.
+Indirect calls fall out for free: the reloc graph captures every
+address-taken reference (vtables, fn-pointer tables, closures, FFI
+callbacks). The only hole is inline assembly that computes absolute
+addresses arithmetically with no relocation — mark such sections as
+"always live" in a sidecar allowlist if any exist.
 
-Post-pass for sections dropped from base at link time (`--gc-sections`,
-COMDAT dedup, ICF, weak resolution — anything the linker pruned):
+**Cycles.** Mutual recursion, trait vtables self-referencing, any
+callback-passing dance can close a forward-reloc cycle. The naive
+recursion above returns False on re-entry, which can leak False
+verdicts into True regions of a cycle. Two ways to handle it:
 
-```
-changed = True
-while changed:
-    changed = False
-    for s in closure:
-        for reloc in forward_relocs(s):
-            t = reloc.target
-            if t.section in closure: continue        # internal to overlay
-            if t in base_symbols: continue           # PROVIDE covers it
-            closure.add(t.section)                   # dropped; pull it in
-            changed = True
-```
+- **SCC condensation** (preferred). Tarjan over the forward-reloc
+  graph gives the SCC DAG. `needs_overlay` operates on SCCs: SCC is
+  changed iff any member section is locally changed *or* any
+  successor SCC is changed. Standard DAG flow on the condensed
+  graph. O(V+E), no fiddly fixed-point.
+- **Fixed-point iteration** (fallback). Initialize `memo[s] =
+  locally_changed(s)`, then sweep: `memo[s] |= any(memo[t] for t in
+  forward(s))`. Repeat until no change. Simpler code, O(V·depth)
+  worst case — fine for typical call graphs but slow for dense
+  ones. Ship this first if SCC implementation slips.
 
-The added sections are resolved the same way as primary closure members
-— bytes + relocations carried into the overlay. Since we work at
-section granularity (`-ffunction-sections -fdata-sections`), pulling in
-a dropped symbol adds only its own section, not the enclosing .rcgu.o.
+Properties of the walk:
 
-### 4. Overlay assembly
+- Natural anchoring — sections unreachable from `main` never get
+  visited, so unreachable changes don't bloat the overlay.
+- Overlay has all object bytes already (cargo handed them to us);
+  re-emission needs no material from base beyond addresses. `.graft.*`
+  can be pure metadata, no archived objects.
+
+### 3. Overlay assembly
 
 Closure is materialized by reading each section's bytes + relocations
 from its source `.rcgu.o`, emitting a single consolidated input object,
@@ -332,15 +332,14 @@ One caveat: `PROVIDE` in the overlay link script can only target
 as global; monomorphized internal helpers occasionally land as
 `STB_LOCAL`. If the closure walk finds a reloc into a base-local
 symbol, the policy is to pull that section into the overlay (re-emit
-locally) rather than fight the linker — the closure-inclusion path
-already exists for the dropped-at-link-time case, same machinery.
+locally) — same machinery as the miss path for any section whose
+hash isn't in base's table.
 
 The only nonstandard linker flags we need on base are the section-
 granularity ones (`-ffunction-sections -fdata-sections`) plus keeping
 the symbol table (don't pass `-s`/`--strip-all`). `--gc-sections`
-stays on — base ships tighter, and the closure post-pass naturally
-pulls in any section the overlay later references that GC pruned,
-same path as COMDAT/ICF dedup.
+stays on — base ships tighter, and the overlay walk naturally pulls
+in any section the overlay needs that GC removed from base.
 
 ### Overlay build (`GRAFT=overlay cargo build`)
 
@@ -353,16 +352,14 @@ same path as COMDAT/ICF dedup.
 3. Shim in `overlay` mode:
    - Parse the link command to get the full input set (all `.rcgu.o`s
      and rlibs for this build).
-   - Load cached `base-graph.bin` and `base-syms.bin`.
+   - Load base's `.graft.*` tables from `GRAFT_BASE_ELF`.
    - Compute content hashes for every section in the current input set.
-   - Walk forward from `main`, memoized: `needs_overlay(s)` = section
-     changed OR any forward-reloc target needs overlay. Closure = memo's
-     truthy set.
-   - Post-pass: for any closure reloc targeting a symbol not in base's
-     symbol table (dropped at link time), add that symbol's section to
-     the closure. Iterate to fixed point.
-   - Emit minimal `base_symbols.ld` — PROVIDE entries for every symbol
-     targeted by a closure reloc that isn't in the closure itself.
+   - Walk from `main` with memoization: on each section, hash-lookup in
+     base's table — hit → PROVIDE, miss → include and recurse into
+     forward relocs.
+   - Emit minimal `base_symbols.ld` — PROVIDE entries for every
+     hash-hit symbol and for every external reloc target resolved via
+     base's `.symtab`.
    - Assemble one consolidated input object: concatenate closure section
      bytes, carry their relocations (rewritten to be internally
      consistent).
@@ -478,7 +475,7 @@ one compiler flag.
 | Piece | Reuse? |
 |---|---|
 | `cli/link.rs` — linker shim structure and `NoLink`-style arg capture | Yes; adapted for our modes. |
-| ELF symbol/section parsing from `HotpatchModuleCache::new` | As input to reverse-reloc graph + content-hash computation. |
+| ELF symbol/section parsing from `HotpatchModuleCache::new` | As input to content-hash computation and the forward-reloc walk. |
 | `notify`-based file watcher from `serve/` | Yes. |
 
 ## What we don't need
@@ -500,7 +497,7 @@ one compiler flag.
 
 - **No hand-rolled absolute jumps in base.** Any runtime-computed
   indirect call (e.g. in the bootloader) must come with a symbol-table
-  allowlist entry, or the reverse-reloc graph will miss its target.
+  allowlist entry, or the walk will miss its target.
 - **Base ABI stability** is enforced by `BASE_ABI_VERSION`. Any change
   to an exported signature bumps the version; overlays built against
   an older base refuse to boot. This is a loud failure, not a subtle
@@ -698,12 +695,12 @@ Deliverable: "hello world from overlay" with the handoff proven.
 
 ### M2 — content-hash + forward-reloc + closure (1 week)
 
-- Base shim caches pre-link per-section content hashes and
-  `(symbol → defining_section)` index; post-link caches the final
-  symbol→address table.
-- Implement the memoized `needs_overlay` walk from `main` over forward
-  relocations.
-- Implement the dropped-symbols fixed-point post-pass.
+- Base shim writes one `symbol → (section_hash, address)` table into
+  base.elf as `.graft.*` sections. Pre-scan runs concurrently with the
+  real linker (hashing and ld are independent; join before attach).
+- Overlay shim loads the table, hashes its own inputs, walks from
+  `main` with memoized hash-lookup: hit → PROVIDE, miss → include and
+  recurse.
 - Replace the manual split with the automatic one.
 - `-ffunction-sections -fdata-sections` on both builds.
 
@@ -715,8 +712,8 @@ containing only that function's closure up to `main`.
 - Implement `graft` as a linker shim with `GRAFT={base,overlay}` modes.
 - Install via `.cargo/config.toml` `linker = "graft"` — no
   `RUSTC_WRAPPER`.
-- Base mode: real link + post-process (graph + hashes + `esptool
-  elf2image`).
+- Base mode: real link + concurrent pre-scan; attach `.graft.*`
+  metadata sections; `esptool elf2image`.
 - Overlay mode: closure computation + minimal `base_symbols.ld` + link +
   package.
 - Dev driver: `notify` watcher → `GRAFT=overlay cargo build` → parse
@@ -741,18 +738,15 @@ containing only that function's closure up to `main`.
   operationally boring. D (SRAM, host-pushed) is the most aggressive but
   requires the host to always be present. Decide at M1 with real numbers
   on overlay size.
-- **SCC content-hash canonicalization.** Need a stable
-  within-SCC ordering. Mangled-name sort is the obvious choice but
-  sensitive to rustc's `$` hash suffixes; we may want to strip those.
 - **`-ffunction-sections` in base**: does ESP-IDF's startup code tolerate
   it? Expected yes (the GNU toolchain uses it universally), but confirm.
-- **Indirect-call conservatism**: what fraction of the reverse-reloc
-  graph is noise (symbols referenced by unused rodata)? Profile on a
-  real project; if noisy, add an allowlist of "canonical roots" (e.g.
+- **Indirect-call conservatism**: what fraction of the reloc graph is
+  noise (symbols referenced by unused rodata)? Profile on a real
+  project; if noisy, add an allowlist of "canonical roots" (e.g.
   `main`, ISR vectors) and walk only from those.
 - **Closure stability across edits**. Want two consecutive builds with
-  the same source to produce byte-identical overlays. Requires
-  deterministic SCC ordering and stable section sort in the output.
+  the same source to produce byte-identical overlays. Requires stable
+  section sort in the output and deterministic hash ordering.
 - **Overlay reboot cost**. Boot time for ESP32-S3 from reset to
   `launch_overlay` is typically 100-300 ms. Dominates the loop when
   delivery is fast (destination D). Worth measuring before optimizing
