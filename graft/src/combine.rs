@@ -38,6 +38,22 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
         bail!("{}: not an ELF", overlay_path.display());
     }
 
+    // Empty overlay (ET_REL with no PHT) means the closure was empty —
+    // nothing to splice, nothing to trampoline. Combined output is just
+    // base verbatim.
+    let ov_etype = u16::from_le_bytes(overlay_bytes[16..18].try_into().unwrap());
+    let ov_phnum = u16::from_le_bytes(overlay_bytes[56..58].try_into().unwrap());
+    if ov_etype == object::elf::ET_REL || ov_phnum == 0 {
+        std::fs::write(output_path, &base_bytes)
+            .with_context(|| format!("write {}", output_path.display()))?;
+        return Ok(Stats {
+            trampolines: Vec::new(),
+            overlay_load_size: 0,
+            overlay_vaddr: 0,
+            combined_size: base_bytes.len() as u64,
+        });
+    }
+
     // Find overlay's unique PT_LOAD via raw PHT walk.
     let ov_phdrs = read_program_headers(&overlay_bytes)?;
     let loads: Vec<&Elf64Phdr> = ov_phdrs.iter().filter(|p| p.p_type == PT_LOAD).collect();
