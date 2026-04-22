@@ -109,16 +109,24 @@ For each section (`SHT_PROGBITS` or `SHT_NOBITS` with `SHF_ALLOC`):
 
 - Canonicalize relocations: replace target symbol indices with symbol
   names; sort by (offset, name).
-- Compute `blake3(section_bytes || postcard(canon_relocs))`.
-- Record `(obj_id, section_name, hash, defined_symbols, st_bind)` per
-  symbol. (We only need `section_hash` per symbol for the table we
-  publish — no need to persist reloc lists or section bytes; overlay
-  has its own copies of the input objects.)
+- Build the forward-reloc graph across all sections.
+- Tarjan SCC on the graph. Compute the transitive hash per SCC in
+  reverse-topological order of the SCC DAG:
+  `trans_hash(scc) = blake3(concat(sorted(member.bytes ||
+  postcard(canonical_relocs(member)))) || concat(sorted(
+  trans_hash(successor_scc))))`. Every member section inherits the
+  SCC's hash.
+- Record `(symbol_name, trans_hash, address=0 placeholder, size=0,
+  bind)` — address/size are filled in from `.symtab` after the real
+  link completes.
 
 Time budget: blake3 hashing 10-15 MB of `.rcgu.o` is ~50 ms on a
-modern laptop. Parallelized across files. `xtensa-esp-elf-ld` on the
-same inputs is typically 500-2000 ms — pre-scan hides entirely under
-ld's runtime, adding 0 ms to wall-clock base build.
+modern laptop; Tarjan + transitive propagation adds ~20 ms.
+Parallelized across files for the initial byte hashing (the reloc
+graph construction and SCC pass are serial but fast).
+`xtensa-esp-elf-ld` on the same inputs is typically 500-2000 ms —
+pre-scan hides entirely under ld's runtime, adding 0 ms to
+wall-clock base build.
 
 ### Real link (concurrent)
 
@@ -135,11 +143,12 @@ Re-open the produced ELF. From standard fields:
   overlay-region placement.
 
 Join with pre-scan output: for every symbol present in the final
-`.symtab`, look up its pre-scan `section_hash`. Symbols that were
-dropped (GC'd, ICF-folded, COMDAT-deduped, weakly overridden) don't
-appear in `.symtab` and are simply absent from the published table —
-overlay will miss on them and include their defining section from its
-own inputs.
+`.symtab`, look up its pre-scan `trans_hash` and fill in the
+`address` and `size` fields. Symbols that were dropped (GC'd,
+ICF-folded, COMDAT-deduped, weakly overridden) don't appear in
+`.symtab` and are simply omitted from the published table — overlay
+will miss on them and include their defining section from its own
+inputs.
 
 ### Attach `.graft.*` sections
 
@@ -177,44 +186,40 @@ Same as base-mode argv parsing: identify inputs, output path, scripts.
 Read `GRAFT_BASE_ELF`. Validate `.graft.manifest` version + the
 toolchain stamp. Extract:
 
-- `.graft.symhash` → `symbol_name → (section_hash, address, size,
-  bind)` for every symbol live in base's final `.symtab`.
+- `.graft.symhash` → `symbol_name → (trans_hash, address, size, bind)`
+  for every symbol live in base's final `.symtab`.
 - `.graft.manifest.base_abi` — must match what the overlay records.
 
-That's it. No archived object bytes (overlay has its own inputs),
-no forward-reloc graph from base (overlay builds its own from its
-own inputs), no pre-link section index (redundant with the symbol
-table).
+### 3. Hash the overlay inputs
 
-### 3. Hash and graph the overlay inputs
-
-Pre-scan this link's inputs: per-section content hash and per-section
-forward-reloc list. Build `symbol_name → defining_section` from
-overlay's own inputs.
+Same SCC + transitive-hash pass as base mode, over this link's inputs.
+`trans_hash` per section; `symbol → defining_section` index built
+along the way.
 
 ### 4. Compute closure
 
-Forward-reloc walk from `main`, as in doc 05 § 2. For each section:
-`needs_overlay` = (no matching hash in base.symhash for any symbol
-defined in this section) OR (any forward-reloc-target section needs
-overlay).
+Reachability walk from `main` over the overlay's forward-reloc graph.
+For each reachable section `s`:
 
-Cycles: run Tarjan's SCC over the forward-reloc graph first, then the
-walk operates on the SCC DAG (each SCC is changed iff any member is
-locally changed or any successor SCC is changed). O(V+E) total. If
-Tarjan is deferred for v0, fall back to fixed-point iteration over
-per-section flags — correct but O(V·depth).
+- Pick any symbol defined in `s` and look it up in
+  `base.symhash`. If base recorded a matching `trans_hash`, emit
+  PROVIDE entries for every symbol `s` defines (addresses from
+  base.symhash).
+- Otherwise: add `s` to the closure.
+
+That's the whole decision. Cycle handling lives in step 3 (SCC
+condensation during hash computation); the walk itself is pure DFS
+with a visited set.
 
 Special case: reloc target is a symbol defined in base's `.symtab`
-with `st_bind == STB_LOCAL`. `PROVIDE` can't bind locals, so treat as
-a miss and include the defining section in the overlay (overlay has
-the bytes in its own inputs).
+with `st_bind == STB_LOCAL`. `PROVIDE` can't bind locals, so treat
+as a miss and include the defining section in the overlay (overlay
+has the bytes in its own inputs).
 
-After the walk: closure = sections with `needs_overlay == True`.
-PROVIDE entries = symbols defined in unchanged sections (memo entry
-False) that are transitively referenced by closure sections, plus
-any external reloc target (e.g. libc symbols) that base's `.symtab`
-carries.
+After the walk: closure = all sections with no hash match. PROVIDE
+entries = symbols in matched sections, plus any reloc target not
+defined in the closure that `base.symhash` knows about (libc from
+prebuilt `.a`, linker-provided, etc.).
 
 ### 5. Assemble consolidated object
 
@@ -304,11 +309,14 @@ One record per symbol live in base's final `.symtab`:
 #[derive(Serialize, Deserialize)]
 struct SymHashEntry {
     name: String,             // mangled symbol name, as in .symtab
-    section_hash: [u8; 16],   // truncated blake3 of defining section
-                               // (bytes + canonicalized relocs), or
-                               // all-zeros if sourced from a
+    trans_hash: [u8; 16],     // truncated blake3 transitive hash of
+                               // defining section (bytes +
+                               // canonical relocs + SCC-successor
+                               // trans_hashes). Sections in the same
+                               // SCC share one trans_hash.
+                               // All-zeros if sourced from a
                                // non-hashable input (prebuilt lib,
-                               // linker-provided symbol)
+                               // linker-provided symbol).
     address: u64,             // st_value from .symtab
     size: u32,                // st_size from .symtab
     bind: u8,                 // STB_GLOBAL / STB_LOCAL / STB_WEAK
@@ -423,14 +431,10 @@ serial timing); runs on-demand, not in CI.
   In overlay mode we need to hash sections in every member; extract
   eagerly or lazy-seek? Punt: eager for v1, revisit if memory
   pressure appears.
-- **Cycle handling: Tarjan SCC vs. fixed-point iteration.** Tarjan
-  is O(V+E), clean, and worth the ~80 lines. Fixed-point is O(V·d)
-  but takes 10 lines and handles arbitrary graphs. Ship fixed-point
-  for v0, upgrade to Tarjan when an actual build shows cycle depth
-  matters.
-- **Parallelism beyond the ld/pre-scan overlap.** Closure walk is
-  serial; overlay's input hashing is parallel. Start with
-  single-threaded overlay walk and profile.
+- **Parallelism beyond the ld/pre-scan overlap.** Byte hashing is
+  embarrassingly parallel; Tarjan + the reverse-topological hash
+  propagation are serial but fast. Reachability walk is serial.
+  Start single-threaded on all of it and profile.
 - **Deterministic builds.** Every artifact should be byte-identical
   for identical inputs. Postcard is deterministic; `ld` has
   `--sort-section=name` and `--hash-style=gnu` for stability; rustc

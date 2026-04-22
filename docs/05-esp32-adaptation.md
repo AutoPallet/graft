@@ -113,72 +113,99 @@ against the old base refuse to boot.
 
 ## Determining overlay membership
 
-Two steps: hash, then a single walk from `main`.
+Two steps: compute a transitive content hash per section, then walk
+reachability from `main` and compare.
 
-### 1. Per-section content hashing
+### 1. Transitive content hashes
 
 For every section in every object file (for base: its inputs at base
-link time; for overlay: this build's inputs):
-
-- **Content hash** of a section = `blake3(section_bytes || sorted_relocs)`
-  where `sorted_relocs` is a canonical encoding of each relocation as
-  `(target_symbol_name, offset, reloc_type, addend)`. Symbolic — stable
-  across rustc versions and CGU repartitioning.
-
-Per-section only. No transitive hash, no SCC handling — the walk in
-step 2 propagates changes transitively via recursion.
-
-Properties:
-
-- Whitespace or reformatting edits that don't affect codegen produce
-  identical hashes — no cascade.
-- Across-branch caching works: switching branches back and forth
-  converges on the same hashes, zero overlay.
-- Strictly more precise than rustc's incremental fingerprints, which can
-  be conservative across compiler upgrades and CGU boundary shifts.
-
-### 2. Walk from `main`
-
-Base publishes one table: `symbol_name → (section_hash, address)` for
-every symbol live in its final `.symtab`. That's all the overlay needs
-from base.
-
-The overlay builds its own forward-reloc graph from its own inputs
-(overlay has every object file cargo handed it — the same inputs that
-went into base, plus whatever rustc just rebuilt).
-
-**Key invariant.** A section must go in the overlay iff it is changed
-*or* it forward-reaches any changed section. The "or" is load-bearing:
-if section `X` is unchanged but calls `A` and `A` changed, then `X`'s
-call site — as linked in base — still points at base's stale `A`
-bytes. So `X` must be re-emitted in overlay too, with its call site
-relinked against overlay's new `A`.
-
-The walk computes that transitive closure:
+link time; for overlay: this build's inputs), the **transitive hash**
+captures both the section's own bytes+relocs and everything it
+forward-references:
 
 ```
-def needs_overlay(s):
-    if s in memo: return memo[s]
-    locally_changed = not base.has_matching(s, content_hash(s))
-    transitively_changed = any(
-        needs_overlay(t) for t in forward_reloc_target_sections(s)
-    )
-    memo[s] = locally_changed or transitively_changed
-    return memo[s]
+trans_hash(s) = blake3(
+    section_bytes(s)
+    || postcard(canonical_relocs(s))
+    || concat(sorted(trans_hash(target) for target in outgoing(s)))
+)
+```
 
-needs_overlay(section_of(main))
-closure = {s for s, v in memo.items() if v}
-for s in memo:
-    if not memo[s]:        # unchanged, all descendants unchanged
+`canonical_relocs(s)` is each reloc encoded as `(target_symbol_name,
+offset, reloc_type, addend)`, sorted — symbolic, stable across rustc
+versions and CGU repartitioning.
+
+**Cycles** are handled by SCC condensation at hash time. Tarjan over
+the forward-reloc graph; every member of an SCC gets one shared
+transitive hash computed by hashing `concat(sorted(members' bytes +
+canonical relocs)) || concat(sorted(trans_hashes of out-of-SCC
+successor SCCs))`. Standard graph-hashing technique. Cost: O(V+E)
+for Tarjan + O(V+E) for the hash pass. All cycle handling lives
+here and only here.
+
+**External edges** — reloc targets defined outside our input set
+(libc from a prebuilt `.a`, linker-provided symbols, runtime
+intrinsics). When computing a section's trans_hash, we need the
+target's trans_hash. Policy: for each target symbol, if it's defined
+in our inputs, recurse; otherwise use the all-zero sentinel hash. Base
+records the all-zero hash too for such symbols, so base and overlay
+agree.
+
+Why transitive hashing is the right primitive:
+
+- If `X` calls `A` and `A` changed, `trans_hash(X)` in the overlay
+  differs from base's `trans_hash(X)` — because it folds in
+  overlay's `trans_hash(A)`, which differs from base's. The
+  "unchanged ancestor calling stale descendant" problem is absorbed
+  into the hash; no transitive walk needed at overlay time.
+- Whitespace/reformatting edits that don't change codegen produce
+  identical hashes throughout the graph — no cascade.
+- Across-branch caching works: equivalent source converges on
+  equivalent hashes.
+- Strictly more precise than rustc's incremental fingerprints.
+
+### 2. Reachability walk from `main`
+
+Base publishes one table: `symbol_name → (trans_hash, address)` for
+every symbol live in its final `.symtab`. The overlay's job is:
+
+```
+visited = {}
+def walk(s):
+    if s in visited: return
+    visited.add(s)
+    for reloc in forward_relocs(s):
+        t = overlay.find_defining_section(reloc.target)
+        if t is not None: walk(t)
+        # else: truly external; no section to pull in
+
+walk(section_of(main))
+
+closure = set()
+for s in visited:
+    h = overlay.trans_hash(s)
+    if any(sym in base.symhash and base.symhash[sym].trans_hash == h
+           for sym in s.defined_symbols):
         for sym in s.defined_symbols:
-            if sym in base.symtab:
-                provides[sym] = base.symtab[sym].address
+            if sym in base.symhash:
+                provides[sym] = base.symhash[sym].address
+    else:
+        closure.add(s)
+
+for target_name in { r.target for s in closure for r in s.relocs }:
+    if target_name in base.symhash:
+        provides[target_name] = base.symhash[target_name].address
+    # else: must be defined in closure (find_defining found it above)
 ```
 
-`base.has_matching(s, h)` = any symbol defined in `s` has an entry in
-base's table with that same `section_hash`. Hash miss ⇒ either
-content changed or the section was dropped from base (GC, COMDAT,
-ICF, weak-overridden) — same handling either way: include in overlay.
+That's the whole algorithm. Reachability from main filters out
+unused workspace code; the transitive hash comparison does change
+detection. No "does any descendant need overlay?" recursion at
+overlay time — the hash already answered that.
+
+Hash miss ⇒ either content changed, or a transitive descendant
+changed, or the section was dropped from base (GC, COMDAT, ICF,
+weakly overridden) — same handling either way: include in overlay.
 
 Indirect calls fall out for free: the reloc graph captures every
 address-taken reference (vtables, fn-pointer tables, closures, FFI
@@ -186,29 +213,15 @@ callbacks). The only hole is inline assembly that computes absolute
 addresses arithmetically with no relocation — mark such sections as
 "always live" in a sidecar allowlist if any exist.
 
-**Cycles.** Mutual recursion, trait vtables self-referencing, any
-callback-passing dance can close a forward-reloc cycle. The naive
-recursion above returns False on re-entry, which can leak False
-verdicts into True regions of a cycle. Two ways to handle it:
+Properties:
 
-- **SCC condensation** (preferred). Tarjan over the forward-reloc
-  graph gives the SCC DAG. `needs_overlay` operates on SCCs: SCC is
-  changed iff any member section is locally changed *or* any
-  successor SCC is changed. Standard DAG flow on the condensed
-  graph. O(V+E), no fiddly fixed-point.
-- **Fixed-point iteration** (fallback). Initialize `memo[s] =
-  locally_changed(s)`, then sweep: `memo[s] |= any(memo[t] for t in
-  forward(s))`. Repeat until no change. Simpler code, O(V·depth)
-  worst case — fine for typical call graphs but slow for dense
-  ones. Ship this first if SCC implementation slips.
-
-Properties of the walk:
-
-- Natural anchoring — sections unreachable from `main` never get
-  visited, so unreachable changes don't bloat the overlay.
+- Natural anchoring — unreachable-from-`main` edits don't bloat the
+  overlay.
 - Overlay has all object bytes already (cargo handed them to us);
   re-emission needs no material from base beyond addresses. `.graft.*`
-  can be pure metadata, no archived objects.
+  is pure metadata, no archived objects.
+- Cycle handling sits entirely in step 1, once per build, at base
+  link time *and* overlay link time independently.
 
 ### 3. Overlay assembly
 
@@ -695,12 +708,13 @@ Deliverable: "hello world from overlay" with the handoff proven.
 
 ### M2 — content-hash + forward-reloc + closure (1 week)
 
-- Base shim writes one `symbol → (section_hash, address)` table into
-  base.elf as `.graft.*` sections. Pre-scan runs concurrently with the
-  real linker (hashing and ld are independent; join before attach).
-- Overlay shim loads the table, hashes its own inputs, walks from
-  `main` with memoized hash-lookup: hit → PROVIDE, miss → include and
-  recurse.
+- Base shim writes one `symbol → (trans_hash, address)` table into
+  base.elf as `.graft.*` sections. Pre-scan (hashing + Tarjan SCC +
+  transitive propagation) runs concurrently with the real linker;
+  join before attach.
+- Overlay shim loads the table, computes its own transitive hashes,
+  reachability-walks from `main`, and at each section emits a PROVIDE
+  on hash match or pulls the section into the closure on miss.
 - Replace the manual split with the automatic one.
 - `-ffunction-sections -fdata-sections` on both builds.
 
