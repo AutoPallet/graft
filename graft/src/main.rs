@@ -28,7 +28,11 @@ fn main() -> ExitCode {
 }
 
 fn passthrough(argv: &[String]) -> ExitCode {
-    let real = env::var("GRAFT_REAL_LD").unwrap_or_else(|_| "ld".into());
+    // rustc drives the "linker" as a C compiler on most hosted targets
+    // (gcc-driver flags like `-m64` and `-Wl,...` appear in argv). Default
+    // to `cc`; bare-metal targets should set GRAFT_REAL_LD explicitly
+    // (e.g. `xtensa-esp-elf-ld`) in .cargo/config.toml's `[env]`.
+    let real = env::var("GRAFT_REAL_LD").unwrap_or_else(|_| "cc".into());
     let status = Command::new(&real).args(argv).status();
     match status {
         Ok(s) => s.code().map_or(ExitCode::FAILURE, |c| ExitCode::from(c as u8)),

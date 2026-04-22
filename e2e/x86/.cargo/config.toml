@@ -1,0 +1,9 @@
+# Wire the graft shim in as the linker. Path is relative to this
+# workspace's root (`e2e/x86/`), not the package dir, per cargo's
+# resolution rules. This .cargo/config.toml is *also* inherited by
+# the outer workspace when cargo is invoked from a child of this
+# directory — so build graft itself from the repo root (`cd ../..`)
+# to avoid a circular dependency.
+
+[target.x86_64-unknown-linux-gnu]
+linker = "../../target/debug/graft"
