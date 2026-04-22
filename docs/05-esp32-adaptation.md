@@ -340,13 +340,15 @@ streams, or linker-script tricks required:
 - **Build ID** via standard `--build-id=sha1` → `NT_GNU_BUILD_ID` note.
   Seed for `BASE_ABI_VERSION` without hand-rolling anything.
 
-One caveat: `PROVIDE` in the overlay link script can only target
-`STB_GLOBAL` symbols. Rust `pub` items and `extern "C"` symbols land
-as global; monomorphized internal helpers occasionally land as
-`STB_LOCAL`. If the closure walk finds a reloc into a base-local
-symbol, the policy is to pull that section into the overlay (re-emit
-locally) — same machinery as the miss path for any section whose
-hash isn't in base's table.
+`PROVIDE` creates a new global in the overlay's own link, so it
+works for any symbol name regardless of what bind that symbol had in
+base. The only snag is name collisions in base's `.symtab`: two
+`STB_LOCAL` symbols with identical mangled names (different TUs) are
+valid in ELF but ambiguous for our lookup-by-name PROVIDE. Base-mode
+detects collisions at attach time and either disambiguates by
+appending a hex address suffix or fails with a diagnostic — rustc v0
+mangling includes per-symbol hashes, so collisions are very rare in
+practice.
 
 The only nonstandard linker flags we need on base are the section-
 granularity ones (`-ffunction-sections -fdata-sections`) plus keeping
@@ -644,6 +646,36 @@ gets the tool written first; extends to n-overlay when stacking ships.
 
 Plain ESP32-S3 Rust project, one partition, `cargo run`. Measure full
 edit→running time. Record the "before."
+
+### M0.25 — rustc stability probe (~1 day)
+
+Empirical check that the symbol/section stability assumptions hold,
+before committing implementation time to the content-hash mechanism.
+
+On a representative small Rust project (maybe a stripped-down
+esp-hal-template or even a pure x86 workspace — the target
+architecture doesn't matter for this):
+
+- Build twice back-to-back with no source changes.
+  `sha256sum target/.../deps/*.o` → are the hashes identical?
+- Add an unrelated `fn noop() {}` to an untouched module, rebuild.
+  Do symbol names of unaffected functions change? Do their mangled
+  names or `.llvm.<hash>` suffixes shift? Do their section bytes
+  drift?
+- Bump `codegen-units` from default to 1 and back. Does anything
+  meaningful move?
+- Toggle LTO off/thin/fat. Record how much drift each introduces.
+
+Expected outcome: with LTO off and default rustc, byte-identical
+rebuilds and stable symbol names across unrelated edits.
+
+If the picture isn't clean, the mitigation menu is: require
+`-Cllvm-args=-import-instr-limit=0` (disable cross-module inlining),
+pin rustc version in `rust-toolchain.toml`, strip `.llvm.<hash>`
+suffixes in canonical reloc encoding, exclude section names from
+hashes (already the case — noting it here for completeness).
+
+This is cheap to run and de-risks a foundational assumption.
 
 ### M0.5 — x86-64 Linux prototype (~1 week)
 

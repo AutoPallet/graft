@@ -150,12 +150,25 @@ ICF-folded, COMDAT-deduped, weakly overridden) don't appear in
 will miss on them and include their defining section from its own
 inputs.
 
+**Name-collision detection.** ELF permits multiple `STB_LOCAL`
+symbols with the same name (different TUs). When publishing
+`.graft.symhash`, walk the joined table and check for duplicate
+names. On duplicates: disambiguate by appending `.<st_value:x>` to
+each colliding entry's name, and record the renaming in
+`.graft.manifest.collisions` so overlay mode can apply the same
+rewriting when looking up a reloc target. In practice rustc v0
+mangling hashes make collisions vanishingly rare, so the common path
+hits zero renames.
+
 ### Attach `.graft.*` sections
 
 Build the two metadata sections (schema below) and write a new ELF
-directly via the `object` crate. All metadata sections `SHF_ALLOC=0`
-so they live in the file but not in any `PT_LOAD` — `esptool
-elf2image` ignores them, base.bin stays lean.
+directly via the `object` crate — `object::read` to parse, then
+`object::write::elf::Writer` to emit a new ELF with the original
+sections copied plus our two appended. ~100 LOC. All metadata sections
+`SHF_ALLOC=0` so they live in the file but not in any `PT_LOAD` —
+`esptool elf2image` ignores them, base.bin stays lean. This is a post-
+link pass today; optimizable later if profiling shows it matters.
 
 ### elf2image (optional)
 
@@ -211,15 +224,11 @@ That's the whole decision. Cycle handling lives in step 3 (SCC
 condensation during hash computation); the walk itself is pure DFS
 with a visited set.
 
-Special case: reloc target is a symbol defined in base's `.symtab`
-with `st_bind == STB_LOCAL`. `PROVIDE` can't bind locals, so treat
-as a miss and include the defining section in the overlay (overlay
-has the bytes in its own inputs).
-
 After the walk: closure = all sections with no hash match. PROVIDE
 entries = symbols in matched sections, plus any reloc target not
 defined in the closure that `base.symhash` knows about (libc from
-prebuilt `.a`, linker-provided, etc.).
+prebuilt `.a`, linker-provided, etc.). Base's bind doesn't matter —
+PROVIDE defines a new global in the overlay's link regardless.
 
 ### 5. Assemble consolidated object
 
@@ -309,6 +318,9 @@ One record per symbol live in base's final `.symtab`:
 #[derive(Serialize, Deserialize)]
 struct SymHashEntry {
     name: String,             // mangled symbol name, as in .symtab
+                               // (disambiguated with a hex-address
+                               // suffix if base had a STB_LOCAL
+                               // collision — see base-mode attach)
     trans_hash: [u8; 16],     // truncated blake3 transitive hash of
                                // defining section (bytes +
                                // canonical relocs + SCC-successor
@@ -319,18 +331,17 @@ struct SymHashEntry {
                                // linker-provided symbol).
     address: u64,             // st_value from .symtab
     size: u32,                // st_size from .symtab
-    bind: u8,                 // STB_GLOBAL / STB_LOCAL / STB_WEAK
 }
 ```
 
 Serialized as a `Vec<SymHashEntry>` sorted by `name` for binary search
-during overlay-mode lookups. Typical size: ~10k symbols × ~80 B =
-~800 KB. Truncated blake3 is fine — we're comparing known sections
+during overlay-mode lookups. Typical size: ~10k symbols × ~72 B =
+~720 KB. Truncated blake3 is fine — we're comparing known sections
 against cached hashes, not doing crypto.
 
-`bind == STB_LOCAL` entries are included so overlay knows it *can't*
-PROVIDE them (linker script can only bind globals) and should re-emit
-the defining section from its own inputs.
+Both globals and locals appear in this table. `PROVIDE` in the
+overlay's linker script defines a new global regardless of what
+bind the symbol had in base, so the overlay doesn't care.
 
 ### Why in-ELF rather than sidecars
 
@@ -396,8 +407,9 @@ in-process (no subprocess), with real `ld` shelled out to. Assertions:
   base.elf's `.symtab`.
 
 Fixtures exercise: leaf edit, mid-graph edit, main edit, dropped-
-symbol (GC'd in base, pulled in by overlay), STB_LOCAL resolution,
-weak symbol overridden, cycle in call graph.
+symbol (GC'd in base, pulled in by overlay), cross-binding reference
+(overlay calls a base function that landed as STB_LOCAL), weak
+symbol overridden, cycle in call graph.
 
 Target: ~20 fixtures, each running in 1-3 seconds. Run on every CI
 push.
