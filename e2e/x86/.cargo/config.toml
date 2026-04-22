@@ -4,6 +4,20 @@
 # the outer workspace when cargo is invoked from a child of this
 # directory — so build graft itself from the repo root (`cd ../..`)
 # to avoid a circular dependency.
+#
+# Target is musl + static + non-PIE: overlay mode needs base to be
+# fully statically linked with absolute addresses, so every symbol
+# (including things like `_Unwind_Resume` that would otherwise be
+# dyn-resolved) has a permanent address we can PROVIDE in overlay's
+# own link. Combine then becomes a pure splice operation — no
+# relocation work at combine time.
 
-[target.x86_64-unknown-linux-gnu]
+[build]
+target = "x86_64-unknown-linux-musl"
+
+[target.x86_64-unknown-linux-musl]
 linker = "../../target/debug/graft"
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "relocation-model=static",
+]
