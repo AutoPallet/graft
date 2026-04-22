@@ -532,12 +532,65 @@ Interactions:
   which is correct: those call sites are themselves shadowed.
 - **Debuggability cost.** A given symbol now lives at whichever address
   the newest defining overlay put it at; tooling that reads a single
-  ELF breaks. Fix is a combined-ELF dump produced from base + manifest
-  stack on demand, not continuously.
+  ELF breaks. See the combined-ELF tool below.
 
 Not on the critical path. The M2 closure machinery composes with this
 directly — the only new work is manifest persistence and the
 newest-first shadow walk during `base_symbols.ld` generation.
+
+## Tooling: combined ELF snapshots
+
+A "combined ELF" is a synthesized single ELF that represents the
+effective program state at a given moment: base collapsed with its
+overlay stack, shadow chain resolved, one entry per live symbol. Not
+used by the device; purely a host artifact for human tools.
+
+Uses:
+
+- **Debugger attach.** `gdb` / `lldb` / `espgdb` read a single ELF for
+  symbols + DWARF. Point them at `combined.elf` and breakpoints on
+  redefined functions land at the currently-live address.
+- **Crash / core-dump triage.** A core dump plus the combined ELF that
+  was live when it fired is enough to reproduce the debugging session
+  weeks later, without replaying the edit sequence.
+- **Profiling / `addr2line` / `perf`.** Any `address → symbol + line`
+  tool works out of the box.
+- **Archiving.** `(commit_sha, combined.elf)` is a self-contained
+  record of what actually ran. No "rebuild and hope it's the same."
+
+Inputs: base's linked ELF (already kept for M2's symbol-address cache)
+plus each overlay's linked ELF (produced by the overlay link step
+before `esptool elf2image`; we just stop throwing it away).
+
+Assembly:
+
+- Start from base ELF.
+- Walk overlays oldest → newest. For each overlay:
+  - Append its allocatable sections as new `SHT_PROGBITS` / `SHT_NOBITS`
+    at their link-time `sh_addr`. No relocations — overlays are already
+    fully linked.
+  - Merge its DWARF sections (`.debug_info`, `.debug_line`,
+    `.debug_abbrev`, …) by concatenation. Absolute-address CUs compose
+    cleanly; line tables index into the merged string pool.
+  - Update `.symtab` / `.dynsym`: for each symbol the overlay defines,
+    remove any prior entry of the same name and insert the new one.
+    Older versions' symbols can optionally be retained under a
+    synthesized name (`foo.v2`, `foo.v3`) for historical stack traces —
+    addresses are still valid, just shadowed.
+- Rebuild section headers and string tables. Done.
+
+Where it runs: host only, on demand. Build cache already keeps every
+base + overlay ELF; the tool is pure offline assembly. Reasonable
+target: ~100ms for a ten-overlay stack.
+
+Implementation: `object` crate to parse/write ELF, `gimli` for DWARF
+section merging. ~500 lines of Rust. Could live as a `dx-esp snapshot`
+subcommand or a separate `dx-esp-combine` binary.
+
+Works for the non-stacked case too: `combine(base, single_overlay)`
+gives you a debuggable ELF for the current edit cycle even without
+stacking landed. Natural to build in M4 as a quality-of-life tool, then
+extend to n-overlay when stacking ships.
 
 ## Milestones
 
@@ -633,6 +686,8 @@ containing only that function's closure up to `main`.
 - Profile `ld`; if it exceeds ~40% of loop time, replace with an
   in-driver linker.
 - `BASE_ABI_VERSION` mismatch UX.
+- `dx-esp snapshot` combined-ELF tool (base + single overlay first;
+  extends to n-overlay when stacking ships).
 - Optional: start exploring the hot-patch extension.
 
 ## Open questions
