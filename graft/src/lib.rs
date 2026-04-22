@@ -4,10 +4,14 @@
 //! tests can drive work in-process. See `docs/06-graft-wrapper.md`.
 
 pub mod archive;
+pub mod argv;
+pub mod base;
 pub mod elf;
+pub mod elf_attach;
 pub mod graph;
 pub mod hash;
 pub mod metadata;
 pub mod scan;
+pub mod subcommands;
 
-pub use metadata::{GraftManifest, SymHashEntry, GRAFT_MAGIC, SCHEMA_VERSION};
+pub use metadata::{GRAFT_MAGIC, GraftManifest, SCHEMA_VERSION, SymHashEntry};

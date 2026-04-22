@@ -6,7 +6,8 @@ fn main() -> ExitCode {
 
     if let Some(cmd) = args.get(1) {
         match cmd.as_str() {
-            "snapshot" | "combine" | "cache-info" | "clean" => {
+            "cache-info" => return graft::subcommands::cache_info(&args[2..]),
+            "snapshot" | "combine" | "clean" => {
                 eprintln!("graft: subcommand `{cmd}` not yet implemented");
                 return ExitCode::from(2);
             }
@@ -15,10 +16,7 @@ fn main() -> ExitCode {
     }
 
     match env::var("GRAFT").as_deref() {
-        Ok("base") => {
-            eprintln!("graft: base mode not yet implemented");
-            ExitCode::from(2)
-        }
+        Ok("base") => graft::base::link(args),
         Ok("overlay") => {
             eprintln!("graft: overlay mode not yet implemented");
             ExitCode::from(2)
