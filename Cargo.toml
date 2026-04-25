@@ -7,6 +7,7 @@ members = [
 exclude = [
     "probes/rustc-stability/fixture",
     "e2e/x86",
+    "esp32s3-hello",
 ]
 
 [workspace.package]
