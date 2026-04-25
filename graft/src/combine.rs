@@ -28,7 +28,10 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use object::{Object, ObjectSymbol, elf::PT_LOAD};
+use object::{
+    Object, ObjectSymbol,
+    elf::{PT_LOAD, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_PROGBITS},
+};
 
 use crate::{elf_attach, metadata};
 
@@ -129,17 +132,60 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
         );
     }
 
-    // Find every overlay PT_LOAD (one on x86, two-or-more on xtensa
-    // due to separate IROM and DROM mappings).
-    let ov_phdrs = read_program_headers(&overlay_bytes, ov_class)?;
-    let overlay_loads: Vec<Phdr> = ov_phdrs
+    // Find every overlay PT_LOAD. linkall.x emits dummy placeholder
+    // LOADs (`.rwdata_dummy`, `.vectors`) that overlap base's RAM at
+    // identical vaddrs and carry no overlay-specific data. esp-hal also
+    // page-aligns DROM/IROM PT_LOADs DOWN to a 4KB boundary, so an
+    // overlay's `.rodata` at 0x3c0019ac sits in a LOAD with
+    // p_vaddr=0x3c001000 — overlapping base's DROM by ~6 KB even though
+    // the actual content is past it. Wholesale-dropping such LOADs
+    // would lose overlay's literal pool. So we *trim* each LOAD to its
+    // non-overlapping subrange instead: keep only the bytes whose
+    // vaddrs are strictly past every base PT_LOAD.
+    let base_phdrs_for_filter = read_program_headers(&base_bytes, base_class)?;
+    let base_loads: Vec<Phdr> = base_phdrs_for_filter
         .iter()
         .copied()
         .filter(|p| p.p_type == PT_LOAD)
         .collect();
-    if overlay_loads.is_empty() {
-        bail!("{}: no PT_LOAD in overlay", overlay_path.display());
+    let ov_phdrs = read_program_headers(&overlay_bytes, ov_class)?;
+    let mut overlay_loads: Vec<Phdr> = Vec::new();
+    for ov in ov_phdrs.iter().filter(|p| p.p_type == PT_LOAD) {
+        if ov.p_filesz == 0 {
+            continue;
+        }
+        // Highest base end-vaddr that the overlay LOAD's start lands
+        // before. If we're entirely past every base LOAD, no trim.
+        let mut min_keep_vaddr = ov.p_vaddr;
+        for b in &base_loads {
+            let b_end = b.p_vaddr + b.p_memsz;
+            if ov.p_vaddr < b_end && ov.p_vaddr + ov.p_memsz > b.p_vaddr {
+                // Overlap. The non-overlapping tail starts at b_end.
+                if b_end > min_keep_vaddr {
+                    min_keep_vaddr = b_end;
+                }
+            }
+        }
+        if min_keep_vaddr >= ov.p_vaddr + ov.p_memsz {
+            // Entirely overlapped — nothing to keep.
+            continue;
+        }
+        let trim = min_keep_vaddr - ov.p_vaddr;
+        overlay_loads.push(Phdr {
+            p_type: PT_LOAD,
+            p_flags: ov.p_flags,
+            p_offset: ov.p_offset + trim,
+            p_vaddr: ov.p_vaddr + trim,
+            p_paddr: ov.p_paddr + trim,
+            p_filesz: ov.p_filesz.saturating_sub(trim),
+            p_memsz: ov.p_memsz - trim,
+            p_align: ov.p_align,
+        });
     }
+    // Empty overlay_loads is OK if the overlay closure is genuinely
+    // empty (no main redirect either) — handled by the trampoline
+    // short-circuit below. Bail only if we have trampolines but no
+    // payload, which would mean we'd jump into nothing.
 
     // Find the one symbol we bridge: base's manifest tells us which
     // user-level entry crt calls (always `main` on hosted x86-64; the
@@ -171,6 +217,13 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
         }],
         None => Vec::new(),
     };
+
+    if !trampolines.is_empty() && overlay_loads.is_empty() {
+        bail!(
+            "trampolines reference overlay but no overlay-specific \
+             PT_LOAD survived overlap trim — overlay layout broken"
+        );
+    }
 
     // No trampoline → base never jumps into overlay. KEEP()'d sections
     // can land in overlay even without a code change but are unreachable
@@ -253,6 +306,13 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
         n => bail!("unexpected e_phoff_size {n}"),
     }
     out[ho.e_phnum..ho.e_phnum + 2].copy_from_slice(&(new_phnum as u16).to_le_bytes());
+
+    // Add section headers for each overlay LOAD so downstream tools
+    // (e.g., espflash, which builds image segments by walking the
+    // section table rather than the PHT) actually see the overlay
+    // bytes. Without this, overlay's slack PT_LOADs are present in the
+    // file but invisible to espflash save-image.
+    add_overlay_section_headers(&mut out, &new_loads, base_class)?;
 
     write_executable(output_path, &out)?;
 
@@ -397,6 +457,7 @@ fn apply_trampolines(
 ) -> Result<()> {
     let loads: Vec<&Phdr> = base_phdrs.iter().filter(|p| p.p_type == PT_LOAD).collect();
     let tramp_size = crate::arch::trampoline_size(e_machine)?;
+    let prologue_size = crate::arch::trampoline_prologue_size(e_machine)?;
     for t in trampolines {
         let seg = loads
             .iter()
@@ -416,7 +477,12 @@ fn apply_trampolines(
                 tramp_size
             );
         }
-        let bytes = crate::arch::trampoline(e_machine, t.base_addr, t.overlay_addr)
+        // For arches that need to preserve a prologue (xtensa: the
+        // windowed-ABI `entry` instruction), grab those bytes BEFORE
+        // we overwrite. They live at the patch site in the (still
+        // unmodified) `out` buffer.
+        let prologue = out[file_off..file_off + prologue_size].to_vec();
+        let bytes = crate::arch::trampoline(e_machine, t.base_addr, t.overlay_addr, &prologue)
             .with_context(|| format!("encode trampoline for {}", t.name))?;
         out[file_off..file_off + bytes.len()].copy_from_slice(&bytes);
     }
@@ -426,6 +492,192 @@ fn apply_trampolines(
 fn align_up(buf: &mut Vec<u8>, align: usize) {
     let pad = (align - (buf.len() % align)) % align;
     buf.resize(buf.len() + pad, 0);
+}
+
+
+/// Append SHT_PROGBITS section headers for each overlay PT_LOAD, plus
+/// names for them in `.shstrtab`, so tools that walk the section table
+/// (espflash save-image specifically) see overlay bytes.
+///
+/// Layout: build a fresh SHT (base's entries + one per overlay LOAD)
+/// after the existing data, write a new shstrtab after that, and patch
+/// e_shoff/e_shnum + the shstrtab section's sh_offset/sh_size.
+fn add_overlay_section_headers(
+    out: &mut Vec<u8>,
+    new_loads: &[Phdr],
+    class: ElfClass,
+) -> Result<()> {
+    if new_loads.is_empty() {
+        return Ok(());
+    }
+
+    // ELF header offsets for SHT pointers — different per class.
+    let (shoff_o, shoff_sz, shentsize_o, shnum_o, shstrndx_o) = match class {
+        ElfClass::Elf32 => (32usize, 4usize, 46usize, 48usize, 50usize),
+        ElfClass::Elf64 => (40, 8, 58, 60, 62),
+    };
+    let shdr_size = match class {
+        ElfClass::Elf32 => 40usize,
+        ElfClass::Elf64 => 64,
+    };
+    // Field offsets within an shdr (sh_offset/sh_size differ per class).
+    let (sh_offset_field, sh_size_field, sh_field_width) = match class {
+        ElfClass::Elf32 => (16usize, 20usize, 4usize),
+        ElfClass::Elf64 => (24, 32, 8),
+    };
+
+    // Read existing SHT pointers from the (already-written) ELF header.
+    let e_shoff = match shoff_sz {
+        4 => u32::from_le_bytes(out[shoff_o..shoff_o + 4].try_into().unwrap()) as usize,
+        8 => u64::from_le_bytes(out[shoff_o..shoff_o + 8].try_into().unwrap()) as usize,
+        n => bail!("bad shoff_sz {n}"),
+    };
+    let e_shentsize =
+        u16::from_le_bytes(out[shentsize_o..shentsize_o + 2].try_into().unwrap()) as usize;
+    let e_shnum = u16::from_le_bytes(out[shnum_o..shnum_o + 2].try_into().unwrap()) as usize;
+    let e_shstrndx =
+        u16::from_le_bytes(out[shstrndx_o..shstrndx_o + 2].try_into().unwrap()) as usize;
+    if e_shentsize != shdr_size {
+        bail!("e_shentsize {e_shentsize} != expected {shdr_size}");
+    }
+    if e_shoff + e_shnum * e_shentsize > out.len() {
+        bail!("truncated existing SHT");
+    }
+    if e_shstrndx >= e_shnum {
+        bail!("e_shstrndx out of range");
+    }
+
+    // Pull the existing .shstrtab content out so we can append our
+    // section names.
+    let shstrtab_hdr = e_shoff + e_shstrndx * e_shentsize;
+    let read_field_at = |buf: &[u8], off: usize, w: usize| -> Result<usize> {
+        Ok(match w {
+            4 => u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize,
+            8 => u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()) as usize,
+            n => bail!("bad field width {n}"),
+        })
+    };
+    let old_shstrtab_off = read_field_at(out, shstrtab_hdr + sh_offset_field, sh_field_width)?;
+    let old_shstrtab_size = read_field_at(out, shstrtab_hdr + sh_size_field, sh_field_width)?;
+    if old_shstrtab_off + old_shstrtab_size > out.len() {
+        bail!("existing .shstrtab out of bounds");
+    }
+    let mut new_shstrtab = out[old_shstrtab_off..old_shstrtab_off + old_shstrtab_size].to_vec();
+
+    // Allocate names; record (name_offset, sh_flags) per overlay LOAD.
+    let mut new_section_meta: Vec<(u32, u64)> = Vec::with_capacity(new_loads.len());
+    for (i, load) in new_loads.iter().enumerate() {
+        let name = format!(".graft.overlay.{i}");
+        let name_off = new_shstrtab.len() as u32;
+        new_shstrtab.extend_from_slice(name.as_bytes());
+        new_shstrtab.push(0);
+        // Translate p_flags (PF_R=4, PF_W=2, PF_X=1) to sh_flags
+        // (SHF_ALLOC=2, SHF_WRITE=1, SHF_EXECINSTR=4). PF_R is implicit
+        // for any allocated section.
+        let mut sh_flags = u64::from(SHF_ALLOC);
+        if load.p_flags & 0x2 != 0 {
+            sh_flags |= u64::from(SHF_WRITE);
+        }
+        if load.p_flags & 0x1 != 0 {
+            sh_flags |= u64::from(SHF_EXECINSTR);
+        }
+        new_section_meta.push((name_off, sh_flags));
+    }
+
+    // Lift the existing SHT into a working buffer (we'll patch the
+    // shstrtab entry's sh_offset/sh_size after we know where the new
+    // shstrtab lands).
+    let old_sht_end = e_shoff + e_shnum * e_shentsize;
+    let mut new_sht = out[e_shoff..old_sht_end].to_vec();
+
+    // Append shdrs for overlay LOADs.
+    for (i, load) in new_loads.iter().enumerate() {
+        let (name_off, sh_flags) = new_section_meta[i];
+        let entry = build_alloc_shdr(class, name_off, load.p_offset, load.p_filesz, load.p_vaddr, sh_flags);
+        new_sht.extend_from_slice(&entry);
+    }
+
+    // Place new shstrtab + new SHT at end of file. shstrtab first
+    // (smaller, doesn't need much alignment), then SHT.
+    align_up(out, 1);
+    let new_shstrtab_off = out.len();
+    out.extend_from_slice(&new_shstrtab);
+
+    // Patch the (in-buffer) shstrtab shdr entry to point at the new
+    // location.
+    let shstrtab_in_new = e_shstrndx * e_shentsize;
+    write_field_at(
+        &mut new_sht,
+        shstrtab_in_new + sh_offset_field,
+        sh_field_width,
+        new_shstrtab_off as u64,
+    );
+    write_field_at(
+        &mut new_sht,
+        shstrtab_in_new + sh_size_field,
+        sh_field_width,
+        new_shstrtab.len() as u64,
+    );
+
+    align_up(out, 8);
+    let new_shoff = out.len();
+    out.extend_from_slice(&new_sht);
+
+    let new_shnum = e_shnum + new_loads.len();
+    match shoff_sz {
+        4 => out[shoff_o..shoff_o + 4].copy_from_slice(&(new_shoff as u32).to_le_bytes()),
+        8 => out[shoff_o..shoff_o + 8].copy_from_slice(&(new_shoff as u64).to_le_bytes()),
+        _ => unreachable!(),
+    }
+    out[shnum_o..shnum_o + 2].copy_from_slice(&(new_shnum as u16).to_le_bytes());
+
+    Ok(())
+}
+
+fn write_field_at(buf: &mut [u8], off: usize, width: usize, value: u64) {
+    match width {
+        4 => buf[off..off + 4].copy_from_slice(&(value as u32).to_le_bytes()),
+        8 => buf[off..off + 8].copy_from_slice(&value.to_le_bytes()),
+        _ => unreachable!(),
+    }
+}
+
+/// Build one SHT_PROGBITS shdr for a section that already lives in the
+/// file at `sh_offset`, mapped to `sh_addr` with `sh_flags`.
+fn build_alloc_shdr(
+    class: ElfClass,
+    sh_name: u32,
+    sh_offset: u64,
+    sh_size: u64,
+    sh_addr: u64,
+    sh_flags: u64,
+) -> Vec<u8> {
+    match class {
+        ElfClass::Elf32 => {
+            let mut e = vec![0u8; 40];
+            e[0..4].copy_from_slice(&sh_name.to_le_bytes());
+            e[4..8].copy_from_slice(&SHT_PROGBITS.to_le_bytes());
+            e[8..12].copy_from_slice(&(sh_flags as u32).to_le_bytes());
+            e[12..16].copy_from_slice(&(sh_addr as u32).to_le_bytes());
+            e[16..20].copy_from_slice(&(sh_offset as u32).to_le_bytes());
+            e[20..24].copy_from_slice(&(sh_size as u32).to_le_bytes());
+            // sh_link, sh_info = 0
+            e[32..36].copy_from_slice(&4u32.to_le_bytes()); // sh_addralign
+            // sh_entsize = 0
+            e
+        }
+        ElfClass::Elf64 => {
+            let mut e = vec![0u8; 64];
+            e[0..4].copy_from_slice(&sh_name.to_le_bytes());
+            e[4..8].copy_from_slice(&SHT_PROGBITS.to_le_bytes());
+            e[8..16].copy_from_slice(&sh_flags.to_le_bytes());
+            e[16..24].copy_from_slice(&sh_addr.to_le_bytes());
+            e[24..32].copy_from_slice(&sh_offset.to_le_bytes());
+            e[32..40].copy_from_slice(&sh_size.to_le_bytes());
+            e[48..56].copy_from_slice(&4u64.to_le_bytes()); // sh_addralign
+            e
+        }
+    }
 }
 
 /// Write an ELF, ensuring the result is executable. fs::write through

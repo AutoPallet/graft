@@ -454,13 +454,24 @@ fn run_real_linker(
         for p in &x.search_paths {
             cmd.arg("-L").arg(p);
         }
+        // PROVIDE-script ordering matters here. esp-hal's hal-defaults.x
+        // (included via linkall.x) has lines like
+        //   `PROVIDE(__post_init = no_init_hook);`
+        // — `no_init_hook` is undefined in overlay's tiny input set, so
+        // if linkall.x is processed first, ld errors before our
+        // base_addresses.ld gets a chance to PROVIDE __post_init from
+        // base's actual address. Putting our PROVIDEs first means
+        // __post_init is already defined by the time linkall.x's
+        // PROVIDE is evaluated, so ld skips it.
+        cmd.arg("-T").arg(base_symbols);
+        cmd.arg("-T").arg(all_base_symbols);
         cmd.arg("-T").arg("linkall.x");
     } else {
         // x86 path: layout script bumps everything from OVERLAY_BASE_ADDR.
         cmd.arg("-T").arg(layout);
+        cmd.arg("-T").arg(base_symbols);
+        cmd.arg("-T").arg(all_base_symbols);
     }
-    cmd.arg("-T").arg(base_symbols);
-    cmd.arg("-T").arg(all_base_symbols);
     for p in pruned {
         cmd.arg(&p.path);
     }
@@ -729,10 +740,17 @@ fn compute_xtensa_slack(base_bytes: &[u8]) -> Result<XtensaSlack> {
     if irom_max == 0 || drom_max == 0 {
         bail!("base ELF has no xtensa IROM or DROM sections — wrong target?");
     }
-    const PAGE: u64 = 0x1000;
+    // 4-byte alignment, NOT 4KB. Reason: ESP-IDF's 2nd-stage bootloader
+    // refuses to map more than one IROM (or DROM) segment per image —
+    // it warns "Image contains multiple IROM segments. Only the last
+    // one will be mapped." espflash save-image's `merge_adjacent_segments`
+    // collapses sections whose vaddrs are within 3 bytes of each other
+    // (rounding up to 4-byte boundary, padding the gap with zeros).
+    // So overlay's IROM/DROM start has to be 4-byte aligned and ≤ 3
+    // bytes past base's end to get folded into one big image segment.
     Ok(XtensaSlack {
-        irom_start: (irom_max + PAGE - 1) & !(PAGE - 1),
-        drom_start: (drom_max + PAGE - 1) & !(PAGE - 1),
+        irom_start: (irom_max + 3) & !3,
+        drom_start: (drom_max + 3) & !3,
     })
 }
 
