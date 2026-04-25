@@ -3,6 +3,7 @@ target = "xtensa-esp32s3-none-elf"
 
 [target.xtensa-esp32s3-none-elf]
 runner = "espflash flash --monitor"
+linker = "/usr/local/bin/graft"
 rustflags = [
     "-C", "link-arg=-Tlinkall.x",
     "-C", "link-arg=-nostartfiles",
@@ -13,3 +14,8 @@ build-std = ["alloc", "core"]
 
 [env]
 ESP_LOG = "INFO"
+# graft's passthrough mode forwards all argv to the real linker. For
+# xtensa builds the gcc driver (not bare ld) is what rustc expects to
+# invoke — it knows how to add the right libgcc / startfiles / linker
+# scripts. See graft/src/main.rs:passthrough.
+GRAFT_REAL_LD = "xtensa-esp32s3-elf-gcc"
