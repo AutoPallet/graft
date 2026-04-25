@@ -30,6 +30,13 @@ plan.
 - **M0.25 (rustc stability probe) — done.** Findings folded into doc 05
   & 06; `tu_id` pinned to `blake3(STT_FILE)[:8]`. Run with
   `cargo run -p rustc-stability`.
+- **M0.5 (x86 prototype) — done.** Base + overlay + combine; all four
+  edit scenarios pass; `e2e_cycle::full_cycle` integration test green.
+- **M1 (xtensa port) — partial.** Base mode works on hardware; overlay
+  builds and flashes but hangs after the bootloader. See
+  [`08-implementation-status.md`](./08-implementation-status.md) for the
+  current state, every design decision changed from the original plan,
+  and the open hang.
 
 ## Reading order
 
@@ -51,6 +58,10 @@ plan.
    ELF metadata schema, and test harnesses.
 7. [`07-dev-environment.md`](./07-dev-environment.md) — operational
    notes: Docker dev container, hardware connection, build/flash/monitor.
+8. [`08-implementation-status.md`](./08-implementation-status.md) —
+   what's actually built vs the plan, every decision changed along the
+   way, the open hang, and what's left to measure. **Read this for
+   "where are we right now."**
 
 ## TL;DR
 
