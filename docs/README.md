@@ -49,6 +49,8 @@ plan.
 6. [`06-graft-wrapper.md`](./06-graft-wrapper.md) — detailed design of
    the `graft` binary: wrapper contract, mode-by-mode steps, `.graft.*`
    ELF metadata schema, and test harnesses.
+7. [`07-dev-environment.md`](./07-dev-environment.md) — operational
+   notes: Docker dev container, hardware connection, build/flash/monitor.
 
 ## TL;DR
 
