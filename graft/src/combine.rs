@@ -112,6 +112,24 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
         None => Vec::new(),
     };
 
+    // No trampoline → base never jumps into overlay. KEEP()'d sections
+    // like `.init_array` or crtbegin's `__do_init` can land in overlay
+    // even without any code change (they have no symbols classify can
+    // match against base's symhash), but they're unreachable without a
+    // trampoline. Short-circuit to byte-identical base output — this is
+    // the "no-op" scenario under the M0.5 model where `main` is the
+    // single redirect point.
+    if trampolines.is_empty() {
+        std::fs::write(output_path, &base_bytes)
+            .with_context(|| format!("write {}", output_path.display()))?;
+        return Ok(Stats {
+            trampolines,
+            overlay_load_size: 0,
+            overlay_vaddr: 0,
+            combined_size: base_bytes.len() as u64,
+        });
+    }
+
     // Build output: start from base, apply trampolines, append overlay
     // payload, relocate + extend PHT.
     let mut out = base_bytes.clone();

@@ -111,15 +111,14 @@ pub fn prune_object(
         let section_idx = src_sym.section_index();
         let is_weak = src_sym.is_weak();
         let is_local = matches!(src_sym.scope(), SymbolScope::Compilation | SymbolScope::Unknown);
-        let is_def = src_sym.is_definition();
 
-        // Skip nameless symbols unless they're referenced by a reloc —
-        // object::write requires symbol lookups through sym_map, so
-        // including a placeholder for nameless symbols is easier than
-        // tracking per-use. Give them an empty name; writer handles that.
-        let (final_name, final_scope, final_section) = match (is_def, section_idx) {
-            (true, Some(idx)) if sec_map.contains_key(&idx) => {
-                // Kept definition: preserve.
+        // Classify by whether the symbol has a defining section, not by
+        // `is_definition()` — that returns false for STT_NOTYPE locals
+        // like `.LC0`, which we still need to rewrite through the
+        // kept/pruned logic.
+        let (final_name, final_scope, final_section) = match section_idx {
+            Some(idx) if sec_map.contains_key(&idx) => {
+                // Defined in a kept section: preserve.
                 let scope = if is_local {
                     write::SymbolScope::Compilation
                 } else {
@@ -127,9 +126,10 @@ pub fn prune_object(
                 };
                 (name.clone(), scope, WSymbolSection::Section(sec_map[&idx]))
             }
-            (true, Some(_)) => {
-                // Pruned definition. Make UND; rename if it was local.
-                if is_local {
+            Some(_) => {
+                // Defined in a pruned section. Emit as UND; rename locals
+                // so base_symbols.ld PROVIDEs can target them by tu_hex.
+                if is_local && !name.is_empty() {
                     renamed_locals += 1;
                     (
                         format!("{name}@{tu_hex}"),
@@ -140,18 +140,10 @@ pub fn prune_object(
                     (name.clone(), write::SymbolScope::Dynamic, WSymbolSection::Undefined)
                 }
             }
-            (true, None) | (false, _) => {
-                // Already-UND, absolute, or common. Keep as UND global.
-                let scope = if is_local && is_def {
-                    write::SymbolScope::Compilation
-                } else {
-                    write::SymbolScope::Dynamic
-                };
-                let w_section = match section_idx {
-                    None => WSymbolSection::Undefined,
-                    Some(_) => WSymbolSection::Undefined,
-                };
-                (name.clone(), scope, w_section)
+            None => {
+                // Already UND, absolute, or common. Pass through as UND
+                // global — base PROVIDEs supply the address.
+                (name.clone(), write::SymbolScope::Dynamic, WSymbolSection::Undefined)
             }
         };
 
@@ -174,6 +166,12 @@ pub fn prune_object(
         sym_map.insert(src_sym.index(), id);
     }
 
+    // Cache of (pruned section idx) → (surrogate symbol id, its offset
+    // in the section). Used to rewrite section-symbol relocs that target
+    // pruned sections into named-symbol relocs with an adjusted addend.
+    // Populated lazily.
+    let mut pruned_surrogate: HashMap<SectionIndex, (SymbolId, u64)> = HashMap::new();
+
     // Pass 3: relocations from kept sections.
     for src_sec in src.sections() {
         let Some(&new_sec_id) = sec_map.get(&src_sec.index()) else {
@@ -188,13 +186,13 @@ pub fn prune_object(
                 continue;
             }
 
+            let mut addend_adjust: i64 = 0;
             let new_sym_id = match r.target() {
                 RelocationTarget::Symbol(sidx) => {
                     if let Some(&id) = sym_map.get(&sidx) {
                         id
                     } else {
-                        // STT_SECTION symbol not in sym_map — emit the
-                        // writer's implicit section-symbol.
+                        // STT_SECTION symbol not in sym_map.
                         let src_sym = src
                             .symbol_by_index(sidx)
                             .map_err(|e| anyhow!("resolve reloc target: {e}"))?;
@@ -204,28 +202,35 @@ pub fn prune_object(
                                 src_sec.name().unwrap_or("?")
                             );
                         };
-                        let Some(&target_new_id) = sec_map.get(&target_sec_idx) else {
-                            bail!(
-                                "reloc from {} targets pruned section (#{}); \
-                                 this input requires PROVIDE of a mid-section \
-                                 address which M0.5 doesn't synthesize yet",
+                        if let Some(&target_new_id) = sec_map.get(&target_sec_idx) {
+                            out.section_symbol(target_new_id)
+                        } else {
+                            let (sym, off) = surrogate_for_pruned_section(
+                                &src,
+                                target_sec_idx,
+                                &sym_map,
+                                &mut pruned_surrogate,
                                 src_sec.name().unwrap_or("?"),
-                                target_sec_idx.0
-                            );
-                        };
-                        out.section_symbol(target_new_id)
+                            )?;
+                            addend_adjust = -(off as i64);
+                            sym
+                        }
                     }
                 }
                 RelocationTarget::Section(target_sec_idx) => {
-                    let Some(&target_new_id) = sec_map.get(&target_sec_idx) else {
-                        bail!(
-                            "reloc from {} targets pruned section (#{}); \
-                             M0.5 doesn't synthesize mid-section PROVIDEs",
+                    if let Some(&target_new_id) = sec_map.get(&target_sec_idx) {
+                        out.section_symbol(target_new_id)
+                    } else {
+                        let (sym, off) = surrogate_for_pruned_section(
+                            &src,
+                            target_sec_idx,
+                            &sym_map,
+                            &mut pruned_surrogate,
                             src_sec.name().unwrap_or("?"),
-                            target_sec_idx.0
-                        );
-                    };
-                    out.section_symbol(target_new_id)
+                        )?;
+                        addend_adjust = -(off as i64);
+                        sym
+                    }
                 }
                 RelocationTarget::Absolute => {
                     bail!("absolute reloc target not supported");
@@ -238,7 +243,7 @@ pub fn prune_object(
                 WRelocation {
                     offset,
                     symbol: new_sym_id,
-                    addend: r.addend(),
+                    addend: r.addend() + addend_adjust,
                     flags: RelocationFlags::Elf { r_type },
                 },
             )
@@ -255,10 +260,66 @@ pub fn prune_object(
 }
 
 fn map_kind(k: SymbolKind) -> SymbolKind {
-    // object's SymbolKind is shared read/write — identity mapping. We
-    // still route through a helper so a future format divergence has
-    // one place to fix.
-    k
+    // object::write rejects `Unknown` for defined symbols, but rustc emits
+    // STT_NOTYPE for local labels like `.LC0` / `.LCPI0_0`. Map those to
+    // `Label`, which also serializes to STT_NOTYPE.
+    match k {
+        SymbolKind::Unknown => SymbolKind::Label,
+        other => other,
+    }
+}
+
+/// Find a named symbol defined in `target_sec_idx` to act as a surrogate
+/// when a reloc targets the section itself (STT_SECTION) or targets a
+/// section that was pruned away. Returns the surrogate's new SymbolId and
+/// its address within the source section, so the caller can subtract that
+/// address from the reloc addend (reloc now resolves to `surrogate + (orig
+/// - surrogate_addr)`, equivalent to the original `section + orig`).
+fn surrogate_for_pruned_section(
+    src: &object::File<'_>,
+    target_sec_idx: SectionIndex,
+    sym_map: &HashMap<SymbolIndex, SymbolId>,
+    cache: &mut HashMap<SectionIndex, (SymbolId, u64)>,
+    from_section_name: &str,
+) -> Result<(SymbolId, u64)> {
+    if let Some(&hit) = cache.get(&target_sec_idx) {
+        return Ok(hit);
+    }
+    // Prefer the lowest-address named definition. For rustc's
+    // `.text.<mangle>` / `.rodata.<mangle>` sections that's the function
+    // or static that gives the section its name — and since that symbol
+    // is in sym_map as a UND (defining section was pruned), it'll resolve
+    // via base_symbols.ld PROVIDE back to the base's address.
+    let mut best: Option<(u64, SymbolIndex)> = None;
+    for sym in src.symbols() {
+        if sym.section_index() != Some(target_sec_idx) {
+            continue;
+        }
+        if matches!(sym.kind(), SymbolKind::File | SymbolKind::Section) {
+            continue;
+        }
+        if sym.name().unwrap_or("").is_empty() {
+            continue;
+        }
+        let addr = sym.address();
+        if best.map_or(true, |(b, _)| addr < b) {
+            best = Some((addr, sym.index()));
+        }
+    }
+    let (off, sidx) = best.ok_or_else(|| {
+        anyhow!(
+            "reloc from {from_section_name} targets pruned section #{} with no named definition to retarget through",
+            target_sec_idx.0,
+        )
+    })?;
+    let sym_id = *sym_map.get(&sidx).ok_or_else(|| {
+        anyhow!(
+            "surrogate symbol {sidx:?} for pruned section #{} missing from sym_map",
+            target_sec_idx.0
+        )
+    })?;
+    cache.insert(target_sec_idx, (sym_id, off));
+    Ok((sym_id, off))
 }
 
 /// Predicate helper: true if this section kind should be carried into

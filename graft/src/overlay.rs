@@ -30,6 +30,7 @@ use crate::metadata::{
     self, GraftManifest, SCHEMA_VERSION, SECTION_MANIFEST, SECTION_SYMHASH, SymHashEntry,
 };
 use crate::prune;
+use crate::roots;
 use crate::scan::{self, ScanResult};
 
 pub fn link(argv: Vec<String>) -> ExitCode {
@@ -59,7 +60,8 @@ fn run(argv: Vec<String>) -> Result<()> {
     let scan_inputs: Vec<PathBuf> = link_args.inputs.clone();
     let scan = scan::run(&scan_inputs).context("overlay pre-scan")?;
 
-    let closure = compute_closure(&scan, &base)?;
+    let roots = roots::find_roots(&scan, &base, &link_args)?;
+    let closure = compute_closure(&scan, &base, &roots)?;
 
     // Scratch dir next to the output path. Cleaned and recreated each
     // run so stale pruned .o's from a prior invocation don't confuse
@@ -344,7 +346,7 @@ fn run_real_linker(
     Ok(status)
 }
 
-pub(crate) struct BaseMetadata {
+pub struct BaseMetadata {
     pub manifest: GraftManifest,
     /// `name` → entry. One per globally-visible symbol live in base's .symtab.
     pub symhash_by_name: HashMap<String, SymHashEntry>,
@@ -404,16 +406,11 @@ pub(crate) struct Closure {
     pub provide_locals: Vec<(String, [u8; 8], u64, u32)>,
 }
 
-fn compute_closure(scan: &ScanResult, base: &BaseMetadata) -> Result<Closure> {
-    // Find entry point: the `main` symbol (or whatever's in base's
-    // manifest.entry_symbol). For M0.5 x86 it's always `main`.
-    let entry_name = base.manifest.entry_symbol.as_str();
-    let entry_node = scan
-        .graph
-        .symbols
-        .resolve_global(entry_name)
-        .ok_or_else(|| anyhow!("entry symbol `{entry_name}` not defined in overlay inputs"))?;
-
+fn compute_closure(
+    scan: &ScanResult,
+    base: &BaseMetadata,
+    roots: &[NodeId],
+) -> Result<Closure> {
     let mut closure: Vec<NodeId> = Vec::new();
     let mut provide_globals: Vec<(String, u64, u32)> = Vec::new();
     let mut provide_locals: Vec<(String, [u8; 8], u64, u32)> = Vec::new();
@@ -422,11 +419,18 @@ fn compute_closure(scan: &ScanResult, base: &BaseMetadata) -> Result<Closure> {
     // nodes marked Provided — base already satisfies everything reachable
     // from them (by trans_hash).
     #[derive(Copy, Clone, PartialEq, Eq)]
-    enum Decision { Unknown, Included, Provided }
+    enum Decision {
+        Unknown,
+        Included,
+        Provided,
+    }
     let mut decision = vec![Decision::Unknown; scan.graph.nodes.len()];
 
-    // DFS from entry.
-    let mut stack = vec![entry_node];
+    // DFS from every root. ld's gc-sections would start from the same
+    // set; the Provided/Included classification terminates branches
+    // whose trans_hash matches base (i.e., base's already-linked
+    // version is interchangeable with whatever overlay would emit).
+    let mut stack: Vec<NodeId> = roots.to_vec();
     while let Some(nid) = stack.pop() {
         if decision[nid as usize] != Decision::Unknown {
             continue;
@@ -440,7 +444,9 @@ fn compute_closure(scan: &ScanResult, base: &BaseMetadata) -> Result<Closure> {
             Classification::Included => {
                 decision[nid as usize] = Decision::Included;
                 closure.push(nid);
-                // Walk its reloc targets.
+                // Walk forward reloc targets. Any already-classified
+                // node is a cache hit; Unknown nodes go back on the
+                // stack.
                 for &succ in &scan.graph.edges[nid as usize] {
                     if decision[succ as usize] == Decision::Unknown {
                         stack.push(succ);
@@ -458,7 +464,11 @@ fn compute_closure(scan: &ScanResult, base: &BaseMetadata) -> Result<Closure> {
     // And closure for determinism.
     closure.sort();
 
-    Ok(Closure { closure, provide_globals, provide_locals })
+    Ok(Closure {
+        closure,
+        provide_globals,
+        provide_locals,
+    })
 }
 
 enum Classification {

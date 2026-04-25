@@ -14,6 +14,7 @@ pub mod hash;
 pub mod metadata;
 pub mod overlay;
 pub mod prune;
+pub mod roots;
 pub mod scan;
 pub mod subcommands;
 

@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 pub struct LinkArgs {
     pub inputs: Vec<PathBuf>,
     pub output: Option<PathBuf>,
+    /// Symbols the link driver has declared "forced undefined" via `-u`
+    /// / `--undefined` (either directly or via `-Wl,`). ld treats these
+    /// as gc-sections roots, so we do too.
+    pub undefined: Vec<String>,
 }
 
 pub fn parse(argv: &[String]) -> LinkArgs {
@@ -35,12 +39,66 @@ pub fn parse(argv: &[String]) -> LinkArgs {
                 continue;
             }
         }
+        // -u SYM / -u=SYM / --undefined=SYM, either bare or wrapped as
+        // `-Wl,-u,SYM` / `-Wl,--undefined=SYM`.
+        if let Some(sym) = extract_undefined(a, argv.get(i + 1).map(|s| s.as_str())) {
+            out.undefined.push(sym.rhs.into_owned());
+            i += if sym.consumed_next { 2 } else { 1 };
+            continue;
+        }
         if is_input(a) {
             out.inputs.push(PathBuf::from(a));
         }
         i += 1;
     }
     out
+}
+
+struct Undefined<'a> {
+    rhs: std::borrow::Cow<'a, str>,
+    consumed_next: bool,
+}
+
+fn extract_undefined<'a>(cur: &'a str, next: Option<&'a str>) -> Option<Undefined<'a>> {
+    // `-u SYM` / `--undefined SYM`
+    if cur == "-u" || cur == "--undefined" {
+        return next.map(|s| Undefined { rhs: s.into(), consumed_next: true });
+    }
+    // `-uSYM` / `--undefined=SYM`
+    if let Some(s) = cur.strip_prefix("-u")
+        && !s.is_empty()
+        && !s.starts_with('-')
+    {
+        return Some(Undefined { rhs: s.into(), consumed_next: false });
+    }
+    if let Some(s) = cur.strip_prefix("--undefined=") {
+        return Some(Undefined { rhs: s.into(), consumed_next: false });
+    }
+    // `-Wl,-u,SYM` / `-Wl,--undefined=SYM` / `-Wl,--undefined,SYM`
+    if let Some(rest) = cur.strip_prefix("-Wl,") {
+        let parts: Vec<&str> = rest.split(',').collect();
+        let mut it = parts.iter().copied();
+        while let Some(tok) = it.next() {
+            match tok {
+                "-u" | "--undefined" => {
+                    if let Some(s) = it.next() {
+                        return Some(Undefined { rhs: s.to_string().into(), consumed_next: false });
+                    }
+                }
+                _ => {
+                    if let Some(s) = tok.strip_prefix("--undefined=") {
+                        return Some(Undefined { rhs: s.to_string().into(), consumed_next: false });
+                    }
+                    if let Some(s) = tok.strip_prefix("-u") {
+                        if !s.is_empty() && !s.starts_with('-') {
+                            return Some(Undefined { rhs: s.to_string().into(), consumed_next: false });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn is_input(s: &str) -> bool {
@@ -81,5 +139,26 @@ mod tests {
         let parsed = parse(&argv);
         assert_eq!(parsed.output.as_deref(), Some(Path::new("/tmp/out")));
         assert_eq!(parsed.inputs.len(), 1);
+    }
+
+    #[test]
+    fn extract_u_flags() {
+        let argv = s(&[
+            "cc",
+            "-u", "foo1",
+            "-ufoo2",
+            "--undefined=foo3",
+            "-Wl,-u,foo4",
+            "-Wl,--undefined=foo5",
+            "-Wl,--undefined,foo6",
+            "-Wl,-ufoo7",
+            "-o", "/tmp/out",
+            "/tmp/foo.o",
+        ]);
+        let parsed = parse(&argv);
+        assert_eq!(
+            parsed.undefined,
+            vec!["foo1", "foo2", "foo3", "foo4", "foo5", "foo6", "foo7"],
+        );
     }
 }

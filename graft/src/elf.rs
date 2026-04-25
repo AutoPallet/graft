@@ -7,8 +7,8 @@
 
 use anyhow::{Context, Result, bail};
 use object::{
-    Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SectionIndex,
-    SectionKind as ObjSectionKind, SymbolIndex, SymbolKind, SymbolScope,
+    Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SectionFlags,
+    SectionIndex, SectionKind as ObjSectionKind, SymbolIndex, SymbolKind, SymbolScope,
     elf::R_X86_64_NONE,
 };
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,9 @@ pub struct SectionInfo {
     pub name: String,
     pub kind: SectionKind,
     pub alloc: bool,
+    /// Raw ELF `sh_flags`. Used by root-finding to detect SHF_GNU_RETAIN
+    /// (`R` flag) and anything else ld treats as "always keep."
+    pub sh_flags: u64,
     /// Section contents, or empty for NOBITS sections (.bss).
     pub bytes: Vec<u8>,
     /// Forward relocations from this section, canonicalized and sorted by
@@ -141,6 +144,10 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedObject> {
             Ok(d) => d.to_vec(),
             Err(_) => Vec::new(),
         };
+        let sh_flags = match sec.flags() {
+            SectionFlags::Elf { sh_flags } => sh_flags,
+            _ => 0,
+        };
 
         // Canonical relocs.
         let mut relocs: Vec<CanonicalReloc> = Vec::new();
@@ -198,6 +205,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedObject> {
             name,
             kind,
             alloc,
+            sh_flags,
             bytes,
             relocs,
             defined_symbols,
