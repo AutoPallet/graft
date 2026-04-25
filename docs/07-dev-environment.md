@@ -17,9 +17,14 @@ and starts a fresh one. The image takes ~5 min on first build (most of
 it pulling the espressif base image and recompiling espflash); rebuilds
 of the dev image after Dockerfile edits are seconds.
 
-Cargo registry, git db, and the `target/` dir live in named volumes so
-they survive container recreate. The repo is bind-mounted at
-`/workspace`, so edits round-trip live between host and container.
+Cargo registry, git db, and the container-side `target/` dir live in
+named volumes so they survive container recreate. The repo is
+bind-mounted at `/workspace`, so edits round-trip live between host
+and container. The host's `target/` is *also* bind-mounted at
+`/host_target/` (read-only) so the host-built `graft` binary
+(`x86_64-unknown-linux-musl/release/graft`) is reachable from inside
+the container — that's how `linker = "/usr/local/bin/graft"` (a
+symlink baked into the image) resolves.
 
 ## Running things
 
@@ -51,8 +56,11 @@ on the host has the port open (e.g. a leftover `picocom` / `screen`).
 
 ## Build / flash / monitor
 
-There's a reference no_std fixture at `esp32s3-hello/`. From inside the
-container:
+There's a reference no_std fixture at `esp32s3-hello/`. Its
+`.cargo/config.toml` wires `linker = "/usr/local/bin/graft"`, so
+every `cargo build` goes through graft. With `GRAFT` unset, graft
+runs in passthrough mode (forwards argv to `xtensa-esp32s3-elf-gcc`
+unchanged), so a vanilla build "just works":
 
 ```sh
 cd /workspace/esp32s3-hello
@@ -69,6 +77,26 @@ espflash monitor --port /dev/ttyACM0 \
 --monitor`), but explicit `espflash monitor` is easier to capture in
 non-interactive contexts — pass `--non-interactive` and a `timeout` if
 you just want to grab a few seconds of output.
+
+For the incremental loop, set `GRAFT` to switch modes:
+
+```sh
+# Clean build that captures base layout in .graft.* sidecar sections.
+GRAFT=base cargo build --release
+
+# Save the reference ELF for later overlay builds.
+cp target/xtensa-esp32s3-none-elf/release/esp32s3-hello /tmp/base.elf
+
+# Edit a source file, then build an overlay against the saved base.
+GRAFT=overlay GRAFT_BASE_ELF=/tmp/base.elf cargo build --release
+```
+
+Each link emits a JSON line to `<output>.graft.log` recording mode,
+input bytes, output bytes, and elapsed seconds. (rustc captures the
+linker's stderr/stdout, so file-based telemetry is the only reliable
+channel — see `graft/src/telemetry.rs`.) Running graft directly
+without `cargo` still works for debugging; just give it the same
+argv rustc would.
 
 ## Snapshots
 

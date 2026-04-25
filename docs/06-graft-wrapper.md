@@ -4,6 +4,31 @@ Detailed-enough-to-critique design for the `graft` binary itself.
 Companion to `05-esp32-adaptation.md` (the *what*); this doc is the
 *how*, one level deeper.
 
+> **Reading note.** This is the original design; what's actually
+> implemented diverged in several places — see
+> [`08-implementation-status.md`](./08-implementation-status.md) for
+> the deltas. The biggest ones for this doc:
+>
+> - **`GRAFT_DEST`** is gone — destination is hardcoded to slack
+>   (option B). Overlay's link writes the combined ELF straight to
+>   `-o`; there's no per-destination packaging step.
+> - **Subcommands**: `snapshot` and `clean` are not implemented;
+>   `combine` and `cache-info` are.
+> - **stdout JSON metadata line** is not produced. rustc captures
+>   linker stderr/stdout, so per-link telemetry instead lands as a
+>   JSON line in `<output>.graft.log` (see `graft/src/telemetry.rs`).
+> - **No stub ELF at `-o`** — overlay writes the *real* combined ELF
+>   there. The standalone `overlay.elf` lives in graft's work_dir for
+>   debugging.
+> - **`OverlayHeader`** isn't generated; there's no runtime launcher.
+> - **`exec`** is not used (we `Command::status` the real linker so
+>   we can run combine afterward in the same process).
+> - **xtensa overlay mode mutates `memory.x`** rather than emitting
+>   its own `overlay_layout.ld`. The `arch::trampoline` boundary
+>   (with its preserve-`entry` form on xtensa) is the only target-
+>   specific code; everything else is class-aware (ELF32/64) and
+>   target-neutral.
+
 ## Shape
 
 One binary, three entry surfaces:

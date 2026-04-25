@@ -1,5 +1,29 @@
 # 05 — Port plan: ESP32-S3 incremental flash
 
+> **Reading note.** This is the original design plan, written before
+> the M1 work landed. Several decisions are now settled and several
+> mechanisms changed shape during implementation —
+> [`08-implementation-status.md`](./08-implementation-status.md)
+> captures every delta. Specifically:
+>
+> - **Destination is option B** (slack at end of app partition).
+> - **Output is a single combined ELF**, not a base + overlay pair —
+>   no runtime launcher, no `OverlayHeader`, no on-device wire
+>   format. `combine` is invoked internally by overlay mode and writes
+>   straight to cargo's `-o` path.
+> - **One trampoline only**, at the entry symbol; the per-call-site
+>   `-mlongcalls` machinery in §"ESP32-S3 and Xtensa specifics" is
+>   not used.
+> - **`memory.x` mutation** replaces a custom `overlay_layout.ld`.
+> - **`base.bin` / `BASE_ABI_VERSION` / `OverlayHeader`** are not
+>   produced; espflash flashes the combined ELF directly.
+> - **`-mlongcalls`, `--build-id=sha1`, `esptool elf2image`** are
+>   not part of the build; espflash handles ELF→img conversion.
+>
+> Read the rest of this doc for the *why* behind the design (closure
+> walk, transitive hash, prune logic — all still load-bearing); read
+> 08 for the *what* that's actually wired up.
+
 ## Scope
 
 - **Target**: ESP32-S3 only (Xtensa LX7, `xtensa-esp32s3-none-elf`).
