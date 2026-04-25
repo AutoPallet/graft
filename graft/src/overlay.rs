@@ -92,15 +92,36 @@ fn run(argv: Vec<String>) -> Result<()> {
     // symbol has a permanent absolute address we can PROVIDE. (The
     // fixture's cargo config wires this up via the musl target +
     // `relocation-model=static`.)
-    // Derive overlay's base vaddr from base.elf's actual layout: the
-    // first 4KB-aligned address past the highest `sh_addr + sh_size`
-    // among loaded sections. This keeps overlay close enough to base
-    // that any `j rel18` / `jmp rel32` trampoline stays in range, and
-    // page-aligns it so pageflash diffs cleanly. Replaces a previous
-    // hardcoded `0x1000_0000`.
+    // Two layout strategies depending on target:
+    //
+    // - x86_64 hosted (e2e/x86 fixture): single SECTIONS block in
+    //   `overlay_layout.ld` placing every alloc'd section at a
+    //   contiguous bump-allocated range starting at OVERLAY_BASE_ADDR.
+    //
+    // - xtensa (esp32s3): pass through esp-hal's linker scripts almost
+    //   verbatim; only mutate `memory.x`'s `irom_seg` / `drom_seg`
+    //   ORIGIN/len so overlay code/data lands in the slack past base's
+    //   used flash. Everything else (alias.x, esp32s3.x, hal-defaults.x,
+    //   the per-section INSERT BEFORE machinery) keeps working as-is.
+    let base_bytes_for_layout =
+        std::fs::read(&base_path).with_context(|| format!("read {}", base_path.display()))?;
+    let e_machine = base_e_machine(&base_bytes_for_layout)?;
+    let xtensa_layout = if e_machine == object::elf::EM_XTENSA {
+        Some(setup_xtensa_layout(&work_dir, &base_bytes_for_layout, &argv)?)
+    } else {
+        None
+    };
+    // x86 layout script lives even in the xtensa branch — `run_real_linker`
+    // unconditionally passes `-T overlay_layout.ld`. For xtensa we hand
+    // it an empty stub so we can rely on linkall.x's own SECTIONS.
     let overlay_base_addr = compute_overlay_base_addr(&base_path)?;
     let layout_script = work_dir.join("overlay_layout.ld");
-    write_overlay_layout_ld(&layout_script, overlay_base_addr)?;
+    if xtensa_layout.is_some() {
+        std::fs::write(&layout_script, b"/* xtensa: linkall.x carries the layout. */\n")
+            .with_context(|| format!("write {}", layout_script.display()))?;
+    } else {
+        write_overlay_layout_ld(&layout_script, overlay_base_addr)?;
+    }
 
     // Extend base_symbols.ld with PROVIDEs for *every* symbol in base's
     // .symtab. The closure walk only gives us ones we saw reloc-targeted,
@@ -115,7 +136,7 @@ fn run(argv: Vec<String>) -> Result<()> {
 
     let overlay_elf = work_dir.join("overlay.elf");
     if pruned.is_empty() {
-        write_empty_relocatable(&overlay_elf)?;
+        write_empty_relocatable_for(&overlay_elf, e_machine)?;
     } else {
         let ld_status = run_real_linker(
             &pruned,
@@ -123,6 +144,7 @@ fn run(argv: Vec<String>) -> Result<()> {
             &all_base_syms_script,
             &layout_script,
             &overlay_elf,
+            xtensa_layout.as_ref(),
         )?;
         if !ld_status.success() {
             bail!(
@@ -286,9 +308,14 @@ fn write_combine_stats(path: &Path, stats: &crate::combine::Stats) -> Result<()>
     Ok(())
 }
 
-fn write_empty_relocatable(path: &Path) -> Result<()> {
+fn write_empty_relocatable_for(path: &Path, e_machine: u16) -> Result<()> {
     use object::{Architecture, BinaryFormat, Endianness, write::Object as WObject};
-    let out = WObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+    let arch = match e_machine {
+        object::elf::EM_X86_64 => Architecture::X86_64,
+        object::elf::EM_XTENSA => Architecture::Xtensa,
+        m => bail!("write_empty_relocatable_for: unsupported e_machine={m:#x}"),
+    };
+    let out = WObject::new(BinaryFormat::Elf, arch, Endianness::Little);
     let bytes = out.write().map_err(|e| anyhow!("write empty ET_REL: {e}"))?;
     std::fs::write(path, bytes).with_context(|| format!("write {}", path.display()))?;
     Ok(())
@@ -399,24 +426,39 @@ fn run_real_linker(
     all_base_symbols: &Path,
     layout: &Path,
     output: &Path,
+    xtensa: Option<&XtensaLayout>,
 ) -> Result<std::process::ExitStatus> {
-    let real = std::env::var("GRAFT_REAL_LD").unwrap_or_else(|_| "ld".into());
+    // For xtensa: invoke ld directly (not the gcc driver), so we don't
+    // pull in crt files. GRAFT_REAL_LD points at gcc on bare-metal
+    // targets — derive the matching ld binary by replacing the trailing
+    // "gcc" with "ld" (xtensa-esp32s3-elf-gcc → xtensa-esp32s3-elf-ld).
+    let real_env = std::env::var("GRAFT_REAL_LD").unwrap_or_else(|_| "ld".into());
+    let real = real_env
+        .strip_suffix("gcc")
+        .map(|p| format!("{p}ld"))
+        .unwrap_or(real_env);
     let mut cmd = Command::new(&real);
-    // Full link. `-nostdlib -static --no-dynamic-linker` prevents ld
-    // from pulling crt*.o / libc / libunwind — every such symbol must
-    // be resolved by base_addresses.ld. `--entry=0` because overlay
-    // isn't a standalone executable (combine copies base's e_entry).
     cmd.arg("-o").arg(output);
     cmd.arg("-nostdlib");
     cmd.arg("-static");
     cmd.arg("--no-dynamic-linker");
     cmd.arg("--entry=0");
-    // `--no-relax` stops ld from trying to shrink GOTPCREL → PC-rel
-    // against an absolute PROVIDE (errors with "failed to convert
-    // GOTPCREL relocation"; the relaxation assumes the target's
-    // section is known, and our PROVIDEs are bare addresses).
     cmd.arg("--no-relax");
-    cmd.arg("-T").arg(layout);
+
+    if let Some(x) = xtensa {
+        // Prepend our work_dir so ld's INCLUDE "memory.x" inside
+        // linkall.x finds our mutated copy first; everything else
+        // (alias.x, esp32s3.x, hal-defaults.x) falls through to the
+        // original esp-hal search paths.
+        cmd.arg("-L").arg(&x.work_dir);
+        for p in &x.search_paths {
+            cmd.arg("-L").arg(p);
+        }
+        cmd.arg("-T").arg("linkall.x");
+    } else {
+        // x86 path: layout script bumps everything from OVERLAY_BASE_ADDR.
+        cmd.arg("-T").arg(layout);
+    }
     cmd.arg("-T").arg(base_symbols);
     cmd.arg("-T").arg(all_base_symbols);
     for p in pruned {
@@ -629,4 +671,199 @@ fn format_closure_dump(scan: &ScanResult, c: &Closure) -> Vec<u8> {
         let _ = writeln!(s, "  {n}@{tu_hex} = {addr:#x} ({sz} bytes)");
     }
     s.into_bytes()
+}
+
+/// Read base.elf's `e_machine` field (bytes 18..20, little-endian).
+fn base_e_machine(bytes: &[u8]) -> Result<u16> {
+    if bytes.len() < 20 || &bytes[..4] != b"\x7fELF" {
+        bail!("base ELF too short or not ELF");
+    }
+    Ok(u16::from_le_bytes(bytes[18..20].try_into().unwrap()))
+}
+
+/// Layout adjustments for xtensa overlay link: a mutated `memory.x`
+/// dropped in `work_dir`, and the original esp-hal `-L` paths so ld's
+/// `INCLUDE` falls through for everything else.
+pub struct XtensaLayout {
+    pub work_dir: PathBuf,
+    pub search_paths: Vec<PathBuf>,
+    pub slack: XtensaSlack,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct XtensaSlack {
+    /// First 4KB-aligned IROM-bus vaddr past base's last IROM section.
+    pub irom_start: u64,
+    /// First 4KB-aligned DROM-bus vaddr past base's last DROM section.
+    pub drom_start: u64,
+}
+
+/// IROM bus base on ESP32-S3: `0x4200_0000..0x4400_0000` (32 MB).
+const ESP32S3_IROM_BASE: u64 = 0x4200_0000;
+const ESP32S3_IROM_END: u64 = 0x4400_0000;
+/// DROM bus base on ESP32-S3: `0x3C00_0000..0x3E00_0000` (32 MB).
+const ESP32S3_DROM_BASE: u64 = 0x3C00_0000;
+const ESP32S3_DROM_END: u64 = 0x3E00_0000;
+
+fn compute_xtensa_slack(base_bytes: &[u8]) -> Result<XtensaSlack> {
+    use object::{Object, ObjectSection, SectionFlags};
+    let elf = object::File::parse(base_bytes).context("parse base ELF for xtensa slack")?;
+    let mut irom_max: u64 = 0;
+    let mut drom_max: u64 = 0;
+    for sec in elf.sections() {
+        let alloc = matches!(
+            sec.flags(),
+            SectionFlags::Elf { sh_flags } if (sh_flags & u64::from(object::elf::SHF_ALLOC)) != 0
+        );
+        if !alloc {
+            continue;
+        }
+        let v = sec.address();
+        let end = v + sec.size();
+        if (ESP32S3_IROM_BASE..ESP32S3_IROM_END).contains(&v) {
+            irom_max = irom_max.max(end);
+        } else if (ESP32S3_DROM_BASE..ESP32S3_DROM_END).contains(&v) {
+            drom_max = drom_max.max(end);
+        }
+    }
+    if irom_max == 0 || drom_max == 0 {
+        bail!("base ELF has no xtensa IROM or DROM sections — wrong target?");
+    }
+    const PAGE: u64 = 0x1000;
+    Ok(XtensaSlack {
+        irom_start: (irom_max + PAGE - 1) & !(PAGE - 1),
+        drom_start: (drom_max + PAGE - 1) & !(PAGE - 1),
+    })
+}
+
+/// Mutate esp-hal's `memory.x` so `irom_seg` and `drom_seg` start at
+/// the slack addresses (overlay's flash region) instead of base's
+/// flash region. Line-based; idempotent re-runs on the same input
+/// produce identical output.
+fn mutate_memory_x(content: &str, slack: &XtensaSlack) -> Result<String> {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(content.len() + 256);
+    let mut found_irom = false;
+    let mut found_drom = false;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("irom_seg") && trimmed.contains("ORIGIN") {
+            // 32 MB irom region minus the slack offset still leaves
+            // plenty for any conceivable overlay.
+            let len = ESP32S3_IROM_END - slack.irom_start;
+            writeln!(
+                out,
+                "  irom_seg ( RX ) : ORIGIN = {:#x}, len = {:#x}",
+                slack.irom_start, len
+            )
+            .unwrap();
+            found_irom = true;
+        } else if trimmed.starts_with("drom_seg") && trimmed.contains("ORIGIN") {
+            let len = ESP32S3_DROM_END - slack.drom_start;
+            writeln!(
+                out,
+                "  drom_seg ( R ) : ORIGIN = {:#x}, len = {:#x}",
+                slack.drom_start, len
+            )
+            .unwrap();
+            found_drom = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !found_irom {
+        bail!("memory.x: no irom_seg ORIGIN line found — esp-hal layout changed?");
+    }
+    if !found_drom {
+        bail!("memory.x: no drom_seg ORIGIN line found — esp-hal layout changed?");
+    }
+    Ok(out)
+}
+
+/// Find esp-hal's `memory.x` by scanning argv's `-L` paths. Returns
+/// the resolved path plus the full list of `-L` directories so the
+/// caller can preserve them (we'll prepend `work_dir` then add these
+/// for fallthrough).
+fn find_memory_x_and_paths(argv: &[String]) -> Result<(PathBuf, Vec<PathBuf>)> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut i = 0;
+    while i < argv.len() {
+        if argv[i] == "-L"
+            && let Some(p) = argv.get(i + 1)
+        {
+            paths.push(PathBuf::from(p));
+            i += 2;
+            continue;
+        }
+        if let Some(p) = argv[i].strip_prefix("-L") {
+            paths.push(PathBuf::from(p));
+        }
+        i += 1;
+    }
+    for p in &paths {
+        let candidate = p.join("memory.x");
+        if candidate.exists() {
+            return Ok((candidate, paths));
+        }
+    }
+    bail!("memory.x not found in any -L path ({} searched)", paths.len());
+}
+
+fn setup_xtensa_layout(
+    work_dir: &Path,
+    base_bytes: &[u8],
+    argv: &[String],
+) -> Result<XtensaLayout> {
+    let slack = compute_xtensa_slack(base_bytes)?;
+    let (memory_x, search_paths) = find_memory_x_and_paths(argv)?;
+    let original = std::fs::read_to_string(&memory_x)
+        .with_context(|| format!("read {}", memory_x.display()))?;
+    let mutated = mutate_memory_x(&original, &slack)?;
+    let dest = work_dir.join("memory.x");
+    std::fs::write(&dest, mutated).with_context(|| format!("write {}", dest.display()))?;
+    Ok(XtensaLayout {
+        work_dir: work_dir.to_path_buf(),
+        search_paths,
+        slack,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mutate_memory_x_replaces_two_lines() {
+        let input = "\
+RESERVE_ICACHE = 0x8000;
+MEMORY
+{
+  vectors_seg ( RX )     : ORIGIN = 0x40378000, len = 0x400
+  irom_seg ( RX )        : ORIGIN = 0x42000020, len = 32M - 0x20
+  drom_seg ( R )         : ORIGIN = 0x3C000020, len = 32M - 0x20
+  rtc_fast_seg(RWX) : ORIGIN = 0x600fe000, len = 8k
+}
+";
+        let slack = XtensaSlack {
+            irom_start: 0x4201_7000,
+            drom_start: 0x3C00_2000,
+        };
+        let out = mutate_memory_x(input, &slack).unwrap();
+        assert!(out.contains("irom_seg ( RX ) : ORIGIN = 0x42017000"));
+        assert!(out.contains("drom_seg ( R ) : ORIGIN = 0x3c002000"));
+        // Other lines preserved.
+        assert!(out.contains("vectors_seg ( RX )     : ORIGIN = 0x40378000"));
+        assert!(out.contains("rtc_fast_seg(RWX) : ORIGIN = 0x600fe000"));
+    }
+
+    #[test]
+    fn mutate_memory_x_errors_if_lines_missing() {
+        let input = "MEMORY { ram (RW) : ORIGIN = 0, len = 1k }\n";
+        let slack = XtensaSlack {
+            irom_start: 0,
+            drom_start: 0,
+        };
+        assert!(mutate_memory_x(input, &slack).is_err());
+    }
 }
