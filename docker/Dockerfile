@@ -38,6 +38,11 @@ RUN cargo install --locked --force espflash@4.4.0
 # Make /workspace writable by esp.
 USER root
 RUN mkdir -p /workspace && chown esp:esp /workspace
+
+# Stable path for the host-built graft musl binary. Resolves at runtime
+# once /host_target/ is bind-mounted; dangles harmlessly otherwise.
+RUN ln -s /host_target/x86_64-unknown-linux-musl/release/graft /usr/local/bin/graft
+
 USER esp
 
 WORKDIR /workspace

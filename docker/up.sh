@@ -27,6 +27,7 @@ docker run -d \
     -v graft-esp32s3-cargo-registry:/home/esp/.cargo/registry \
     -v graft-esp32s3-cargo-git:/home/esp/.cargo/git \
     -v graft-esp32s3-target:/workspace/target \
+    -v "$ROOT/target":/host_target:ro \
     -w /workspace \
     "$IMAGE" \
     sleep infinity >/dev/null
