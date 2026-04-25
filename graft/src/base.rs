@@ -136,33 +136,63 @@ fn build_symhash(scan: &ScanResult, elf_bytes: &[u8]) -> Result<Vec<SymHashEntry
     }
 
     // Now walk the output ELF's symtab, emitting an entry for each symbol
-    // we can resolve back to a trans_hash.
+    // we can resolve back to a trans_hash. STT_FILE markers partition
+    // STB_LOCAL ranges by source TU — we track the current TU's tu_id
+    // (computed identically to scan-side via blake3(stt_file_name)[:8])
+    // and use it to disambiguate same-named locals across TUs in the
+    // local_hash lookup.
+    //
+    // Critical: locals MUST round-trip through symhash. With LTO/fat,
+    // every static (e.g. esp_println::LOCK) is a STB_LOCAL — if we
+    // skip them, overlay's closure walk classifies them as Included,
+    // which makes overlay re-allocate them at fresh addresses while
+    // base is still using its own copy. The two halves of the program
+    // end up with different views of every shared static.
     let mut entries: Vec<SymHashEntry> = Vec::new();
+    let mut current_tu: Option<[u8; 8]> = None;
     for s in elf.symbols() {
-        if !s.is_definition() { continue; }
-        let name = s.name().unwrap_or("").to_string();
-        if name.is_empty() { continue; }
-
-        // We only have trans_hash for globals (by name) in the output's
-        // .symtab, because locals in the .o were internalized and have
-        // different namespacing after link. For M0.5 this is fine —
-        // most of what overlay mode looks up is callable globals anyway.
-        let is_global = matches!(s.scope(), SymbolScope::Linkage | SymbolScope::Dynamic);
-        if !is_global {
+        let name_raw = s.name().unwrap_or("");
+        if matches!(s.kind(), object::SymbolKind::File) {
+            current_tu = Some(tu_id_from_file_name(name_raw));
             continue;
         }
-        let Some(&th) = global_hash.get(&name) else { continue };
-        entries.push(SymHashEntry {
-            name,
-            tu: None,
-            trans_hash: th,
-            address: s.address(),
-            size: s.size() as u32,
-        });
+        if !s.is_definition() { continue; }
+        if name_raw.is_empty() { continue; }
+        let name = name_raw.to_string();
+
+        let is_global = matches!(s.scope(), SymbolScope::Linkage | SymbolScope::Dynamic);
+        if is_global {
+            let Some(&th) = global_hash.get(&name) else { continue };
+            entries.push(SymHashEntry {
+                name,
+                tu: None,
+                trans_hash: th,
+                address: s.address(),
+                size: s.size() as u32,
+            });
+        } else {
+            let Some(tu) = current_tu else { continue };
+            let Some(&th) = local_hash.get(&(name.clone(), tu)) else { continue };
+            entries.push(SymHashEntry {
+                name,
+                tu: Some(tu),
+                trans_hash: th,
+                address: s.address(),
+                size: s.size() as u32,
+            });
+        }
     }
     entries.sort_by(|a, b| (a.name.as_str(), a.tu).cmp(&(b.name.as_str(), b.tu)));
     entries.dedup_by(|a, b| a.name == b.name && a.tu == b.tu);
     Ok(entries)
+}
+
+/// Same derivation as `elf::ParsedObject::tu_id` — blake3(file)[:8].
+fn tu_id_from_file_name(name: &str) -> [u8; 8] {
+    let digest = *blake3::hash(name.as_bytes()).as_bytes();
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&digest[..8]);
+    out
 }
 
 fn node_id_of(graph: &crate::graph::Graph, object: u32, section: u32) -> Option<u32> {
@@ -204,9 +234,15 @@ fn read_build_id(elf_bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn find_entry_symbol(elf_bytes: &[u8]) -> Option<String> {
-    // On hosted Linux the real entry (`_start`) is libc's, but the
-    // user-level entry we care about is `main`. Just hard-code for
-    // M0.5 — the manifest field is informational.
+    // `GRAFT_ENTRY_SYMBOL` overrides for debugging — moves the single
+    // trampoline off `main` to a function the user controls, so they
+    // can run code (printlns, memory probes) before the trampoline
+    // fires and bisect crashes.
+    if let Ok(s) = std::env::var("GRAFT_ENTRY_SYMBOL")
+        && !s.is_empty()
+    {
+        return Some(s);
+    }
     let _ = elf_bytes;
     Some("main".into())
 }

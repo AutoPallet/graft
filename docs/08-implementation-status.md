@@ -21,7 +21,7 @@ what got changed along the way. As of `edcea78` (M1.g.8).
 | M1.g.5 — memory.x mutation for overlay layout | done |
 | M1.g.6 — combine.rs supports ELF32 and multi-segment overlays | done |
 | M1.g.7 — base mode on hardware (`.graft.manifest`/`.symhash` attached, ELF boots) | done |
-| M1.g.8 — overlay mode on hardware | **partial — hangs after bootloader on non-empty overlay** |
+| M1.g.8 — overlay mode on hardware | **done** — non-empty overlay boots and runs edited code |
 | M1.h — re-run churn experiments through graft | not started |
 
 ## Key decisions changed from the 05 plan
@@ -163,44 +163,55 @@ Everything except the two memory.x lines:
   `rtc_fast.x`, `rtc_slow.x`, `eh_frame.x`, `metadata.x`, `dram2.x` —
   all picked up via INCLUDE/INSERT. Unchanged.
 
-## What's open
+## M1.g.8 hang — root cause and fix
 
-### M1.g.8 hang (non-empty overlay)
+**Bug:** `base.rs::build_symhash` emitted `.graft.symhash` entries only
+for STB_GLOBAL/WEAK symbols, skipping every STB_LOCAL with `if
+!is_global { continue; }`. Local trans_hashes were computed from the
+input scan but never round-tripped through the metadata section.
 
-Repro:
-```sh
-GRAFT=base cargo build --release            # produces base.elf with sidecars
-cp …/release/esp32s3-hello /tmp/base.elf    # save the reference
-echo "// trivial change" >> src/main.rs     # any source edit
-GRAFT=overlay GRAFT_BASE_ELF=/tmp/base.elf cargo build --release
-espflash flash …/release/esp32s3-hello      # boots through bootloader, then silence
-```
+**Effect:** overlay's `compute_closure` could never match a base local
+on trans_hash — `symhash_by_local` was always empty. Every static and
+private function in the closure got re-defined locally in overlay's
+link at fresh addresses, while base kept its own copies. With LTO=fat
+the closure of even a one-line edit pulls in dozens of esp-hal /
+esp-println locals, so the two halves of the running program ended up
+with diverged views of every shared static.
 
-Verified working:
-- Trampoline encoding (entry + j + l32r + jx) — bytes match expected
-  by hand and by `xtensa-esp32s3-elf-as`.
-- Overlay's `main` bytes in the combined ELF match overlay.elf at the
-  expected vaddr.
-- Single merged IROM segment, single merged DROM segment in the
-  flashed image — no "multiple IROM/DROM" warnings.
-- No-op overlay (closure empty) produces a byte-identical output and
-  boots correctly.
+The most directly fatal one was `esp_println::LOCK` (a STB_LOCAL
+`AtomicU32` initial value 0x100). base's link allocated it at
+0x3fc89d1c; overlay's link re-allocated it at 0x3fc8849c. Combine then
+trimmed overlay's RW PT_LOAD because it overlapped base's, so
+overlay's LOCK at 0x3fc8849c was *never written to RAM at boot* and
+fell inside base's `.rwdata_dummy` (an uninitialized esp-hal stack-
+reservation region). At runtime, overlay's first `println!` did a CAS
+against that uninitialized RAM (random power-on garbage), the CAS
+never matched the expected 0x100, and the lock acquisition spun
+forever — silently, with no exception or panic, since spin loops don't
+fault.
 
-Untriaged hypotheses (in rough plausibility order):
-1. **`base_addresses.ld` PROVIDEs a wrong address.** The script is
-   built from base.elf's full symtab; an aliased / weak-overridden
-   symbol could end up wrong. Inspecting overlay.elf's literal pool
-   bytes vs the expected base symbol values would catch this.
-2. **`esp_hal::init()` re-running has a non-idempotent side effect.**
-   base's main called init at boot; overlay's main calls it again on
-   the trampoline jump. Could leave a peripheral in a bad state.
-3. **Watchdog timeout** — the overlay path takes longer than base's
-   for some reason and the TG0WDT isn't fed in time.
-4. **Stack frame mismatch** — same source/compiler should produce
-   `entry a1, 192` for both, but worth confirming.
+**Fix:** in the post-link symhash walk, track the current
+`STT_FILE` marker, derive its tu_id (same blake3-of-stt_file_name as
+the input scan), and emit a SymHashEntry for every STB_LOCAL
+definition with `tu = Some(tu_id)`. After the fix, overlay's
+`compute_closure` correctly classifies LOCK's section as Provided,
+prune.rs renames the reference to `LOCK@<tu_id_hex>` GLOBAL UND, and
+`base_addresses.ld` PROVIDEs that name at base's address (0x3fc89d1c).
 
-JTAG / `espflash monitor --raw` would clear this up quickly; UART
-silence is unhelpful.
+**Debug bisection that pinpointed it:** moved the trampoline off
+`main` and onto a user-controlled `graft_entry` (via
+`GRAFT_ENTRY_SYMBOL=graft_entry`). `main` then runs base's init/UART
+unconditionally and dumps the trampoline + overlay-text bytes via
+`read_volatile<u32>` (u8 reads from IROM cause LoadStoreError —
+0x42xxxxxx is on the I-bus, only word-aligned 32-bit loads are
+allowed) before the handoff. Bytes verified correct → bypassed the
+trampoline by jumping to overlay's graft_entry directly via raw
+address → still hung → ruled out the trampoline → started inspecting
+literal-pool addresses, where the smoking gun appeared
+(`_ZN…LOCK… (3fc8849c)` annotation in overlay.elf vs (3fc89d1c) in
+base.elf). The tooling probe is gone from the fixture but the
+trampoline-relocation pattern stayed: it's a useful loop-isolation
+mode for any future bisection.
 
 ### M1.h — measure
 
