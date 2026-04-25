@@ -133,7 +133,8 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
     let mut out = base_bytes.clone();
 
     let base_phdrs = read_program_headers(&base_bytes)?;
-    apply_trampolines(&mut out, &base_phdrs, &trampolines)?;
+    let e_machine = u16::from_le_bytes(base_bytes[18..20].try_into().unwrap());
+    apply_trampolines(&mut out, &base_phdrs, &trampolines, e_machine)?;
 
     align_up(&mut out, 0x1000);
     let new_load_offset = out.len() as u64;
@@ -271,8 +272,10 @@ fn apply_trampolines(
     out: &mut [u8],
     base_phdrs: &[Elf64Phdr],
     trampolines: &[Trampoline],
+    e_machine: u16,
 ) -> Result<()> {
     let loads: Vec<&Elf64Phdr> = base_phdrs.iter().filter(|p| p.p_type == PT_LOAD).collect();
+    let tramp_size = crate::arch::trampoline_size(e_machine)?;
     for t in trampolines {
         let seg = loads
             .iter()
@@ -285,16 +288,16 @@ fn apply_trampolines(
                 )
             })?;
         let file_off = (seg.p_offset + (t.base_addr - seg.p_vaddr)) as usize;
-        if file_off + 5 > out.len() {
-            bail!("trampoline {} patches past EOF", t.name);
+        if file_off + tramp_size > out.len() {
+            bail!(
+                "trampoline {} ({} bytes) patches past EOF",
+                t.name,
+                tramp_size
+            );
         }
-        // `jmp rel32`: 0xe9 + (target - source - 5) as i32 LE.
-        let rel = (t.overlay_addr as i64) - (t.base_addr as i64 + 5);
-        if !(i32::MIN as i64..=i32::MAX as i64).contains(&rel) {
-            bail!("trampoline {} exceeds rel32 range: {:+#x}", t.name, rel);
-        }
-        out[file_off] = 0xe9;
-        out[file_off + 1..file_off + 5].copy_from_slice(&(rel as i32).to_le_bytes());
+        let bytes = crate::arch::trampoline(e_machine, t.base_addr, t.overlay_addr)
+            .with_context(|| format!("encode trampoline for {}", t.name))?;
+        out[file_off..file_off + bytes.len()].copy_from_slice(&bytes);
     }
     Ok(())
 }
