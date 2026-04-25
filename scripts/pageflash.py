@@ -83,8 +83,14 @@ def main() -> int:
     if args.dry_run or not runs:
         return 0
 
-    # espflash write-bin can only target one offset per call, so drive
-    # one call per run. Each run becomes a temp .bin file.
+    # espflash write-bin only takes one (offset, file) per call, but
+    # `--before no-reset --after no-reset` keeps the device in the
+    # stub bootloader between calls, skipping the connect/sync/stub-
+    # load cycle on subsequent invocations. Per-call overhead drops
+    # from ~0.9s to ~0.1s. Use default reset on the first call (clean
+    # entry to bootloader) and `watchdog-reset` on the last (~0.5s
+    # faster than hard-reset and still boots the new firmware);
+    # everything in between uses no-reset on both ends.
     if not shutil.which("espflash"):
         print("espflash not on PATH; can't write", file=sys.stderr)
         return 1
@@ -96,7 +102,13 @@ def main() -> int:
         for idx, (off, chunk) in enumerate(runs):
             blob = td_p / f"run_{idx}.bin"
             blob.write_bytes(chunk)
-            cmd = ["espflash", "write-bin", "--port", args.port, hex(off), str(blob)]
+            cmd = ["espflash", "write-bin", "--port", args.port]
+            is_first = idx == 0
+            is_last = idx == len(runs) - 1
+            if not is_first:
+                cmd += ["--before", "no-reset"]
+            cmd += ["--after", "no-reset" if not is_last else "watchdog-reset"]
+            cmd += [hex(off), str(blob)]
             r = subprocess.run(cmd, capture_output=True, text=True)
             if r.returncode != 0:
                 print(f"espflash failed for run @ {off:#010x}:", file=sys.stderr)
