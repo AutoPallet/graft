@@ -156,7 +156,21 @@ fn build_symhash(scan: &ScanResult, elf_bytes: &[u8]) -> Result<Vec<SymHashEntry
             current_tu = Some(tu_id_from_file_name(name_raw));
             continue;
         }
-        if !s.is_definition() { continue; }
+        // `is_definition()` in `object` 0.36 requires a real section
+        // index, which excludes SHN_ABS — i.e. linker-script direct
+        // assignments like `__udivdi3 = 0x40002544`. We still want
+        // those: overlay's `compute_closure` needs to see ROM symbols
+        // (esp32s3.rom.libgcc.ld) so calls into them resolve straight
+        // to base's address rather than dragging compiler_builtins'
+        // weak fallback into the closure. So accept anything that's
+        // not undef and not a marker (FILE/SECTION/UNKNOWN).
+        if s.is_undefined() { continue; }
+        if matches!(
+            s.kind(),
+            object::SymbolKind::Section | object::SymbolKind::Unknown
+        ) {
+            continue;
+        }
         if name_raw.is_empty() { continue; }
         let name = name_raw.to_string();
 
