@@ -145,6 +145,8 @@ fn run(argv: Vec<String>) -> Result<()> {
             &layout_script,
             &overlay_elf,
             xtensa_layout.as_ref(),
+            &argv,
+            base.manifest.entry_symbol.as_str(),
         )?;
         if !ld_status.success() {
             bail!(
@@ -427,51 +429,54 @@ fn run_real_linker(
     layout: &Path,
     output: &Path,
     xtensa: Option<&XtensaLayout>,
+    rustc_argv: &[String],
+    entry_symbol: &str,
 ) -> Result<std::process::ExitStatus> {
-    // For xtensa: invoke ld directly (not the gcc driver), so we don't
-    // pull in crt files. GRAFT_REAL_LD points at gcc on bare-metal
-    // targets — derive the matching ld binary by replacing the trailing
-    // "gcc" with "ld" (xtensa-esp32s3-elf-gcc → xtensa-esp32s3-elf-ld).
-    let real_env = std::env::var("GRAFT_REAL_LD").unwrap_or_else(|_| "ld".into());
-    let real = real_env
-        .strip_suffix("gcc")
-        .map(|p| format!("{p}ld"))
-        .unwrap_or(real_env);
+    // Invoke the gcc-style driver rustc gave us (gcc handles `-Wl,…`,
+    // `-l<lib>`, default-library suppression, etc. for both
+    // bare-metal and hosted targets — base mode's passthrough also
+    // goes through it). Forward rustc's full link argv so overlay
+    // sees the same `-l esp_rom_sys` (whose stub library is a
+    // linker script PROVIDING ROM addresses), `-Wl,--gc-sections`,
+    // `-nostartfiles`, etc. that base saw. The only divergence from
+    // rustc's argv is: we replace inputs with the pruned `.o`s and
+    // we redirect `-o` to overlay.elf.
+    let real = std::env::var("GRAFT_REAL_LD").unwrap_or_else(|_| "cc".into());
     let mut cmd = Command::new(&real);
     cmd.arg("-o").arg(output);
-    cmd.arg("-nostdlib");
-    cmd.arg("-static");
-    cmd.arg("--no-dynamic-linker");
-    cmd.arg("--entry=0");
-    cmd.arg("--no-relax");
+
+    // Forced-root for --gc-sections (which rustc enables by default
+    // for release builds). The overlay link has no `_start` —
+    // entry_symbol is the only thing that needs to survive ld's GC,
+    // since combine's trampoline is what actually reaches it.
+    // Without this, --gc-sections sees no roots and nukes the
+    // entire pruned input.
+    cmd.arg(format!("-Wl,-u,{entry_symbol}"));
+
+    // Our scripts MUST come before any of rustc's `-T` (notably
+    // linkall.x): hal-defaults.x has `PROVIDE(__post_init =
+    // no_init_hook)` which references a symbol undefined in
+    // overlay's pruned input. Our base_addresses.ld defines
+    // __post_init at base's address first, so linkall.x's PROVIDE
+    // is suppressed.
+    cmd.arg("-T").arg(base_symbols);
+    cmd.arg("-T").arg(all_base_symbols);
 
     if let Some(x) = xtensa {
         // Prepend our work_dir so ld's INCLUDE "memory.x" inside
-        // linkall.x finds our mutated copy first; everything else
-        // (alias.x, esp32s3.x, hal-defaults.x) falls through to the
-        // original esp-hal search paths.
+        // linkall.x finds our mutated copy first.
         cmd.arg("-L").arg(&x.work_dir);
-        for p in &x.search_paths {
-            cmd.arg("-L").arg(p);
-        }
-        // PROVIDE-script ordering matters here. esp-hal's hal-defaults.x
-        // (included via linkall.x) has lines like
-        //   `PROVIDE(__post_init = no_init_hook);`
-        // — `no_init_hook` is undefined in overlay's tiny input set, so
-        // if linkall.x is processed first, ld errors before our
-        // base_addresses.ld gets a chance to PROVIDE __post_init from
-        // base's actual address. Putting our PROVIDEs first means
-        // __post_init is already defined by the time linkall.x's
-        // PROVIDE is evaluated, so ld skips it.
-        cmd.arg("-T").arg(base_symbols);
-        cmd.arg("-T").arg(all_base_symbols);
-        cmd.arg("-T").arg("linkall.x");
     } else {
         // x86 path: layout script bumps everything from OVERLAY_BASE_ADDR.
         cmd.arg("-T").arg(layout);
-        cmd.arg("-T").arg(base_symbols);
-        cmd.arg("-T").arg(all_base_symbols);
     }
+
+    // Now forward rustc's link args verbatim (sans inputs and `-o`).
+    for a in crate::argv::forwarded_link_args(rustc_argv) {
+        cmd.arg(a);
+    }
+
+    // Pruned closure inputs replace rustc's original inputs.
     for p in pruned {
         cmd.arg(&p.path);
     }

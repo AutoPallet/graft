@@ -101,11 +101,38 @@ fn extract_undefined<'a>(cur: &'a str, next: Option<&'a str>) -> Option<Undefine
     None
 }
 
-fn is_input(s: &str) -> bool {
+pub fn is_input(s: &str) -> bool {
     if s.starts_with('-') { return false; }
     let p = Path::new(s);
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
     matches!(ext, "o" | "rlib" | "a")
+}
+
+/// Walk rustc-provided link argv, yielding everything overlay mode
+/// wants to forward verbatim to the real linker — that is, everything
+/// EXCEPT the inputs (replaced by the pruned objects) and the `-o`
+/// output flag (replaced by overlay's own output path).
+///
+/// Rationale: the overlay link should mirror base's link as closely
+/// as possible — same `-l libs`, same `-L` paths, same `-T` scripts,
+/// same `-Wl,...` linker options. Hand-curating the subset we need
+/// is fragile (e.g. `-l esp_rom_sys` whose stub library is itself a
+/// linker script that PROVIDES ROM addresses for `__udivdi3` etc.).
+/// Passthrough keeps overlay aligned with whatever flags base built
+/// with for free, and any divergence becomes a deliberate override
+/// rather than an oversight.
+pub fn forwarded_link_args(argv: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut i = if argv.is_empty() { 0 } else { 1 };
+    while i < argv.len() {
+        let a = &argv[i];
+        if is_input(a) { i += 1; continue; }
+        if a == "-o" { i += 2; continue; }
+        if a.starts_with("-o") && a.len() > 2 { i += 1; continue; }
+        out.push(a.as_str());
+        i += 1;
+    }
+    out
 }
 
 #[cfg(test)]
