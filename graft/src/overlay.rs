@@ -92,8 +92,15 @@ fn run(argv: Vec<String>) -> Result<()> {
     // symbol has a permanent absolute address we can PROVIDE. (The
     // fixture's cargo config wires this up via the musl target +
     // `relocation-model=static`.)
+    // Derive overlay's base vaddr from base.elf's actual layout: the
+    // first 4KB-aligned address past the highest `sh_addr + sh_size`
+    // among loaded sections. This keeps overlay close enough to base
+    // that any `j rel18` / `jmp rel32` trampoline stays in range, and
+    // page-aligns it so pageflash diffs cleanly. Replaces a previous
+    // hardcoded `0x1000_0000`.
+    let overlay_base_addr = compute_overlay_base_addr(&base_path)?;
     let layout_script = work_dir.join("overlay_layout.ld");
-    write_overlay_layout_ld(&layout_script, OVERLAY_BASE_ADDR)?;
+    write_overlay_layout_ld(&layout_script, overlay_base_addr)?;
 
     // Extend base_symbols.ld with PROVIDEs for *every* symbol in base's
     // .symtab. The closure walk only gives us ones we saw reloc-targeted,
@@ -287,11 +294,34 @@ fn write_empty_relocatable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Fixed virtual address where overlay's output sections land. Must sit
-/// within `call rel32` reach (±2 GB) of base's address range — base is
-/// around 0x400000 on non-PIE x86-64 static, so 256 MB is plenty of gap
-/// while staying within reach.
-const OVERLAY_BASE_ADDR: u64 = 0x1000_0000;
+/// Compute the virtual address where overlay's output sections land:
+/// first 4KB-aligned vaddr past the highest end of any allocated
+/// section in base.elf. Page-aligned so partial-flash diffs (pageflash)
+/// land cleanly on sector boundaries; close enough to base that the
+/// trampoline jump (`jmp rel32` on x86-64, multi-instruction long-jump
+/// on xtensa) is always in range.
+fn compute_overlay_base_addr(base_path: &Path) -> Result<u64> {
+    use object::{Object, ObjectSection, SectionFlags};
+    let bytes =
+        std::fs::read(base_path).with_context(|| format!("read {}", base_path.display()))?;
+    let elf = object::File::parse(&*bytes).context("parse base ELF for layout")?;
+    let mut max_end: u64 = 0;
+    for sec in elf.sections() {
+        let alloc = matches!(
+            sec.flags(),
+            SectionFlags::Elf { sh_flags } if (sh_flags & u64::from(object::elf::SHF_ALLOC)) != 0
+        );
+        if !alloc {
+            continue;
+        }
+        max_end = max_end.max(sec.address() + sec.size());
+    }
+    if max_end == 0 {
+        bail!("base ELF {} has no allocated sections", base_path.display());
+    }
+    const PAGE: u64 = 0x1000;
+    Ok((max_end + PAGE - 1) & !(PAGE - 1))
+}
 
 fn write_overlay_layout_ld(path: &Path, base_addr: u64) -> Result<()> {
     // Bump-allocate overlay's alloc sections starting at `base_addr`.
