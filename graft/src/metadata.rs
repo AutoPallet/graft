@@ -21,9 +21,9 @@ pub struct BaseLayout {
     /// Toolchain identifier ("rustc -Vv" commit hash) — incremental mode
     /// refuses to mix layouts across toolchains.
     pub toolchain_stamp: String,
-    /// Per-section record, ordered by vaddr. Only sections relevant to
-    /// flash layout are kept (alloc'd loaded sections — anything that
-    /// will end up in the .img).
+    /// Per-output-section record, ordered by vaddr. Used for image-
+    /// header context and to pick the slack offset (= end of the last
+    /// loaded section, page-aligned) where overlay code lands.
     pub sections: Vec<SectionLayout>,
 }
 
