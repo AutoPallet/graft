@@ -1,16 +1,16 @@
 //! Combine base + overlay ELFs into a runnable combined executable.
 //!
-//! Pure splice: no relocation work. Overlay is already fully linked at a
-//! disjoint address range (see `overlay.rs` — 0x1000_0000 on M0.5 x86),
-//! and its references to base symbols are resolved as absolute constants
-//! through `base_addresses.ld`. Combine's job is just:
+//! Pure splice: no relocation work. Overlay is already fully linked at
+//! disjoint addresses (see `overlay.rs` — disjoint flat region on x86,
+//! the slack past base's IROM/DROM on xtensa), and its references to
+//! base symbols are resolved as absolute constants through
+//! `base_addresses.ld`. Combine's job is just:
 //!
 //!   1. Copy base.elf verbatim.
-//!   2. Append overlay's PT_LOAD payload to the end of the file.
-//!   3. Rewrite the program header table to include the new PT_LOAD.
-//!   4. Install **one** 5-byte `jmp rel32` trampoline, at base's
-//!      `entry_symbol` (typically `main`), redirecting crt (_start) to
-//!      overlay's entry.
+//!   2. Append each overlay PT_LOAD's payload to the end of the file.
+//!   3. Rewrite the program header table to include the new PT_LOADs.
+//!   4. Install **one** trampoline at base's `entry_symbol` (typically
+//!      `main`), redirecting crt (or the boot path) to overlay's entry.
 //!
 //! Only the entry-point trampoline is needed. Every other base→closure
 //! reloc is impossible by construction: if some base section pointed
@@ -22,9 +22,8 @@
 //! isn't an overlay scan input (ld pulls it in via `-lc` rather than as
 //! an explicit `.o`), so the cascade can't reach it.
 //!
-//! (A better long-term design is an indirection table base reads at
-//! runtime — similar to how dioxus's hot-patcher dispatches — so even
-//! the entry hand-off doesn't require mutating base's bytes. Deferred.)
+//! Class-aware (ELF32 + ELF64) so this works for both x86_64 hosted
+//! (ELF64) and xtensa esp32s3 (ELF32).
 
 use std::path::Path;
 
@@ -33,17 +32,70 @@ use object::{Object, ObjectSymbol, elf::PT_LOAD};
 
 use crate::{elf_attach, metadata};
 
+/// ELF class — 32-bit or 64-bit. Detected from byte 4 of the ELF
+/// header. Determines program-header size, header field offsets, and
+/// width of file/address fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ElfClass {
+    Elf32,
+    Elf64,
+}
+
+impl ElfClass {
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 5 || &bytes[..4] != b"\x7fELF" {
+            bail!("not an ELF");
+        }
+        match bytes[4] {
+            1 => Ok(ElfClass::Elf32),
+            2 => Ok(ElfClass::Elf64),
+            c => bail!("unknown ELF class {c}"),
+        }
+    }
+
+    fn phdr_size(self) -> usize {
+        match self {
+            ElfClass::Elf32 => 32,
+            ElfClass::Elf64 => 56,
+        }
+    }
+
+    /// Byte offsets of (e_phoff, e_phentsize, e_phnum) in the ELF
+    /// header, plus how many bytes e_phoff occupies (4 vs 8).
+    fn header_offsets(self) -> HeaderOffsets {
+        match self {
+            ElfClass::Elf32 => HeaderOffsets {
+                e_phoff: 28,
+                e_phoff_size: 4,
+                e_phentsize: 42,
+                e_phnum: 44,
+            },
+            ElfClass::Elf64 => HeaderOffsets {
+                e_phoff: 32,
+                e_phoff_size: 8,
+                e_phentsize: 54,
+                e_phnum: 56,
+            },
+        }
+    }
+}
+
+struct HeaderOffsets {
+    e_phoff: usize,
+    e_phoff_size: usize, // 4 for ELF32, 8 for ELF64
+    e_phentsize: usize,
+    e_phnum: usize,
+}
+
 pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Result<Stats> {
     let base_bytes = std::fs::read(base_path)
         .with_context(|| format!("read {}", base_path.display()))?;
     let overlay_bytes = std::fs::read(overlay_path)
         .with_context(|| format!("read {}", overlay_path.display()))?;
 
-    if base_bytes.len() < 64 || &base_bytes[..4] != b"\x7fELF" {
-        bail!("{}: not an ELF", base_path.display());
-    }
-    if base_bytes[4] != 2 || base_bytes[5] != 1 {
-        bail!("{}: only ELF64 little-endian supported", base_path.display());
+    let base_class = ElfClass::from_bytes(&base_bytes)?;
+    if base_bytes[5] != 1 {
+        bail!("{}: only little-endian ELF supported", base_path.display());
     }
     if overlay_bytes.len() < 64 || &overlay_bytes[..4] != b"\x7fELF" {
         bail!("{}: not an ELF", overlay_path.display());
@@ -53,7 +105,13 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
     // nothing to splice, nothing to trampoline. Combined output is just
     // base verbatim.
     let ov_etype = u16::from_le_bytes(overlay_bytes[16..18].try_into().unwrap());
-    let ov_phnum = u16::from_le_bytes(overlay_bytes[56..58].try_into().unwrap());
+    let ov_class = ElfClass::from_bytes(&overlay_bytes)?;
+    let ov_phnum_offset = ov_class.header_offsets().e_phnum;
+    let ov_phnum = u16::from_le_bytes(
+        overlay_bytes[ov_phnum_offset..ov_phnum_offset + 2]
+            .try_into()
+            .unwrap(),
+    );
     if ov_etype == object::elf::ET_REL || ov_phnum == 0 {
         write_executable(output_path, &base_bytes)?;
         return Ok(Stats {
@@ -63,26 +121,29 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
             combined_size: base_bytes.len() as u64,
         });
     }
-
-    // Find overlay's unique PT_LOAD via raw PHT walk.
-    let ov_phdrs = read_program_headers(&overlay_bytes)?;
-    let loads: Vec<&Elf64Phdr> = ov_phdrs.iter().filter(|p| p.p_type == PT_LOAD).collect();
-    if loads.is_empty() {
-        bail!("{}: no PT_LOAD in overlay", overlay_path.display());
-    }
-    if loads.len() > 1 {
+    if ov_class != base_class {
         bail!(
-            "{}: overlay has {} PT_LOADs; M0.5 supports exactly one",
-            overlay_path.display(),
-            loads.len()
+            "ELF class mismatch: base {:?}, overlay {:?}",
+            base_class,
+            ov_class
         );
     }
-    let ov_load = *loads[0];
-    let ov_load_data = &overlay_bytes
-        [ov_load.p_offset as usize..(ov_load.p_offset + ov_load.p_filesz) as usize];
+
+    // Find every overlay PT_LOAD (one on x86, two-or-more on xtensa
+    // due to separate IROM and DROM mappings).
+    let ov_phdrs = read_program_headers(&overlay_bytes, ov_class)?;
+    let overlay_loads: Vec<Phdr> = ov_phdrs
+        .iter()
+        .copied()
+        .filter(|p| p.p_type == PT_LOAD)
+        .collect();
+    if overlay_loads.is_empty() {
+        bail!("{}: no PT_LOAD in overlay", overlay_path.display());
+    }
 
     // Find the one symbol we bridge: base's manifest tells us which
-    // user-level entry crt calls (always `main` on hosted x86-64).
+    // user-level entry crt calls (always `main` on hosted x86-64; the
+    // bootloader entry for xtensa).
     let manifest_bytes = elf_attach::read_section(&base_bytes, metadata::SECTION_MANIFEST)?
         .ok_or_else(|| anyhow!("{}: no {}", base_path.display(), metadata::SECTION_MANIFEST))?;
     let manifest = metadata::decode_manifest(manifest_bytes)?;
@@ -94,13 +155,13 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
         .with_context(|| format!("parse {}", overlay_path.display()))?;
     let base_entry_addr = find_text_def(&base_obj, entry)
         .ok_or_else(|| anyhow!("entry symbol {entry:?} not defined in base"))?;
+    // Overlay's entry must live inside one of the overlay PT_LOADs;
+    // if the link resolved entry to a base PROVIDE address it'd be
+    // outside, meaning the closure didn't cascade to entry — guard.
     let overlay_entry_addr = find_text_def(&overlay_obj, entry).filter(|&a| {
-        // Must live inside overlay's PT_LOAD; an ABS symbol at base's
-        // address would mean overlay's link resolved `main` through our
-        // PROVIDE script rather than redefining it (i.e. the closure
-        // didn't cascade to main — shouldn't happen with a non-empty
-        // closure, but guard anyway).
-        a >= ov_load.p_vaddr && a < ov_load.p_vaddr + ov_load.p_memsz
+        overlay_loads
+            .iter()
+            .any(|p| a >= p.p_vaddr && a < p.p_vaddr + p.p_memsz)
     });
     let trampolines: Vec<Trampoline> = match overlay_entry_addr {
         Some(a) => vec![Trampoline {
@@ -112,12 +173,8 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
     };
 
     // No trampoline → base never jumps into overlay. KEEP()'d sections
-    // like `.init_array` or crtbegin's `__do_init` can land in overlay
-    // even without any code change (they have no symbols classify can
-    // match against base's symhash), but they're unreachable without a
-    // trampoline. Short-circuit to byte-identical base output — this is
-    // the "no-op" scenario under the M0.5 model where `main` is the
-    // single redirect point.
+    // can land in overlay even without a code change but are unreachable
+    // without a trampoline. Short-circuit to byte-identical base output.
     if trampolines.is_empty() {
         write_executable(output_path, &base_bytes)?;
         return Ok(Stats {
@@ -128,61 +185,82 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
         });
     }
 
-    // Build output: start from base, apply trampolines, append overlay
-    // payload, relocate + extend PHT.
+    // Build output: start from base, apply trampolines, append every
+    // overlay PT_LOAD, append a new PHT extending base's.
     let mut out = base_bytes.clone();
 
-    let base_phdrs = read_program_headers(&base_bytes)?;
+    let base_phdrs = read_program_headers(&base_bytes, base_class)?;
     let e_machine = u16::from_le_bytes(base_bytes[18..20].try_into().unwrap());
     apply_trampolines(&mut out, &base_phdrs, &trampolines, e_machine)?;
 
-    align_up(&mut out, 0x1000);
-    let new_load_offset = out.len() as u64;
-    out.extend_from_slice(ov_load_data);
-    // Zero-pad up to overlay's declared p_memsz so any .bss tail lives
-    // inside the file (this lets us overlap the PHT into the same LOAD
-    // without clipping overlay's memsz).
-    if ov_load.p_memsz > ov_load.p_filesz {
-        let pad = (ov_load.p_memsz - ov_load.p_filesz) as usize;
-        out.resize(out.len() + pad, 0);
+    // For each overlay LOAD: append its bytes, padded to memsz; track
+    // the new file offset for the rewritten PHT entry. Each LOAD is
+    // page-aligned so the kernel/bootloader can mmap cleanly.
+    let mut new_loads: Vec<Phdr> = Vec::with_capacity(overlay_loads.len());
+    let primary_load = overlay_loads[0]; // for Stats reporting
+    for ov_load in &overlay_loads {
+        align_up(&mut out, 0x1000);
+        let new_offset = out.len() as u64;
+        let load_data = &overlay_bytes
+            [ov_load.p_offset as usize..(ov_load.p_offset + ov_load.p_filesz) as usize];
+        out.extend_from_slice(load_data);
+        if ov_load.p_memsz > ov_load.p_filesz {
+            out.resize(out.len() + (ov_load.p_memsz - ov_load.p_filesz) as usize, 0);
+        }
+        new_loads.push(Phdr {
+            p_type: PT_LOAD,
+            p_flags: ov_load.p_flags,
+            p_offset: new_offset,
+            p_vaddr: ov_load.p_vaddr,
+            p_paddr: ov_load.p_vaddr,
+            p_filesz: ov_load.p_filesz,
+            p_memsz: ov_load.p_memsz,
+            p_align: 0x1000,
+        });
     }
 
     align_up(&mut out, 8);
     let new_phoff = out.len() as u64;
-    let phdrs = read_program_headers(&base_bytes)?;
-    let new_phnum = (phdrs.len() + 1) as u64;
-    let pht_size = new_phnum * 56;
-    // Extend the overlay LOAD so it covers the PHT trailing it; the
-    // kernel needs e_phoff to fall inside *some* LOAD segment for AT_PHDR
-    // to be a valid virtual address (else musl SEGVs in __init_libc
-    // reading phdrs for TLS setup).
-    let new_load_filesz = (new_phoff + pht_size) - new_load_offset;
-    let new_phdr = Elf64Phdr {
-        p_type: PT_LOAD,
-        p_flags: ov_load.p_flags,
-        p_offset: new_load_offset,
-        p_vaddr: ov_load.p_vaddr,
-        p_paddr: ov_load.p_vaddr,
-        p_filesz: new_load_filesz,
-        p_memsz: new_load_filesz,
-        p_align: 0x1000,
-    };
+    let new_phnum = base_phdrs.len() + new_loads.len();
+    let pht_size = new_phnum * base_class.phdr_size();
 
-    for p in &phdrs {
-        out.extend_from_slice(&p.to_le_bytes());
+    // ELF64 hosted (x86 musl): the kernel needs e_phoff to fall inside
+    // *some* PT_LOAD for AT_PHDR to be a valid virtual address (else
+    // musl SEGVs in __init_libc reading phdrs for TLS setup). Stretch
+    // the last new LOAD to cover the trailing PHT.
+    //
+    // ELF32 xtensa: bootloader walks PHT directly from the file via
+    // e_phoff, doesn't require it to be inside a LOAD. Skip the stretch
+    // there to avoid declaring extra memory the bootloader would try
+    // to map.
+    if base_class == ElfClass::Elf64
+        && let Some(last) = new_loads.last_mut()
+    {
+        let new_filesz = (new_phoff + pht_size as u64) - last.p_offset;
+        last.p_filesz = new_filesz;
+        last.p_memsz = new_filesz;
     }
-    out.extend_from_slice(&new_phdr.to_le_bytes());
+
+    for p in base_phdrs.iter().chain(new_loads.iter()) {
+        out.extend_from_slice(&p.to_le_bytes(base_class));
+    }
 
     // Patch e_phoff + e_phnum in the ELF header.
-    out[32..40].copy_from_slice(&new_phoff.to_le_bytes());
-    out[56..58].copy_from_slice(&(new_phnum as u16).to_le_bytes());
+    let ho = base_class.header_offsets();
+    match ho.e_phoff_size {
+        4 => out[ho.e_phoff..ho.e_phoff + 4].copy_from_slice(&(new_phoff as u32).to_le_bytes()),
+        8 => out[ho.e_phoff..ho.e_phoff + 8].copy_from_slice(&new_phoff.to_le_bytes()),
+        n => bail!("unexpected e_phoff_size {n}"),
+    }
+    out[ho.e_phnum..ho.e_phnum + 2].copy_from_slice(&(new_phnum as u16).to_le_bytes());
 
     write_executable(output_path, &out)?;
 
+    let total_overlay_filesz: u64 = overlay_loads.iter().map(|p| p.p_filesz).sum();
     Ok(Stats {
         trampolines,
-        overlay_load_size: ov_load.p_filesz,
-        overlay_vaddr: ov_load.p_vaddr,
+        overlay_load_size: total_overlay_filesz,
+        overlay_vaddr: primary_load.p_vaddr,
         combined_size: out.len() as u64,
     })
 }
@@ -201,8 +279,10 @@ pub struct Trampoline {
     pub overlay_addr: u64,
 }
 
+/// Canonical 64-bit-wide program header. ELF32 fields are zero-extended
+/// on read and truncated on write.
 #[derive(Debug, Clone, Copy)]
-struct Elf64Phdr {
+struct Phdr {
     p_type: u32,
     p_flags: u32,
     p_offset: u64,
@@ -213,46 +293,87 @@ struct Elf64Phdr {
     p_align: u64,
 }
 
-impl Elf64Phdr {
-    fn parse(raw: &[u8]) -> Self {
-        Elf64Phdr {
-            p_type: u32::from_le_bytes(raw[0..4].try_into().unwrap()),
-            p_flags: u32::from_le_bytes(raw[4..8].try_into().unwrap()),
-            p_offset: u64::from_le_bytes(raw[8..16].try_into().unwrap()),
-            p_vaddr: u64::from_le_bytes(raw[16..24].try_into().unwrap()),
-            p_paddr: u64::from_le_bytes(raw[24..32].try_into().unwrap()),
-            p_filesz: u64::from_le_bytes(raw[32..40].try_into().unwrap()),
-            p_memsz: u64::from_le_bytes(raw[40..48].try_into().unwrap()),
-            p_align: u64::from_le_bytes(raw[48..56].try_into().unwrap()),
+impl Phdr {
+    fn parse(raw: &[u8], class: ElfClass) -> Self {
+        match class {
+            ElfClass::Elf64 => Self {
+                p_type: u32::from_le_bytes(raw[0..4].try_into().unwrap()),
+                p_flags: u32::from_le_bytes(raw[4..8].try_into().unwrap()),
+                p_offset: u64::from_le_bytes(raw[8..16].try_into().unwrap()),
+                p_vaddr: u64::from_le_bytes(raw[16..24].try_into().unwrap()),
+                p_paddr: u64::from_le_bytes(raw[24..32].try_into().unwrap()),
+                p_filesz: u64::from_le_bytes(raw[32..40].try_into().unwrap()),
+                p_memsz: u64::from_le_bytes(raw[40..48].try_into().unwrap()),
+                p_align: u64::from_le_bytes(raw[48..56].try_into().unwrap()),
+            },
+            ElfClass::Elf32 => {
+                // ELF32 layout: type, offset, vaddr, paddr, filesz,
+                // memsz, flags, align — note flags is *after* memsz.
+                let r = |o: usize| u32::from_le_bytes(raw[o..o + 4].try_into().unwrap()) as u64;
+                Self {
+                    p_type: r(0) as u32,
+                    p_offset: r(4),
+                    p_vaddr: r(8),
+                    p_paddr: r(12),
+                    p_filesz: r(16),
+                    p_memsz: r(20),
+                    p_flags: r(24) as u32,
+                    p_align: r(28),
+                }
+            }
         }
     }
-    fn to_le_bytes(&self) -> [u8; 56] {
-        let mut b = [0u8; 56];
-        b[0..4].copy_from_slice(&self.p_type.to_le_bytes());
-        b[4..8].copy_from_slice(&self.p_flags.to_le_bytes());
-        b[8..16].copy_from_slice(&self.p_offset.to_le_bytes());
-        b[16..24].copy_from_slice(&self.p_vaddr.to_le_bytes());
-        b[24..32].copy_from_slice(&self.p_paddr.to_le_bytes());
-        b[32..40].copy_from_slice(&self.p_filesz.to_le_bytes());
-        b[40..48].copy_from_slice(&self.p_memsz.to_le_bytes());
-        b[48..56].copy_from_slice(&self.p_align.to_le_bytes());
-        b
+
+    fn to_le_bytes(&self, class: ElfClass) -> Vec<u8> {
+        match class {
+            ElfClass::Elf64 => {
+                let mut b = Vec::with_capacity(56);
+                b.extend_from_slice(&self.p_type.to_le_bytes());
+                b.extend_from_slice(&self.p_flags.to_le_bytes());
+                b.extend_from_slice(&self.p_offset.to_le_bytes());
+                b.extend_from_slice(&self.p_vaddr.to_le_bytes());
+                b.extend_from_slice(&self.p_paddr.to_le_bytes());
+                b.extend_from_slice(&self.p_filesz.to_le_bytes());
+                b.extend_from_slice(&self.p_memsz.to_le_bytes());
+                b.extend_from_slice(&self.p_align.to_le_bytes());
+                b
+            }
+            ElfClass::Elf32 => {
+                let mut b = Vec::with_capacity(32);
+                b.extend_from_slice(&(self.p_type).to_le_bytes());
+                b.extend_from_slice(&(self.p_offset as u32).to_le_bytes());
+                b.extend_from_slice(&(self.p_vaddr as u32).to_le_bytes());
+                b.extend_from_slice(&(self.p_paddr as u32).to_le_bytes());
+                b.extend_from_slice(&(self.p_filesz as u32).to_le_bytes());
+                b.extend_from_slice(&(self.p_memsz as u32).to_le_bytes());
+                b.extend_from_slice(&(self.p_flags).to_le_bytes());
+                b.extend_from_slice(&(self.p_align as u32).to_le_bytes());
+                b
+            }
+        }
     }
 }
 
-fn read_program_headers(elf: &[u8]) -> Result<Vec<Elf64Phdr>> {
-    let e_phoff = u64::from_le_bytes(elf[32..40].try_into().unwrap()) as usize;
-    let e_phentsize = u16::from_le_bytes(elf[54..56].try_into().unwrap()) as usize;
-    let e_phnum = u16::from_le_bytes(elf[56..58].try_into().unwrap()) as usize;
-    if e_phentsize != 56 {
-        bail!("unexpected e_phentsize {e_phentsize} (wanted 56 for ELF64)");
+fn read_program_headers(elf: &[u8], class: ElfClass) -> Result<Vec<Phdr>> {
+    let ho = class.header_offsets();
+    let e_phoff = match ho.e_phoff_size {
+        4 => u32::from_le_bytes(elf[ho.e_phoff..ho.e_phoff + 4].try_into().unwrap()) as usize,
+        8 => u64::from_le_bytes(elf[ho.e_phoff..ho.e_phoff + 8].try_into().unwrap()) as usize,
+        n => bail!("unexpected e_phoff_size {n}"),
+    };
+    let e_phentsize =
+        u16::from_le_bytes(elf[ho.e_phentsize..ho.e_phentsize + 2].try_into().unwrap()) as usize;
+    let e_phnum = u16::from_le_bytes(elf[ho.e_phnum..ho.e_phnum + 2].try_into().unwrap()) as usize;
+    let expected = class.phdr_size();
+    if e_phentsize != expected {
+        bail!("unexpected e_phentsize {e_phentsize} (wanted {expected} for {class:?})");
     }
     let end = e_phoff + e_phnum * e_phentsize;
     if end > elf.len() {
         bail!("truncated PHT");
     }
     Ok((0..e_phnum)
-        .map(|i| Elf64Phdr::parse(&elf[e_phoff + i * e_phentsize..e_phoff + (i + 1) * e_phentsize]))
+        .map(|i| Phdr::parse(&elf[e_phoff + i * e_phentsize..e_phoff + (i + 1) * e_phentsize], class))
         .collect())
 }
 
@@ -270,11 +391,11 @@ fn find_text_def(elf: &object::File<'_>, name: &str) -> Option<u64> {
 
 fn apply_trampolines(
     out: &mut [u8],
-    base_phdrs: &[Elf64Phdr],
+    base_phdrs: &[Phdr],
     trampolines: &[Trampoline],
     e_machine: u16,
 ) -> Result<()> {
-    let loads: Vec<&Elf64Phdr> = base_phdrs.iter().filter(|p| p.p_type == PT_LOAD).collect();
+    let loads: Vec<&Phdr> = base_phdrs.iter().filter(|p| p.p_type == PT_LOAD).collect();
     let tramp_size = crate::arch::trampoline_size(e_machine)?;
     for t in trampolines {
         let seg = loads
