@@ -804,11 +804,60 @@ fn mutate_memory_x(content: &str, slack: &XtensaSlack) -> Result<String> {
     Ok(out)
 }
 
-/// Find esp-hal's `memory.x` by scanning argv's `-L` paths. Returns
-/// the resolved path plus the full list of `-L` directories so the
-/// caller can preserve them (we'll prepend `work_dir` then add these
-/// for fallthrough).
-fn find_memory_x_and_paths(argv: &[String]) -> Result<(PathBuf, Vec<PathBuf>)> {
+/// Strip the `.rotext_dummy` SECTIONS clause (and its
+/// `INSERT BEFORE .text;`) from esp-hal's `esp32s3.x`.
+///
+/// Why: the clause exists in base's link to skip past the flash
+/// bytes occupied by `.rodata` so `.text` doesn't end up reading
+/// rodata content (DROM and IROM map the same physical flash on
+/// ESP32-S3). It rounds the skip up to `ALIGN(0x10000) + 0x20`,
+/// which costs ~38 KB of zero-padding in the image.
+///
+/// For overlay's link this is unnecessary by construction:
+///   - Overlay's `.rodata` lives in the slack DROM region, past
+///     base's DROM end.
+///   - Overlay's `.text`  lives in the slack IROM region, past
+///     base's IROM end.
+///   - The two slack regions correspond to disjoint flash ranges,
+///     so DROM-reading-text overlap is impossible.
+///
+/// The cache requirement (`paddr % 64KB == vaddr % 64KB`) is
+/// satisfied by *contiguity* with base's segment: when espflash
+/// merges base's IROM segment with overlay's, paddr and vaddr
+/// advance in lockstep, so any aligned-on-base position remains
+/// aligned. We just need overlay's `.text` 4-byte slack-aligned
+/// past base's IROM end and the merged segment is well-formed.
+///
+/// `_rotext_reserved_start` is only referenced inside esp32s3.x
+/// itself, so dropping the clause is safe — confirmed by grep
+/// across all esp-hal scripts. Idempotent.
+fn mutate_esp32s3_x(content: &str) -> Result<String> {
+    let block_start = content
+        .find("SECTIONS {\n  .rotext_dummy")
+        .ok_or_else(|| anyhow!("esp32s3.x: no `.rotext_dummy` SECTIONS clause"))?;
+    let insert = "INSERT BEFORE .text;\n";
+    let block_end_rel = content[block_start..]
+        .find(insert)
+        .ok_or_else(|| anyhow!("esp32s3.x: no `INSERT BEFORE .text` after `.rotext_dummy`"))?;
+    let block_end = block_start + block_end_rel + insert.len();
+
+    let mut out = String::with_capacity(content.len());
+    out.push_str(&content[..block_start]);
+    out.push_str(
+        "/* graft overlay: .rotext_dummy removed — overlay's .text and \
+         .rodata land in disjoint slack ranges, so the DROM/IROM-overlap \
+         skip is unnecessary. */\n",
+    );
+    out.push_str(&content[block_end..]);
+    Ok(out)
+}
+
+/// Find esp-hal's `memory.x` and `esp32s3.x` by scanning argv's `-L`
+/// paths. Returns the resolved memory.x path, the resolved
+/// esp32s3.x path, and the full list of `-L` directories so the
+/// caller can preserve them (we'll prepend `work_dir` then add
+/// these for fallthrough).
+fn find_memory_x_and_paths(argv: &[String]) -> Result<(PathBuf, PathBuf, Vec<PathBuf>)> {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut i = 0;
     while i < argv.len() {
@@ -824,13 +873,27 @@ fn find_memory_x_and_paths(argv: &[String]) -> Result<(PathBuf, Vec<PathBuf>)> {
         }
         i += 1;
     }
+    let mut memory_x: Option<PathBuf> = None;
+    let mut esp32s3_x: Option<PathBuf> = None;
     for p in &paths {
-        let candidate = p.join("memory.x");
-        if candidate.exists() {
-            return Ok((candidate, paths));
+        if memory_x.is_none() {
+            let c = p.join("memory.x");
+            if c.exists() {
+                memory_x = Some(c);
+            }
+        }
+        if esp32s3_x.is_none() {
+            let c = p.join("esp32s3.x");
+            if c.exists() {
+                esp32s3_x = Some(c);
+            }
         }
     }
-    bail!("memory.x not found in any -L path ({} searched)", paths.len());
+    let memory_x = memory_x
+        .ok_or_else(|| anyhow!("memory.x not found in any -L path ({} searched)", paths.len()))?;
+    let esp32s3_x = esp32s3_x
+        .ok_or_else(|| anyhow!("esp32s3.x not found in any -L path ({} searched)", paths.len()))?;
+    Ok((memory_x, esp32s3_x, paths))
 }
 
 fn setup_xtensa_layout(
@@ -839,12 +902,20 @@ fn setup_xtensa_layout(
     argv: &[String],
 ) -> Result<XtensaLayout> {
     let slack = compute_xtensa_slack(base_bytes)?;
-    let (memory_x, search_paths) = find_memory_x_and_paths(argv)?;
-    let original = std::fs::read_to_string(&memory_x)
+    let (memory_x, esp32s3_x, search_paths) = find_memory_x_and_paths(argv)?;
+
+    let memory_orig = std::fs::read_to_string(&memory_x)
         .with_context(|| format!("read {}", memory_x.display()))?;
-    let mutated = mutate_memory_x(&original, &slack)?;
-    let dest = work_dir.join("memory.x");
-    std::fs::write(&dest, mutated).with_context(|| format!("write {}", dest.display()))?;
+    let memory_mutated = mutate_memory_x(&memory_orig, &slack)?;
+    std::fs::write(work_dir.join("memory.x"), memory_mutated)
+        .with_context(|| format!("write {}/memory.x", work_dir.display()))?;
+
+    let esp_orig = std::fs::read_to_string(&esp32s3_x)
+        .with_context(|| format!("read {}", esp32s3_x.display()))?;
+    let esp_mutated = mutate_esp32s3_x(&esp_orig)?;
+    std::fs::write(work_dir.join("esp32s3.x"), esp_mutated)
+        .with_context(|| format!("write {}/esp32s3.x", work_dir.display()))?;
+
     Ok(XtensaLayout {
         work_dir: work_dir.to_path_buf(),
         search_paths,
@@ -888,5 +959,40 @@ MEMORY
             drom_start: 0,
         };
         assert!(mutate_memory_x(input, &slack).is_err());
+    }
+
+    #[test]
+    fn mutate_esp32s3_x_drops_rotext_dummy() {
+        let input = "\
+INCLUDE exception.x
+
+SECTIONS {
+  .rotext_dummy (NOLOAD) :
+  {
+    . = . + SIZEOF(.rodata);
+    . = ALIGN(0x10000) + 0x20;
+    _rotext_reserved_start = .;
+  } > ROTEXT
+}
+INSERT BEFORE .text;
+
+SECTIONS {
+  INCLUDE \"text.x\"
+}
+";
+        let out = mutate_esp32s3_x(input).unwrap();
+        // The actual SECTIONS clause and INSERT directive are gone
+        // (the explanatory comment retains the term `.rotext_dummy`,
+        // which is fine — ld doesn't interpret comments).
+        assert!(!out.contains(".rotext_dummy (NOLOAD)"));
+        assert!(!out.contains("INSERT BEFORE .text;"));
+        // Other content preserved.
+        assert!(out.contains("INCLUDE exception.x"));
+        assert!(out.contains("INCLUDE \"text.x\""));
+    }
+
+    #[test]
+    fn mutate_esp32s3_x_errors_on_unrecognized_layout() {
+        assert!(mutate_esp32s3_x("INCLUDE foo.x\n").is_err());
     }
 }

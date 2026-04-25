@@ -23,6 +23,7 @@ what got changed along the way. As of `edcea78` (M1.g.8).
 | M1.g.7 — base mode on hardware (`.graft.manifest`/`.symhash` attached, ELF boots) | done |
 | M1.g.8 — overlay mode on hardware | **done** — non-empty overlay boots and runs edited code |
 | M1.h — re-run churn experiments through graft | done; **regression vs stock + pageflash** — see below |
+| M1.i — drop rotext_dummy padding from overlay link | done; payload 14× smaller; full-flash 2.2× faster; pageflash now segment-shift bound |
 
 ## Key decisions changed from the 05 plan
 
@@ -281,28 +282,84 @@ So a tight upper bound is 12-16 KB — already 4× better than stock
 pageflash on this scenario. The 64 KB we measured is bottlenecked
 entirely by the rotext_dummy padding being flashed.
 
-### Follow-up work (deferred from M1.h)
+**Followup work** is consolidated in the M1.i section below.
 
-1. **Eliminate the rotext_dummy padding from the flashed image.** Three
-   plausible angles, all of them needing experimentation:
+Driver script: `scripts/m1h_churn.sh`. Numbers above were collected
+with `target_chip=esp32s3, espflash 4.4.0, esp-hal 1.1.0, rustc esp
+fork 1.92.0.0`.
 
-   1. **Two-IROM-segment combine.** Have combine emit base's IROM and
-      overlay's IROM as separate PT_LOADs / sections. The bootloader
-      can in principle handle multiple IROM segments via the cache
-      controller; espflash's `merge_adjacent_segments` is conservative
-      but the underlying chip is not. Need to verify on real ESP-IDF
-      v5+ bootloaders that two IROM segments map cleanly.
-   2. **Place overlay's `.text` adjacent to base.** Override esp32s3.x's
-      `.rotext_dummy` clause for the overlay link so `.text` starts at
-      a 4-byte slack offset past base instead of `ALIGN(0x10000)+0x20`.
-      `paddr % 64KB == vaddr % 64KB` still holds because both paddr
-      and vaddr advance by the same amount through the merged segment.
-      Probably the cleanest fix.
-   3. **Mark padding NOBITS in the combined ELF.** Convert combine's
-      `.graft.overlay.<i>` section for the rotext_dummy range to
-      `SHT_NOBITS`. espflash skips NOBITS from the image. But then
-      we'd need two PROGBITS sections at the same vaddr range, which
-      again hits the multi-segment constraint.
+## M1.i — drop `.rotext_dummy` from overlay link
+
+esp32s3.x's `.rotext_dummy (NOLOAD)` clause exists in base's link to
+skip past the flash bytes occupied by `.rodata` so `.text` doesn't
+end up reading rodata content (DROM and IROM map the same physical
+flash on ESP32-S3). It rounds the skip up to `ALIGN(0x10000) + 0x20`,
+costing ~38 KB of zero-padding in base's image — and, before this
+fix, in every overlay rebuild's image too.
+
+Key insight: for overlay's link, the clause is unnecessary by
+construction. Overlay's `.rodata` lives in the slack DROM region
+past base's DROM end; overlay's `.text` lives in the slack IROM
+region past base's IROM end. The two slack regions correspond to
+disjoint flash ranges, so DROM-reading-text overlap is impossible.
+
+The cache requirement (`paddr % 64KB == vaddr % 64KB`) is satisfied
+by *contiguity* with base's segment: when espflash merges base's
+IROM segment with overlay's, paddr and vaddr advance in lockstep,
+so any aligned-on-base position remains aligned. We just need
+overlay's `.text` 4-byte slack-aligned past base's IROM end and the
+merged segment is well-formed.
+
+**Fix**: `mutate_esp32s3_x` in `overlay.rs` strips the
+`.rotext_dummy` SECTIONS clause and its `INSERT BEFORE .text;` from
+esp-hal's `esp32s3.x`, drops the modified copy in `work_dir`, and
+relies on the existing `-L work_dir` precedence to make ld pick it
+up over esp-hal's. `_rotext_reserved_start` (the only symbol the
+clause defined) isn't referenced anywhere outside the clause itself
+(verified by grep across all esp-hal scripts), so dropping it is
+safe.
+
+### Numbers after M1.i (Hello → Howdy)
+
+| pipeline                  | bytes  | wall time |
+|---|---:|---:|
+| stock full-flash          | 92 KB  | 2.43s     |
+| **stock + pageflash**     | **8 KB** | **1.56s** |
+| graft full-flash          | **94 KB** (was 132) | **1.46s** (was 3.28) |
+| graft overlay + pageflash | **24 KB** (was 64) | 2.12s    |
+
+Overlay payload itself: 41,554 → **2,898 bytes** (14× smaller). The
+combined image dropped from 132 KB → 94 KB. Graft full-flash now
+*beats stock full-flash* outright (smaller image, faster write).
+
+But on this particular fixture, **stock + pageflash still wins on
+small edits** (8 KB vs 24 KB; ~0.6 s wall time advantage). The
+remaining 24 KB graft churn breaks down as:
+
+  - **16 KB at flash 0x10000**: base's DROM/DRAM/IRAM segments
+    *shifted later in the image* because espflash placed overlay's
+    `.rodata` (1.7 KB) immediately after base's `.rodata` in paddr
+    order, which pushed every subsequent segment forward. So 4 pages
+    of base content count as "changed" purely from being relocated
+    in flash, even though the bytes themselves are identical.
+  - **4 KB at 0x20000**: base's IROM page that contains the
+    trampoline patch (graft's only real write into base territory).
+  - **4 KB at 0x26000**: image-trailing SHA-256 / metadata page.
+
+The dominant cost is now the *segment-shift* (16 KB / 24 KB = 67% of
+the diff) — paddr layout, not real content change.
+
+### Follow-up work after M1.i
+
+1. **Stop shifting base segments when overlay grows.** Have
+   `combine.rs` place overlay sections at *high* paddrs (past every
+   base segment) rather than letting espflash interleave them by
+   vaddr-sort order. The vaddr stays at the slack DROM/IROM
+   addresses (the chip needs those for MMU mapping); only the file
+   paddr changes. This keeps base content at its original flash
+   offsets so pageflash sees only the trampoline page + overlay
+   pages + checksum page diff. Estimate: ~16 KB → ~4-8 KB diff,
+   crossing under stock pageflash for any non-trivial edit.
 
 2. **Per-string sub-sectioning for `SHF_MERGE | SHF_STRINGS`.** With
    LTO=fat, all anonymous string constants land in one merged section
@@ -332,15 +389,11 @@ entirely by the rotext_dummy padding being flashed.
    we care about LLD compatibility.
 
 3. **Closer-fit cache alignment.** Even the 4-byte-slack
-   placement (option 1.2 above) leaves base's IROM segment ending at
-   an arbitrary vaddr and overlay's starting right after. The
-   bootloader might map a final partial cache page that overflows
-   into overlay's IROM; in pathological cases this could double-count
-   the boundary page. Audit at implementation time.
-
-Driver script: `scripts/m1h_churn.sh`. Numbers above were collected
-with `target_chip=esp32s3, espflash 4.4.0, esp-hal 1.1.0, rustc esp
-fork 1.92.0.0`.
+   placement leaves base's IROM segment ending at an arbitrary vaddr
+   and overlay's starting right after. The bootloader might map a
+   final partial cache page that overflows into overlay's IROM; in
+   pathological cases this could double-count the boundary page.
+   Audit at implementation time.
 
 ## Things that turned out to not matter (or got simpler)
 
