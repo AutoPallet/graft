@@ -22,7 +22,6 @@ use object::{
     Architecture, BinaryFormat, Endianness, Object, ObjectSection, ObjectSymbol,
     RelocationFlags, RelocationTarget, SectionIndex, SectionKind, SymbolIndex, SymbolKind,
     SymbolScope,
-    elf::R_X86_64_NONE,
     write::{
         self, Object as WObject, Relocation as WRelocation, SectionId, Symbol as WSymbol,
         SymbolId, SymbolSection as WSymbolSection,
@@ -48,6 +47,7 @@ pub fn prune_object(
 
     let arch = match src.architecture() {
         object::Architecture::X86_64 => Architecture::X86_64,
+        object::Architecture::Xtensa => Architecture::Xtensa,
         a => bail!("unsupported architecture {a:?}"),
     };
     let endian = if src.is_little_endian() {
@@ -182,7 +182,9 @@ pub fn prune_object(
                 RelocationFlags::Elf { r_type } => r_type,
                 _ => continue,
             };
-            if r_type == R_X86_64_NONE {
+            // R_*_NONE is reloc-type 0 across every supported arch
+            // (x86_64, xtensa, arm, riscv) — it's a no-op placeholder.
+            if r_type == 0 {
                 continue;
             }
 
