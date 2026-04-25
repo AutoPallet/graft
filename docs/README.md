@@ -32,11 +32,13 @@ plan.
   `cargo run -p rustc-stability`.
 - **M0.5 (x86 prototype) — done.** Base + overlay + combine; all four
   edit scenarios pass; `e2e_cycle::full_cycle` integration test green.
-- **M1 (xtensa port) — partial.** Base mode works on hardware; overlay
-  builds and flashes but hangs after the bootloader. See
-  [`08-implementation-status.md`](./08-implementation-status.md) for the
-  current state, every design decision changed from the original plan,
-  and the open hang.
+- **M1 (xtensa port) — overlay loop works on hardware**, but currently
+  a regression vs. stock + pageflash on flash bytes/time because of a
+  ~38 KB rotext_dummy zero-padding the linker forces between base
+  and overlay. Edit-to-running fixture is end-to-end correct; making
+  it _faster than stock_ is the open follow-up. See
+  [`08-implementation-status.md`](./08-implementation-status.md) for
+  M1.h numbers and the path to fixing the padding bloat.
 
 ## Reading order
 

@@ -22,7 +22,7 @@ what got changed along the way. As of `edcea78` (M1.g.8).
 | M1.g.6 — combine.rs supports ELF32 and multi-segment overlays | done |
 | M1.g.7 — base mode on hardware (`.graft.manifest`/`.symhash` attached, ELF boots) | done |
 | M1.g.8 — overlay mode on hardware | **done** — non-empty overlay boots and runs edited code |
-| M1.h — re-run churn experiments through graft | not started |
+| M1.h — re-run churn experiments through graft | done; **regression vs stock + pageflash** — see below |
 
 ## Key decisions changed from the 05 plan
 
@@ -213,13 +213,134 @@ base.elf). The tooling probe is gone from the fixture but the
 trampoline-relocation pattern stayed: it's a useful loop-isolation
 mode for any future bisection.
 
-### M1.h — measure
+## M1.h — churn measurements
 
-Once M1.g.8 boots, re-run the M1.b churn experiments (`Hello`→`Howdy`,
-+8-byte body, new function, same-size code change) through
-`GRAFT=overlay`, compare pages-changed / bytes-written / wall time
-against the stock-rustc M1.b numbers. Goal: 47.8 % cascading churn
-drops to ~10 %.
+Re-ran the M1.b style churn experiments through `GRAFT=overlay` and
+compared against stock-rustc + pageflash. Driver: `scripts/m1h_churn.sh`
+(in-container, `--dry-run` mode for byte/page numbers; one wall-time
+run on hardware for `Hello`→`Howdy` to validate).
+
+| scenario | mode  | img_sz | pages_changed | bytes_changed |
+|---|---|---:|---:|---:|
+| Hello→Howdy (5↔5)        | stock | 92 KB → 92 KB  | 2 / 23 (8.7%)  | 8 KB  |
+| Hello→Howdy              | graft | 92 KB → 132 KB | 16 / 33 (48%)  | 64 KB |
+| Hello→Hello v2!! (+4)    | stock | 92 KB → 92 KB  | 6 / 23 (26%)   | 24 KB |
+| Hello→Hello v2!!         | graft | 92 KB → 132 KB | 16 / 33 (48%)  | 64 KB |
+| add new helper + call    | stock | 92 KB → 92 KB  | 3 / 23 (13%)   | 12 KB |
+| add new helper + call    | graft | 92 KB → 132 KB | 16 / 33 (48%)  | 64 KB |
+| `tick + 1` → `tick + 2`  | stock | 92 KB → 92 KB  | 3 / 23 (13%)   | 12 KB |
+| `tick + 1` → `tick + 2`  | graft | 92 KB → 132 KB | 16 / 33 (48%)  | 64 KB |
+
+Wall time on `Hello`→`Howdy` (chained `espflash write-bin`):
+
+| pipeline                  | bytes | wall time |
+|---|---:|---:|
+| stock full-flash          | 92 KB | 2.43s     |
+| **stock + pageflash**     | **8 KB** | **1.56s** |
+| graft full-flash          | 132 KB | 3.28s    |
+| graft overlay + pageflash | 64 KB | 2.48s    |
+
+**Headline: graft is currently a regression vs. stock + pageflash on
+this fixture.** Same shape across every scenario — graft writes a
+constant ~64 KB regardless of edit size. The reason is mechanical and
+fixable, not fundamental.
+
+### Where the 64 KB comes from
+
+The combined ELF's overlay PT_LOAD covers `0x42016b6c..0x42022543` —
+~47 KB, of which:
+
+  - **~38 KB is `.rotext_dummy` zero-padding.** esp32s3.x's
+    `.rotext_dummy` clause forces `.text` to start at
+    `ALIGN(0x10000) + 0x20`, the ESP-IDF cache requirement
+    (`paddr % 64KB == vaddr % 64KB`). Overlay's `.text` consequently
+    lands at `0x42020020`, leaving a 38 KB gap of zero bytes between
+    base's IROM end and overlay's actual code.
+  - **~3 KB is real overlay code/data** (graft_entry + a few
+    `.rodata..Lanon.*` + the merged-strings section).
+  - **~1 KB is image headers / segment metadata.**
+  - **~3 KB is shifted base content** (the trampoline patch in base's
+    `.text` plus a couple of pages disturbed by image-end alignment +
+    the trailing SHA-256).
+
+That zero-padding is inherent to the current single-merged-IROM-segment
+strategy (which the bootloader requires, per espflash's
+`merge_adjacent_segments` constraint: only one IROM/DROM segment per
+image). The padding bytes are flashed because they're inside the
+contiguous PROGBITS payload between base's text and overlay's text.
+
+### What "right" looks like
+
+For a `Hello`→`Howdy` edit, the *minimum* graft must write is roughly:
+
+  - 1 page covering the trampoline patch in base's `.text` (~4 KB).
+  - 1-2 pages covering overlay's actual `.text` + `.rodata` (~4-8 KB).
+  - 1 page for SHA-256 / image-end metadata.
+
+So a tight upper bound is 12-16 KB — already 4× better than stock
+pageflash on this scenario. The 64 KB we measured is bottlenecked
+entirely by the rotext_dummy padding being flashed.
+
+### Follow-up work (deferred from M1.h)
+
+1. **Eliminate the rotext_dummy padding from the flashed image.** Three
+   plausible angles, all of them needing experimentation:
+
+   1. **Two-IROM-segment combine.** Have combine emit base's IROM and
+      overlay's IROM as separate PT_LOADs / sections. The bootloader
+      can in principle handle multiple IROM segments via the cache
+      controller; espflash's `merge_adjacent_segments` is conservative
+      but the underlying chip is not. Need to verify on real ESP-IDF
+      v5+ bootloaders that two IROM segments map cleanly.
+   2. **Place overlay's `.text` adjacent to base.** Override esp32s3.x's
+      `.rotext_dummy` clause for the overlay link so `.text` starts at
+      a 4-byte slack offset past base instead of `ALIGN(0x10000)+0x20`.
+      `paddr % 64KB == vaddr % 64KB` still holds because both paddr
+      and vaddr advance by the same amount through the merged segment.
+      Probably the cleanest fix.
+   3. **Mark padding NOBITS in the combined ELF.** Convert combine's
+      `.graft.overlay.<i>` section for the rotext_dummy range to
+      `SHT_NOBITS`. espflash skips NOBITS from the image. But then
+      we'd need two PROGBITS sections at the same vaddr range, which
+      again hits the multi-segment constraint.
+
+2. **Per-string sub-sectioning for `SHF_MERGE | SHF_STRINGS`.** With
+   LTO=fat, all anonymous string constants land in one merged section
+   (`.rodata.str1.1`, ~1.6 KB on this fixture). Editing any string
+   changes the section's bytes → trans_hash differs → whole section
+   in the closure. *And it's not just bloat:* base functions that
+   reference strings near the changed one still resolve to base's
+   copy at base's `.rodata` address, but overlay carries a duplicate
+   of every string in its own `.rodata.str1.1`. GNU ld's
+   `--gc-sections` doesn't drop unreferenced fragments within a
+   merged section (LLD does, but Xtensa support in LLD is incomplete).
+
+   Right fix: in `scan.rs`, recognize `SHF_MERGE | SHF_STRINGS`
+   sections and split them at NUL boundaries into per-string virtual
+   sub-sections, each with its own trans_hash and its own incoming
+   relocs (with addend = byte offset within the original section).
+   `prune.rs` and `combine.rs` would have to follow suit. Estimated
+   a few hundred LOC plus careful reloc retargeting; pays off
+   directly in shipped overlay bytes.
+
+   *Possible bug if anyone ever runs graft with LLD:* base's link
+   may have already dropped strings that overlay still wants to
+   reference (because base's gc-sections fragmentized them out, but
+   overlay's compute_closure thinks they're "Provided" by base at a
+   per-section address). The current GNU-ld behavior accidentally
+   masks this — every string survives in base. Worth a guard once
+   we care about LLD compatibility.
+
+3. **Closer-fit cache alignment.** Even the 4-byte-slack
+   placement (option 1.2 above) leaves base's IROM segment ending at
+   an arbitrary vaddr and overlay's starting right after. The
+   bootloader might map a final partial cache page that overflows
+   into overlay's IROM; in pathological cases this could double-count
+   the boundary page. Audit at implementation time.
+
+Driver script: `scripts/m1h_churn.sh`. Numbers above were collected
+with `target_chip=esp32s3, espflash 4.4.0, esp-hal 1.1.0, rustc esp
+fork 1.92.0.0`.
 
 ## Things that turned out to not matter (or got simpler)
 
