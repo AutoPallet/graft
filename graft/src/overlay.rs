@@ -125,15 +125,36 @@ fn run(argv: Vec<String>) -> Result<()> {
         }
     }
 
-    // Write a stub to cargo's `-o` path so cargo sees success. `graft
-    // combine` (M0.5.e) merges base.elf + overlay.elf → final artifact.
-    std::fs::write(&output, b"graft-overlay-stub\n")
-        .with_context(|| format!("write stub {}", output.display()))?;
+    // Single-ELF output: combine base + overlay directly into cargo's
+    // `-o` path. The standalone overlay.elf stays in work_dir for
+    // debugging / inspection, but cargo + everything downstream sees one
+    // self-contained executable. The `graft combine` subcommand still
+    // exists for explicit invocation against arbitrary base/overlay
+    // pairs (snapshots, archived overlays, …), but no longer required
+    // for the normal build loop.
+    let combine_stats = crate::combine::combine(&base_path, &overlay_elf, &output)
+        .with_context(|| {
+            format!(
+                "combine base={} overlay={} -> {}",
+                base_path.display(),
+                overlay_elf.display(),
+                output.display()
+            )
+        })?;
+
+    // Sidecar with the combine stats so callers (tests, dev driver) can
+    // see the trampoline count etc. without parsing the linker's stderr
+    // — rustc captures+filters linker stderr so eprintln won't reach
+    // them. JSON-on-disk next to overlay.elf in work_dir.
+    let stats_path = work_dir.join("combine-stats.json");
+    write_combine_stats(&stats_path, &combine_stats)?;
 
     let summary = format!(
         "graft overlay: base {} symhash · overlay {} objs / {} sections · \
          closure {} sections · provides {} globals / {} locals · \
-         pruned {} objs / {} sections / {} renamed-locals · total {:.1?}\n\
+         pruned {} objs / {} sections / {} renamed-locals · \
+         combined {} bytes (overlay payload {} @ {:#x}, {} trampolines) · \
+         total {:.1?}\n\
          overlay.elf: {}\n",
         base.symhash_by_name.len(),
         scan.objects.len(),
@@ -144,6 +165,10 @@ fn run(argv: Vec<String>) -> Result<()> {
         pruned.len(),
         kept_sec_total,
         renamed_total,
+        combine_stats.combined_size,
+        combine_stats.overlay_load_size,
+        combine_stats.overlay_vaddr,
+        combine_stats.trampolines.len(),
         t_start.elapsed(),
         overlay_elf.display(),
     );
@@ -225,6 +250,31 @@ fn write_base_symbols_ld(closure: &Closure, path: &Path) -> Result<()> {
         let tu_hex: String = tu.iter().map(|b| format!("{b:02x}")).collect();
         writeln!(s, "PROVIDE(\"{name}@{tu_hex}\" = {addr:#x});").unwrap();
     }
+    std::fs::write(path, s).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+fn write_combine_stats(path: &Path, stats: &crate::combine::Stats) -> Result<()> {
+    use std::fmt::Write;
+    let mut s = String::new();
+    write!(
+        s,
+        "{{\"combined_size\":{},\"overlay_load_size\":{},\"overlay_vaddr\":{},\"trampolines\":[",
+        stats.combined_size, stats.overlay_load_size, stats.overlay_vaddr,
+    )
+    .unwrap();
+    for (i, t) in stats.trampolines.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        write!(
+            s,
+            "{{\"name\":{:?},\"base_addr\":{},\"overlay_addr\":{}}}",
+            t.name, t.base_addr, t.overlay_addr,
+        )
+        .unwrap();
+    }
+    s.push_str("]}\n");
     std::fs::write(path, s).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }

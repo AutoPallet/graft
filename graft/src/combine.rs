@@ -55,8 +55,7 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
     let ov_etype = u16::from_le_bytes(overlay_bytes[16..18].try_into().unwrap());
     let ov_phnum = u16::from_le_bytes(overlay_bytes[56..58].try_into().unwrap());
     if ov_etype == object::elf::ET_REL || ov_phnum == 0 {
-        std::fs::write(output_path, &base_bytes)
-            .with_context(|| format!("write {}", output_path.display()))?;
+        write_executable(output_path, &base_bytes)?;
         return Ok(Stats {
             trampolines: Vec::new(),
             overlay_load_size: 0,
@@ -120,8 +119,7 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
     // the "no-op" scenario under the M0.5 model where `main` is the
     // single redirect point.
     if trampolines.is_empty() {
-        std::fs::write(output_path, &base_bytes)
-            .with_context(|| format!("write {}", output_path.display()))?;
+        write_executable(output_path, &base_bytes)?;
         return Ok(Stats {
             trampolines,
             overlay_load_size: 0,
@@ -178,8 +176,7 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
     out[32..40].copy_from_slice(&new_phoff.to_le_bytes());
     out[56..58].copy_from_slice(&(new_phnum as u16).to_le_bytes());
 
-    std::fs::write(output_path, &out)
-        .with_context(|| format!("write {}", output_path.display()))?;
+    write_executable(output_path, &out)?;
 
     Ok(Stats {
         trampolines,
@@ -305,4 +302,25 @@ fn apply_trampolines(
 fn align_up(buf: &mut Vec<u8>, align: usize) {
     let pad = (align - (buf.len() % align)) % align;
     buf.resize(buf.len() + pad, 0);
+}
+
+/// Write an ELF, ensuring the result is executable. fs::write through
+/// open(O_TRUNC) creates the file with the umask-default mode (~0o644),
+/// stripping the +x bit even if the file existed and was executable
+/// before. The single-ELF combine flow writes over cargo's output, so
+/// we have to put the bit back ourselves.
+fn write_executable(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, bytes).with_context(|| format!("write {}", path.display()))?;
+    let mut perms = std::fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .permissions();
+    let mode = perms.mode();
+    let new_mode = mode | 0o111; // u+x, g+x, o+x — match cargo's default for binaries.
+    if new_mode != mode {
+        perms.set_mode(new_mode);
+        std::fs::set_permissions(path, perms)
+            .with_context(|| format!("chmod +x {}", path.display()))?;
+    }
+    Ok(())
 }

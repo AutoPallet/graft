@@ -1,4 +1,9 @@
-//! End-to-end cycle test: base build → edit → overlay build → combine → run.
+//! End-to-end cycle test: base build → edit → overlay build → run.
+//!
+//! With single-ELF mode, overlay's link produces the combined ELF
+//! directly at cargo's `-o` path (the underlying combine logic still
+//! lives in `combine.rs` and is exercised internally). No separate
+//! `graft combine` invocation needed for the normal build loop.
 //!
 //! Ignored by default because it shells out to `cargo build` twice per
 //! scenario. Run with:
@@ -70,12 +75,15 @@ impl Fixture {
         }
     }
 
-    fn overlay_elf(&self) -> PathBuf {
+    fn combine_stats(&self) -> Stats {
         let deps = self.dir.join("target/x86_64-unknown-linux-musl/debug/deps");
         for e in std::fs::read_dir(&deps).unwrap_or_else(|_| panic!("read {}", deps.display())) {
             let p = e.unwrap().path();
             if p.is_dir() && p.extension().and_then(|s| s.to_str()) == Some("graft-work") {
-                return p.join("overlay.elf");
+                let stats_path = p.join("combine-stats.json");
+                let s = std::fs::read_to_string(&stats_path)
+                    .unwrap_or_else(|_| panic!("read {}", stats_path.display()));
+                return Stats::parse(&s);
             }
         }
         panic!("no *.graft-work dir inside {}", deps.display());
@@ -86,18 +94,35 @@ impl Fixture {
     }
 }
 
+/// Just the bits we need to assert on. Hand-parsed from the JSON
+/// sidecar so this test stays free of serde dependencies.
+struct Stats {
+    trampolines: usize,
+}
+
+impl Stats {
+    fn parse(s: &str) -> Self {
+        let key = "\"trampolines\":[";
+        let start = s.find(key).expect("no trampolines key") + key.len();
+        let end = start
+            + s[start..]
+                .find(']')
+                .expect("unclosed trampolines array");
+        let body = &s[start..end];
+        let trampolines = if body.trim().is_empty() {
+            0
+        } else {
+            body.matches("\"name\"").count()
+        };
+        Stats { trampolines }
+    }
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::write(self.dir.join("base/src/lib.rs"), &self.original_lib);
         let _ = std::fs::write(self.dir.join("app/src/main.rs"), &self.original_main);
     }
-}
-
-fn graft_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../target/debug/graft")
-        .canonicalize()
-        .expect("target/debug/graft not built — run `cargo build -p graft` first")
 }
 
 fn make_executable(p: &Path) {
@@ -118,24 +143,6 @@ fn run_combined(path: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-fn combine(base: &Path, overlay: &Path, out: &Path) -> String {
-    let r = Command::new(graft_bin())
-        .arg("combine")
-        .arg(base)
-        .arg(overlay)
-        .arg("-o")
-        .arg(out)
-        .output()
-        .expect("exec graft combine");
-    assert!(
-        r.status.success(),
-        "graft combine failed\nstderr:\n{}",
-        String::from_utf8_lossy(&r.stderr)
-    );
-    make_executable(out);
-    String::from_utf8_lossy(&r.stderr).into_owned()
-}
-
 #[test]
 #[ignore]
 fn full_cycle() {
@@ -151,7 +158,6 @@ fn full_cycle() {
     assert!(base_out.contains("sum = 105"), "baseline: {base_out}");
     assert!(base_out.contains("mixed = 14280"), "baseline: {base_out}");
 
-    let combined = std::env::temp_dir().join("graft-e2e-combined.elf");
     let base_env = base_elf.to_string_lossy().into_owned();
     let overlay_env = [("GRAFT", "overlay"), ("GRAFT_BASE_ELF", base_env.as_str())];
 
@@ -161,9 +167,8 @@ fn full_cycle() {
     //    inside overlay's own link.
     fx.edit("base/src/lib.rs", "wrapping_mul(7)", "wrapping_mul(13)");
     fx.cargo_build(&overlay_env);
-    let stderr = combine(&base_elf, &fx.overlay_elf(), &combined);
-    assert!(stderr.contains("1 trampolines"), "A: {stderr}");
-    let out = run_combined(&combined);
+    assert_eq!(fx.combine_stats().trampolines, 1, "A: trampoline count");
+    let out = run_combined(&fx.app_bin());
     assert!(out.contains("sum = 195"), "A: {out}");
     assert!(out.contains("mixed = 26520"), "A: {out}");
     fx.edit("base/src/lib.rs", "wrapping_mul(13)", "wrapping_mul(7)");
@@ -172,9 +177,8 @@ fn full_cycle() {
     //    the closure because its trans_hash is unchanged.
     fx.edit("base/src/lib.rs", "rotate_left(3)", "rotate_left(5)");
     fx.cargo_build(&overlay_env);
-    let stderr = combine(&base_elf, &fx.overlay_elf(), &combined);
-    assert!(stderr.contains("1 trampolines"), "B: {stderr}");
-    let out = run_combined(&combined);
+    assert_eq!(fx.combine_stats().trampolines, 1, "B: trampoline count");
+    let out = run_combined(&fx.app_bin());
     assert!(out.contains("sum = 105"), "B (compute unchanged): {out}");
     assert!(out.contains("mixed = 57120"), "B: {out}");
     fx.edit("base/src/lib.rs", "rotate_left(5)", "rotate_left(3)");
@@ -182,19 +186,17 @@ fn full_cycle() {
     // C. Top: edit app only. Base unchanged.
     fx.edit("app/src/main.rs", r#"greet("graft")"#, r#"greet("world")"#);
     fx.cargo_build(&overlay_env);
-    let stderr = combine(&base_elf, &fx.overlay_elf(), &combined);
-    assert!(stderr.contains("1 trampolines"), "C: {stderr}");
-    let out = run_combined(&combined);
+    assert_eq!(fx.combine_stats().trampolines, 1, "C: trampoline count");
+    let out = run_combined(&fx.app_bin());
     assert!(out.contains("hello, world!"), "C: {out}");
     fx.edit("app/src/main.rs", r#"greet("world")"#, r#"greet("graft")"#);
 
     // D. No-op: sources match base. 0 trampolines, combined ≡ base.
     fx.cargo_build(&overlay_env);
-    let stderr = combine(&base_elf, &fx.overlay_elf(), &combined);
-    assert!(stderr.contains("0 trampolines"), "D: {stderr}");
+    assert_eq!(fx.combine_stats().trampolines, 0, "D: trampoline count");
     assert_eq!(
         std::fs::read(&base_elf).unwrap(),
-        std::fs::read(&combined).unwrap(),
+        std::fs::read(&fx.app_bin()).unwrap(),
         "D: combined should be byte-identical to base",
     );
 }
