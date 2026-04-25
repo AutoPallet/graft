@@ -5,15 +5,21 @@ use std::time::Instant;
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
 
-    if let Some(cmd) = args.get(1)
-        && let "cache-info" = cmd.as_str()
-    {
-        return graft::subcommands::cache_info(&args[2..]);
+    if let Some(cmd) = args.get(1) {
+        match cmd.as_str() {
+            "cache-info" => return graft::subcommands::cache_info(&args[2..]),
+            "combine" => return graft::subcommands::combine(&args[2..]),
+            "snapshot" | "clean" => {
+                eprintln!("graft: subcommand `{cmd}` not yet implemented");
+                return ExitCode::from(2);
+            }
+            _ => {}
+        }
     }
 
     match env::var("GRAFT").as_deref() {
         Ok("base") => graft::base::link(args),
-        Ok("incremental") => graft::incremental::link(args),
+        Ok("overlay") => graft::overlay::link(args),
         _ => passthrough(&args),
     }
 }

@@ -1,52 +1,64 @@
-//! Sidecar layout file written next to base.elf on a clean link, read
-//! back by incremental links so they can pin sections to the same
-//! addresses they had in base.
+//! On-disk schemas for base's ELF-embedded metadata sections.
 //!
-//! The companion `<output>.graft-base.elf` is the actual reference ELF
-//! kept around verbatim. This file just records what graft cares about
-//! cheaply (avoids reparsing every section header on every link).
+//! Two sections live inside base.elf (both `SHF_ALLOC=0` /
+//! `SHT_PROGBITS`), together holding everything overlay mode needs:
+//! `.graft.manifest` (root record) and `.graft.symhash` (per-symbol
+//! address + transitive hash). postcard-encoded for stable binary
+//! layout.
 
 use serde::{Deserialize, Serialize};
 
 pub const GRAFT_MAGIC: [u8; 4] = *b"GRFT";
-pub const SCHEMA_VERSION: u16 = 2;
+pub const SCHEMA_VERSION: u16 = 1;
 
-/// Layout snapshot saved by base mode and consumed by incremental mode.
-/// JSON-on-disk so it's eyeballable; small enough that re-encoding cost
-/// is irrelevant.
+pub const SECTION_MANIFEST: &str = ".graft.manifest";
+pub const SECTION_SYMHASH: &str = ".graft.symhash";
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct BaseLayout {
+pub struct GraftManifest {
     pub magic: [u8; 4],
     pub version: u16,
-    /// Toolchain identifier ("rustc -Vv" commit hash) — incremental mode
-    /// refuses to mix layouts across toolchains.
+    /// sha1, matches NT_GNU_BUILD_ID when base was linked with --build-id=sha1.
+    pub base_abi: [u8; 20],
+    pub entry_symbol: String,
+    /// `rustc -Vv` hash — prevents cross-toolchain overlays.
     pub toolchain_stamp: String,
-    /// Per-output-section record, ordered by vaddr. Used for image-
-    /// header context and to pick the slack offset (= end of the last
-    /// loaded section, page-aligned) where overlay code lands.
-    pub sections: Vec<SectionLayout>,
+    /// Link-time [start, end) address range reserved for overlays.
+    /// Informational — the overlay link script is authoritative.
+    pub overlay_region: (u64, u64),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct SectionLayout {
+pub struct SymHashEntry {
     pub name: String,
-    pub vaddr: u64,
-    pub size: u64,
-    /// Raw `sh_flags` so incremental mode knows alloc/exec/write/etc
-    /// without reparsing flags into named bits.
-    pub sh_flags: u64,
-    /// blake3-128 of the section bytes as written into base.elf — lets
-    /// incremental mode short-circuit "did this section actually change?"
-    /// without re-running the linker.
-    pub content_hash: [u8; 16],
+    /// `None` for STB_GLOBAL. `Some(tu_id)` for STB_LOCAL, where
+    /// `tu_id = blake3(STT_FILE symbol name of defining .o)[:8]`.
+    pub tu: Option<[u8; 8]>,
+    /// Truncated blake3 of (bytes || canonical relocs || SCC-successor
+    /// transitive hashes). Sections in the same SCC share one hash.
+    /// All-zeros for externally-sourced symbols (prebuilt libs,
+    /// linker-provided).
+    pub trans_hash: [u8; 16],
+    /// `st_value` from base's final `.symtab`.
+    pub address: u64,
+    /// `st_size` from base's final `.symtab`.
+    pub size: u32,
 }
 
-pub fn encode_layout(layout: &BaseLayout) -> anyhow::Result<Vec<u8>> {
-    serde_json::to_vec_pretty(layout).map_err(|e| anyhow::anyhow!("encode layout: {e}"))
+pub fn encode_manifest(m: &GraftManifest) -> anyhow::Result<Vec<u8>> {
+    postcard::to_allocvec(m).map_err(|e| anyhow::anyhow!("encode manifest: {e}"))
 }
 
-pub fn decode_layout(bytes: &[u8]) -> anyhow::Result<BaseLayout> {
-    serde_json::from_slice(bytes).map_err(|e| anyhow::anyhow!("decode layout: {e}"))
+pub fn decode_manifest(bytes: &[u8]) -> anyhow::Result<GraftManifest> {
+    postcard::from_bytes(bytes).map_err(|e| anyhow::anyhow!("decode manifest: {e}"))
+}
+
+pub fn encode_symhash(entries: &[SymHashEntry]) -> anyhow::Result<Vec<u8>> {
+    postcard::to_allocvec(entries).map_err(|e| anyhow::anyhow!("encode symhash: {e}"))
+}
+
+pub fn decode_symhash(bytes: &[u8]) -> anyhow::Result<Vec<SymHashEntry>> {
+    postcard::from_bytes(bytes).map_err(|e| anyhow::anyhow!("decode symhash: {e}"))
 }
 
 #[cfg(test)]
@@ -54,21 +66,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn layout_roundtrip() {
-        let l = BaseLayout {
+    fn manifest_roundtrip() {
+        let m = GraftManifest {
             magic: GRAFT_MAGIC,
             version: SCHEMA_VERSION,
+            base_abi: [0x11; 20],
+            entry_symbol: "main".into(),
             toolchain_stamp: "rustc-1.94.1".into(),
-            sections: vec![SectionLayout {
-                name: ".text.main".into(),
-                vaddr: 0x42010100,
-                size: 0x40,
-                sh_flags: 0x6,
-                content_hash: [0xAB; 16],
-            }],
+            overlay_region: (0x5_0000_0000, 0x5_0100_0000),
         };
-        let bytes = encode_layout(&l).unwrap();
-        let back = decode_layout(&bytes).unwrap();
-        assert_eq!(l, back);
+        let bytes = encode_manifest(&m).unwrap();
+        let decoded = decode_manifest(&bytes).unwrap();
+        assert_eq!(m, decoded);
+    }
+
+    #[test]
+    fn symhash_roundtrip() {
+        let entries = vec![
+            SymHashEntry {
+                name: "main".into(),
+                tu: None,
+                trans_hash: [1; 16],
+                address: 0x400000,
+                size: 42,
+            },
+            SymHashEntry {
+                name: "_ZN4core3fmt9Formatter...".into(),
+                tu: Some([2; 8]),
+                trans_hash: [3; 16],
+                address: 0x401000,
+                size: 128,
+            },
+        ];
+        let bytes = encode_symhash(&entries).unwrap();
+        let decoded = decode_symhash(&bytes).unwrap();
+        assert_eq!(entries, decoded);
     }
 }
