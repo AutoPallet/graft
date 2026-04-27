@@ -68,6 +68,13 @@ plan.
    graft as the base linker on the user's real ESP32-S3 project (vs
    the `esp32s3-hello` fixture). Container setup, `secrets.rs` stub,
    linker swap via env vars, current status.
+10. [`10-mutation-experiments.md`](./10-mutation-experiments.md) —
+    4×2 mutation matrix on roborack3 (site × string-vs-numeric)
+    measuring closure cost + per-phase graft timing. Headline:
+    introducing `log::info!` into a function that wasn't previously
+    in the format-machinery closure produces a 380× cascade
+    (15.6 K sections, 1.2 MB payload). Other axes are largely
+    site-determined.
 
 ## TL;DR
 

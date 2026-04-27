@@ -55,7 +55,11 @@ fn run(argv: Vec<String>) -> Result<()> {
     // the user-supplied inputs — the synthetic slack `.o` (if any) is
     // pure linker-side machinery and shouldn't appear in the call graph.
     let scan_inputs: Vec<PathBuf> = link_args.inputs.clone();
-    let scan_handle = std::thread::spawn(move || scan::run(&scan_inputs));
+    let scan_handle = std::thread::spawn(move || {
+        let t = std::time::Instant::now();
+        let r = scan::run(&scan_inputs);
+        (r, t.elapsed())
+    });
 
     // Splice mode needs base to carry slack regions. Detect the target
     // arch from the inputs to pick the right default mode (xtensa
@@ -71,11 +75,13 @@ fn run(argv: Vec<String>) -> Result<()> {
         argv
     };
 
+    let t_link_start = std::time::Instant::now();
     let ld_status = exec_real_linker(&argv)?;
-    let scan_result = scan_handle
+    let t_link = t_link_start.elapsed();
+    let (scan_result, t_scan) = scan_handle
         .join()
-        .map_err(|_| anyhow!("pre-scan thread panicked"))?
-        .context("pre-scan failed")?;
+        .map_err(|_| anyhow!("pre-scan thread panicked"))?;
+    let scan_result = scan_result.context("pre-scan failed")?;
 
     let t_parallel = t_start.elapsed();
 
@@ -110,10 +116,13 @@ fn run(argv: Vec<String>) -> Result<()> {
 
     let t_total = t_start.elapsed();
     eprintln!(
-        "graft base: {} objects · {} sections · {} symhash entries · link+scan {:.1?} · attach {:.1?} · total {:.1?}",
+        "graft base: {} objects · {} sections · {} symhash entries · \
+         link {:.1?} · scan {:.1?} · link+scan {:.1?} · attach {:.1?} · total {:.1?}",
         scan_result.objects.len(),
         scan_result.graph.nodes.len(),
         entries.len(),
+        t_link,
+        t_scan,
         t_parallel,
         t_post.elapsed(),
         t_total,

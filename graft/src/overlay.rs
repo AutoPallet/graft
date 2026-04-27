@@ -66,10 +66,14 @@ fn run(argv: Vec<String>) -> Result<()> {
     let base = load_base_metadata(&base_path)?;
 
     let scan_inputs: Vec<PathBuf> = link_args.inputs.clone();
+    let t_scan_start = std::time::Instant::now();
     let scan = scan::run(&scan_inputs).context("overlay pre-scan")?;
+    let t_scan = t_scan_start.elapsed();
 
+    let t_closure_start = std::time::Instant::now();
     let roots = roots::find_roots(&scan, &base, &link_args)?;
     let closure = compute_closure(&scan, &base, &roots)?;
+    let t_closure = t_closure_start.elapsed();
 
     // Scratch dir next to the output path. Cleaned and recreated each
     // run so stale pruned .o's from a prior invocation don't confuse
@@ -82,7 +86,9 @@ fn run(argv: Vec<String>) -> Result<()> {
         .with_context(|| format!("create {}", work_dir.display()))?;
 
     // Prune each source object; collect the pruned-.o paths.
+    let t_prune_start = std::time::Instant::now();
     let pruned = prune_all(&scan, &closure, &work_dir)?;
+    let t_prune = t_prune_start.elapsed();
     let renamed_total: usize = pruned.iter().map(|p| p.renamed_locals).sum();
     let kept_sec_total: usize = pruned.iter().map(|p| p.kept_sections).sum();
 
@@ -157,6 +163,7 @@ fn run(argv: Vec<String>) -> Result<()> {
     write_all_base_symbols_ld(&base_path, &all_base_syms_script)?;
 
     let overlay_elf = work_dir.join("overlay.elf");
+    let t_link_start = std::time::Instant::now();
     if pruned.is_empty() {
         write_empty_relocatable_for(&overlay_elf, e_machine)?;
     } else {
@@ -177,6 +184,7 @@ fn run(argv: Vec<String>) -> Result<()> {
             );
         }
     }
+    let t_link = t_link_start.elapsed();
 
     // Single-ELF output: combine base + overlay directly into cargo's
     // `-o` path. The standalone overlay.elf stays in work_dir for
@@ -185,6 +193,7 @@ fn run(argv: Vec<String>) -> Result<()> {
     // exists for explicit invocation against arbitrary base/overlay
     // pairs (snapshots, archived overlays, …), but no longer required
     // for the normal build loop.
+    let t_combine_start = std::time::Instant::now();
     let combine_stats = crate::combine::combine(&base_path, &overlay_elf, &output)
         .with_context(|| {
             format!(
@@ -194,6 +203,7 @@ fn run(argv: Vec<String>) -> Result<()> {
                 output.display()
             )
         })?;
+    let t_combine = t_combine_start.elapsed();
 
     // Sidecar with the combine stats so callers (tests, dev driver) can
     // see the trampoline count etc. without parsing the linker's stderr
@@ -207,6 +217,7 @@ fn run(argv: Vec<String>) -> Result<()> {
          closure {} sections · provides {} globals / {} locals · \
          pruned {} objs / {} sections / {} renamed-locals · \
          combined {} bytes (overlay payload {} @ {:#x}, {} trampolines) · \
+         scan {:.1?} · closure {:.1?} · prune {:.1?} · link {:.1?} · combine {:.1?} · \
          total {:.1?}\n\
          overlay.elf: {}\n",
         base.symhash_by_name.len(),
@@ -222,6 +233,11 @@ fn run(argv: Vec<String>) -> Result<()> {
         combine_stats.overlay_load_size,
         combine_stats.overlay_vaddr,
         combine_stats.trampolines.len(),
+        t_scan,
+        t_closure,
+        t_prune,
+        t_link,
+        t_combine,
         t_start.elapsed(),
         overlay_elf.display(),
     );
