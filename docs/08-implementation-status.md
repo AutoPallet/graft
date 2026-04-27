@@ -571,16 +571,27 @@ So the per-string sub-sectioning idea (M1.i followup #2) is mis-targeted for our
 
 `.note.GNU-stack` (and similar SHF_ALLOC=0 metadata sections) shouldn't be graph nodes. Zero-byte, but they pollute the closure dump and waste classify() work. One-line filter in `scan.rs` at graph construction.
 
-### M1.m.2 — content-match path for anonymous sections
+### M1.m.2 — content-match path for anonymous sections (deferred)
 
-For sections with `STT_SECTION`-only definitions (`.rodata.str1.*`, `.rodata..Lanon.*`, `.eh_frame`, etc.), classify currently bails to `Included`. Two parts to a fix:
+**Status: deferred.** Investigated; structurally invasive; postponing in favor of feature-coverage work (M1.n) until we have a concrete payload-budget pressure.
 
-- **Detection**: scan.rs emits synthetic locals for these sections (e.g., `__graft_anon@<tu_id>:<section_name>`), tu-keyed so the same anonymous section in two TUs doesn't collide. trans_hash for each goes into symhash.
-- **Resolution**: at base-link time, graft injects anchor symbols (similar to the slack-`.o` trick) at the start of each tracked anonymous section, so overlay's link can PROVIDE a stable base-side address. Without anchors, overlay can't refer to base's content — the merged-strings dedup pass means there's no canonical "address of `.rodata.str1.1` from cgu.0.o" in base.elf.
+**The problem.** `classify()` in `overlay.rs:711` returns `Included` for any section with no matchable defined symbols. `.rodata.str1.1`, `.rodata..Lanon.*`, `.eh_frame`, etc. have only `STT_SECTION` symbols, so they always go through this path — even when their bytes are byte-identical to base.
 
-Estimated payload reduction on the current fixture: ~1700 bytes (~58%). The remaining ~1200 bytes are `graft_entry` itself plus the user string — what we'd want.
+**Why the obvious fix is hard.** "If trans_hash matches base, classify as Provided" requires a *symbol name* for overlay's link to PROVIDE the address against. Anonymous sections by definition have no exported name. Three plausible paths, each with a real obstacle:
 
-Caveat: synthetic anchors may interact with ld's `--gc-sections` or `SHF_MERGE` dedup. Anchor symbols would need either `KEEP()` or `--undefined=` to survive, and probably need to *not* land inside a mergeable section (so they sit at a stable address rather than being deduplicated away).
+1. **Synthetic local symbol injected at scan time.** scan.rs invents a name (e.g. `__graft_anon@<tu_id_hex>:<section_name>`) and adds it to graft's in-memory symbol index. base mode emits a symhash entry. Obstacle: prune.rs re-parses the source `.o` from disk and never sees the synthetic symbol — so when a kept section's reloc targets the anon section, prune falls into `surrogate_for_pruned_section` which requires a real named definition and bails.
+2. **Synthetic anchor injected at base-link time.** Like the slack-`.o` trick: emit a relocatable `.o` containing `__graft_anon_*` symbols pointing at each tracked anon section. Obstacle: anchors must point *into* sections that come from *other* input objects. Cross-object symbol definition isn't a thing in ld's input model — symbols define their own section's contents.
+3. **Post-link content-match in base.elf.** Walk every input anon section, find unique byte-matching subrange in base.elf, record that address as the resolved value. Then overlay's `base_symbols.ld` PROVIDEs the synthetic name → address. Obstacle: `SHF_MERGE | SHF_STRINGS` dedup (`.rodata.str1.1`) suffix-shares strings across input TUs, so a single input section's bytes may not appear contiguously anywhere in base.elf.
+
+**The path that probably works** is a hybrid of (1) and (3), restricted to non-mergeable anon sections (`.rodata..Lanon.*` but *not* `.rodata.str1.*`):
+
+- scan.rs synthesizes the name at parse time; base post-link finds the unique byte-match in base.elf's `.text` / `.rodata` and records it in symhash.
+- prune.rs needs an extra input: a `HashMap<SectionIndex, String>` of "if you'd otherwise call `surrogate_for_pruned_section`, use this synthetic name as a UND surrogate instead." Plumbed from overlay's compute_closure (which knows the classification outcome).
+- `.rodata.str1.1` keeps going through the Included path. The merged-strings handling needs the per-string sub-sectioning idea (M1.i followup #2) — split at NUL boundaries during scan so each NUL-terminated run becomes its own non-mergeable virtual sub-section, classify-able by content match.
+
+Estimated payload reduction once both are wired: ~1700 bytes (~58%) on the current `Hello`→`Howdy` fixture. The 1655 of `.rodata.str1.1` is the long pole and needs the sub-sectioning piece.
+
+**Why deferring.** The current fixture is small enough that 2.9 KB overlay payload doesn't bottleneck flash time vs. stock+pageflash (M1.h numbers show graft overlay+pageflash at 24 KB / 2.12 s vs. stock pageflash at 8 KB / 1.56 s — the gap isn't dominantly anon-section-bound, it's segment-shift-bound, which M1.k already fixed). Likely to revisit when a real fixture hits a payload budget that anon-section bloat actually pushes past.
 
 ## Things that turned out to not matter (or got simpler)
 
