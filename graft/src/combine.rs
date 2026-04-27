@@ -357,6 +357,9 @@ fn combine_splice(
 
     let overlay_obj = object::File::parse(overlay_bytes)
         .with_context(|| format!("parse {}", overlay_path.display()))?;
+    let base_obj_for_slack = object::File::parse(base_bytes)
+        .with_context(|| format!("parse {}", base_path.display()))?;
+    let slack_regions = read_slack_regions(&base_obj_for_slack)?;
 
     let mut total_spliced: u64 = 0;
     let mut overlay_vaddr_first: u64 = 0;
@@ -374,15 +377,43 @@ fn combine_splice(
         }
         let v_start = sec.address();
         let v_end = v_start + sec_size;
+        let sec_name = sec.name().unwrap_or("?");
+
+        // Splice mode requires every overlay section to land inside a
+        // declared slack region. Anything else risks silently
+        // overwriting live base content (real `.data`, real `.text`,
+        // base's stack/heap region, etc.). Clobbering base RW with
+        // overlay `.data` was the M1.n surprise — the symptom is
+        // silent: overlay's bytes go into whatever base section
+        // happens to share the vaddr. Guard rather than warn.
+        let in_slack = slack_regions
+            .iter()
+            .any(|r| v_start >= r.start && v_end <= r.start + r.len);
+        if !in_slack {
+            let in_base_load = base_loads
+                .iter()
+                .any(|p| v_start < p.p_vaddr + p.p_filesz && v_end > p.p_vaddr);
+            let detail = if in_base_load {
+                "would overwrite live base content — overlay was linked at \
+                 a vaddr inside a non-slack base PT_LOAD"
+            } else {
+                "vaddr is outside every base PT_LOAD — splice mode requires \
+                 overlay sections to land in a declared slack region"
+            };
+            bail!(
+                "overlay section {sec_name:?} at {v_start:#x}+{sec_size:#x}: \
+                 {detail}. Slack regions: {slack_regions:?}"
+            );
+        }
+
         let load = base_loads
             .iter()
             .find(|p| v_start >= p.p_vaddr && v_end <= p.p_vaddr + p.p_filesz)
             .ok_or_else(|| {
                 anyhow!(
-                    "overlay section {:?} at {v_start:#x}+{sec_size:#x} \
-                     does not fit in any base PT_LOAD — slack overflowed \
-                     or overlay laid out at wrong vaddr",
-                    sec.name().unwrap_or("?")
+                    "overlay section {sec_name:?} at {v_start:#x}+{sec_size:#x} \
+                     is in slack vaddr range but no covering base PT_LOAD \
+                     (slack symbol claimed an address outside base's segments?)"
                 )
             })?;
         let base_off = (load.p_offset + (v_start - load.p_vaddr)) as usize;
@@ -401,9 +432,7 @@ fn combine_splice(
     let manifest = metadata::decode_manifest(manifest_bytes)?;
     let entry = manifest.entry_symbol.as_str();
 
-    let base_obj = object::File::parse(base_bytes)
-        .with_context(|| format!("parse {}", base_path.display()))?;
-    let base_entry_addr = find_text_def(&base_obj, entry)
+    let base_entry_addr = find_text_def(&base_obj_for_slack, entry)
         .ok_or_else(|| anyhow!("entry symbol {entry:?} not defined in base"))?;
     let overlay_entry_addr = find_text_def(&overlay_obj, entry);
     let trampolines: Vec<Trampoline> = match overlay_entry_addr {
@@ -453,6 +482,54 @@ pub struct Trampoline {
     pub name: String,
     pub base_addr: u64,
     pub overlay_addr: u64,
+}
+
+/// A vaddr range in base.elf that splice-mode overlay sections are
+/// allowed to land in. Read from `GRAFT_TEXT_SLACK` / `GRAFT_RODATA_SLACK`
+/// symbols emitted by the synthetic slack `.o`.
+#[derive(Clone, Copy)]
+struct SlackRegion {
+    name: &'static str,
+    start: u64,
+    len: u64,
+}
+
+impl std::fmt::Debug for SlackRegion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}@{:#x}+{:#x}",
+            self.name, self.start, self.len
+        )
+    }
+}
+
+fn read_slack_regions(base: &object::File) -> Result<Vec<SlackRegion>> {
+    use object::ObjectSymbol;
+    let mut text: Option<(u64, u64)> = None;
+    let mut rodata: Option<(u64, u64)> = None;
+    for sym in base.symbols() {
+        let Ok(name) = sym.name() else { continue };
+        match name {
+            crate::slack::TEXT_SYMBOL => text = Some((sym.address(), sym.size())),
+            crate::slack::RODATA_SYMBOL => rodata = Some((sym.address(), sym.size())),
+            _ => {}
+        }
+    }
+    let mut regions = Vec::new();
+    if let Some((s, l)) = text {
+        regions.push(SlackRegion { name: "text", start: s, len: l });
+    }
+    if let Some((s, l)) = rodata {
+        regions.push(SlackRegion { name: "rodata", start: s, len: l });
+    }
+    if regions.is_empty() {
+        bail!(
+            "base ELF has neither GRAFT_TEXT_SLACK nor GRAFT_RODATA_SLACK — \
+             splice mode requires at least one slack region"
+        );
+    }
+    Ok(regions)
 }
 
 /// Canonical 64-bit-wide program header. ELF32 fields are zero-extended
