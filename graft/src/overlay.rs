@@ -1233,7 +1233,63 @@ fn mutate_sections_ld(content: &str) -> Result<String> {
     final_out.push_str(&out[..injection_point]);
     final_out.push_str("\n  INCLUDE \"graft_blockers.ld\"\n");
     final_out.push_str(&out[injection_point..]);
-    Ok(final_out)
+
+    // Strip every `KEEP(<expr>)` wrapper, leaving `<expr>` as a bare
+    // section pattern. Effect: ld's --gc-sections is allowed to drop
+    // these sections if nothing in overlay's pruned input references
+    // them. base.elf already carries every KEEP'd section's content
+    // (vector tables, build-id note, ctors/dtors, esp-idf bootloader
+    // markers, etc.), and base_addresses.ld PROVIDEs every base
+    // symbol — so any reference from overlay code resolves through
+    // base. Without this, esp-idf's `KEEP(*libxt_hal.a:eri.*)` and
+    // siblings drag whole archive members into overlay.elf even
+    // when no code reaches them.
+    Ok(strip_keep_wrappers(&final_out))
+}
+
+/// Find every `KEEP(<expr>)` (handling balanced parens inside) and
+/// replace with `<expr>`. Idempotent — if no KEEP, returns unchanged.
+fn strip_keep_wrappers(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let mut out = String::with_capacity(content.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Match `KEEP(` or `KEEP (` at a word boundary (not part of
+        // a larger identifier like `KEEPER`).
+        if (bytes[i..].starts_with(b"KEEP(") || bytes[i..].starts_with(b"KEEP ("))
+            && (i == 0 || !is_ident_char(bytes[i - 1]))
+        {
+            let space = bytes[i + 4] == b' ';
+            let open = i + 4 + (if space { 1 } else { 0 });
+            debug_assert_eq!(bytes[open], b'(');
+            // Find the matching close paren, accounting for nesting.
+            let mut depth: usize = 1;
+            let mut j = open + 1;
+            while j < bytes.len() && depth > 0 {
+                match bytes[j] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            // bytes[open+1 .. j-1] is the inner expression; emit it
+            // verbatim, dropping the `KEEP(...)` wrapper.
+            if depth == 0 {
+                out.push_str(&content[open + 1..j - 1]);
+                i = j;
+                continue;
+            }
+        }
+        // Not a KEEP we can strip; copy this byte through.
+        out.push(content[i..].chars().next().unwrap());
+        i += content[i..].chars().next().unwrap().len_utf8();
+    }
+    out
+}
+
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// ESP32-S3 IRAM region, per esp-hal `memory.x`:
@@ -1398,5 +1454,44 @@ INCLUDE \"text.x\"
     #[test]
     fn mutate_esp32s3_x_errors_on_unrecognized_layout() {
         assert!(mutate_esp32s3_x("INCLUDE foo.x\n").is_err());
+    }
+
+    #[test]
+    fn strip_keep_wrappers_basic() {
+        let s = "  KEEP(*(.eh_frame))\n  KEEP (*libfoo.a:bar.*)\n";
+        let out = strip_keep_wrappers(s);
+        assert_eq!(out, "  *(.eh_frame)\n  *libfoo.a:bar.*\n");
+    }
+
+    #[test]
+    fn strip_keep_wrappers_handles_nested_parens() {
+        // ld scripts can have nested parens, e.g. EXCLUDE_FILE(...) inside.
+        let s = "KEEP(*(EXCLUDE_FILE(*libphy.a) .rodata .rodata.*))";
+        let out = strip_keep_wrappers(s);
+        assert_eq!(out, "*(EXCLUDE_FILE(*libphy.a) .rodata .rodata.*)");
+    }
+
+    #[test]
+    fn strip_keep_wrappers_doesnt_match_identifiers() {
+        // KEEPER, KEEP_ME etc. shouldn't be touched.
+        let s = "KEEPER(x) KEEP(y) KEEP_FOO(z)";
+        let out = strip_keep_wrappers(s);
+        assert_eq!(out, "KEEPER(x) y KEEP_FOO(z)");
+    }
+
+    #[test]
+    fn strip_keep_wrappers_no_change_when_absent() {
+        let s = "*(.text .text.*)";
+        assert_eq!(strip_keep_wrappers(s), s);
+    }
+
+    #[test]
+    fn strip_keep_wrappers_preserves_other_text() {
+        let s = ".section_a : { *(.foo) } > REGION\n.b : { KEEP(*(.bar)) } > R2";
+        let out = strip_keep_wrappers(s);
+        assert_eq!(
+            out,
+            ".section_a : { *(.foo) } > REGION\n.b : { *(.bar) } > R2"
+        );
     }
 }
