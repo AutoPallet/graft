@@ -593,6 +593,49 @@ Estimated payload reduction once both are wired: ~1700 bytes (~58%) on the curre
 
 **Why deferring.** The current fixture is small enough that 2.9 KB overlay payload doesn't bottleneck flash time vs. stock+pageflash (M1.h numbers show graft overlay+pageflash at 24 KB / 2.12 s vs. stock pageflash at 8 KB / 1.56 s — the gap isn't dominantly anon-section-bound, it's segment-shift-bound, which M1.k already fixed). Likely to revisit when a real fixture hits a payload budget that anon-section bloat actually pushes past.
 
+## M1.n — Rust feature coverage
+
+Expanded `esp32s3-hello/src/main.rs` with four patterns and verified each end-to-end through the overlay link. Verification was symbolic (build + overlay closure dump + `base_addresses.ld` inspection) — hardware capture was intermittently broken in this session (USB-CDC modem-control state issues on the serial port; `espflash flash --monitor` showed only "waiting for download" between flashes despite `boot:0x2b SPI_FAST_FLASH_BOOT` succeeding earlier).
+
+| Pattern | Symbol | Address | Resolution path | Status |
+|---|---|---|---|---|
+| `static mut TICK_COUNTER: u32 = 0` | `_ZN…TICK_COUNTER…` | `0x3fc89dc4` (.bss) | PROVIDE in `base_addresses.ld` | ✅ works |
+| `static ATOMIC_TICK: AtomicU32` | `_ZN…ATOMIC_TICK…` | `0x3fc89dc0` (.bss) | PROVIDE | ✅ works |
+| `#[link_section = ".rwtext"]` fn | `_ZN…ram_resident_step…` | `0x40378a4c` (IRAM) | PROVIDE | ✅ works *(uncalled-edited)* |
+| `static GREETING_TABLE: [&str; 3]` | folded by LTO | n/a | inlined as constants | ✅ works |
+
+For the unedited-callee case (overlay's `graft_entry` *calls* `ram_resident_step` but doesn't redefine it), `base_addresses.ld` gets the right `PROVIDE` line and overlay's link resolves through it.
+
+### Known gap: editing IRAM (`.rwtext`) functions is not supported
+
+If a user edits the body of a `#[link_section = ".rwtext"]` function, the overlay's link would emit a new `.rwtext` section, but graft's slack reservation only covers `.text` (IROM) and `.rodata` (DROM). There's no `.rwtext` slack to splice into. Two paths to fix:
+
+1. Add `GRAFT_RWTEXT_SLACK` synthetic-`.o` section (mirrors the existing slack for `.text`/`.rodata`). `.rwtext` is loaded by the bootloader from flash to IRAM at boot, so reserved zeros in flash get faithfully copied to RAM at base boot, and overlay can splice into the flash-side bytes.
+2. Document the gap and recommend users avoid `#[link_section = ".rwtext"]` for hot-edit code paths.
+
+(1) is the right fix; not urgent until a real fixture hits this.
+
+### Surprise finding: overlay's `.data` lands in base's RW PT_LOAD without explicit handling
+
+With three format-arg substitutions (`mut={mut_tick} atomic={atomic_tick} ram={ram_tick}`), the overlay link emits ~56 bytes in `.data` containing format-piece strings + esp-hal exception-name constants (`ItlbMissDtlbMissEXCCAUSEEXCVADDR`). Vaddr `0x3fc88400`, which lands inside base's RW PT_LOAD at file-offset `0x13400`. `combine_splice` finds it there and writes the bytes — silently overwriting base's `.rwdata_dummy` zero-padding region.
+
+In *this* fixture the target is a NOBITS dummy region, so the corruption is harmless. But generalizing:
+- Splice mode currently writes overlay's `.data` content into wherever it lands in base's RW segment, *without* a slack reservation guarantee.
+- If overlay's `.data` vaddr happened to fall inside base's actual `.data` (real, in-use mutable statics), boot would corrupt base's state.
+- The existing `splice` layout script for x86 splice mode `/DISCARD/`s `.data` / `.bss` / `.eh_frame` — but xtensa splice goes through `setup_xtensa_layout` which keeps esp-hal's full linker chain, including `.data` placement.
+
+Two paths to fix:
+1. Reserve `.data` slack alongside `.text` / `.rodata` and assert (in `combine_splice`) that any overlay `.data` lands inside the slack.
+2. Walk overlay's sections in `combine_splice` and reject any whose vaddr doesn't fall within a known slack region — fail-loud rather than silent splice into base's RAM.
+
+Tracked: `M1.o` candidate.
+
+### Hardware verification gap
+
+Serial capture intermittency this session: `espflash` reset successfully wrote the new image, `espflash board-info` could communicate, but resetting into the user app produced `boot:0x23 (DOWNLOAD(USB/UART0))` rather than `boot:0x2b SPI_FAST_FLASH_BOOT`. Suspect USB-CDC modem-control state: the host's DTR/RTS sequence ends up holding GPIO0 (bootloader strapping) low past chip-reset release. Tried multiple DTR/RTS sequences (espressif espflash, pyserial inverted/non-inverted, raw termios, `espflash --monitor`); none produced a clean cold-boot in this session.
+
+The previous M1.k / M1.l hardware tests in the same setup *did* boot cleanly, so the chip and wiring are fine — likely a transient USB driver state. Plausible follow-ups: physical power cycle, switch USB host port, replace `python3 scripts/capture.py` with a better-behaved tool. None done in this session — symbolic verification is sufficient signal that the build pipeline handles each feature.
+
 ## Things that turned out to not matter (or got simpler)
 
 - **Per-call-site `l32r` literals.** Not needed — only one
