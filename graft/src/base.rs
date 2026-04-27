@@ -125,6 +125,7 @@ fn inject_slack(
     argv.push(slack_path.to_string_lossy().into_owned());
     argv.push(format!("-Wl,--undefined={}", crate::slack::TEXT_SYMBOL));
     argv.push(format!("-Wl,--undefined={}", crate::slack::RODATA_SYMBOL));
+    argv.push(format!("-Wl,--undefined={}", crate::slack::DATA_SYMBOL));
     Ok(argv)
 }
 

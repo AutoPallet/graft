@@ -32,9 +32,16 @@ const SLACK_FILL_BYTE: u8 = 0xFF;
 
 const DEFAULT_TEXT_LEN: u32 = 64 * 1024;
 const DEFAULT_RODATA_LEN: u32 = 64 * 1024;
+// Smaller default than text/rodata: writable static data in typical
+// fixtures (format-piece slices, rust panic-info structs) is on the
+// order of dozens to hundreds of bytes per closure. 4 KB covers
+// common churn with room to spare; bumpable via env if a fixture
+// needs more.
+const DEFAULT_DATA_LEN: u32 = 4 * 1024;
 
 pub const TEXT_SYMBOL: &str = "GRAFT_TEXT_SLACK";
 pub const RODATA_SYMBOL: &str = "GRAFT_RODATA_SLACK";
+pub const DATA_SYMBOL: &str = "GRAFT_DATA_SLACK";
 
 /// Overlay layout strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +87,7 @@ fn default_for_machine(e_machine: u16) -> Mode {
 pub struct SlackParams {
     pub text_len: u32,
     pub rodata_len: u32,
+    pub data_len: u32,
 }
 
 impl SlackParams {
@@ -87,6 +95,7 @@ impl SlackParams {
         Self {
             text_len: env_u32("GRAFT_TEXT_SLACK_LEN").unwrap_or(DEFAULT_TEXT_LEN),
             rodata_len: env_u32("GRAFT_RODATA_SLACK_LEN").unwrap_or(DEFAULT_RODATA_LEN),
+            data_len: env_u32("GRAFT_DATA_SLACK_LEN").unwrap_or(DEFAULT_DATA_LEN),
         }
     }
 }
@@ -127,6 +136,23 @@ pub fn synthesize(architecture: Architecture, params: &SlackParams) -> Result<Ve
         4,
     );
 
+    // Writable-data slack. Lands in base's `.data` via the standard
+    // `*(.data .data.*)` wildcard, ends up loaded from flash to RAM
+    // by the bootloader at boot like any other `.data`. Overlay's
+    // `.data` later splices into the slack vaddr; the only cost vs
+    // an unloaded section is N bytes of flash plus N bytes of RAM
+    // permanently reserved.
+    let data_id = obj.add_section(
+        Vec::new(),
+        b".data.graft_slack".to_vec(),
+        SectionKind::Data,
+    );
+    obj.set_section_data(
+        data_id,
+        vec![SLACK_FILL_BYTE; params.data_len as usize],
+        4,
+    );
+
     obj.add_symbol(Symbol {
         name: TEXT_SYMBOL.as_bytes().to_vec(),
         value: 0,
@@ -145,6 +171,16 @@ pub fn synthesize(architecture: Architecture, params: &SlackParams) -> Result<Ve
         scope: SymbolScope::Linkage,
         weak: false,
         section: SymbolSection::Section(rodata_id),
+        flags: SymbolFlags::None,
+    });
+    obj.add_symbol(Symbol {
+        name: DATA_SYMBOL.as_bytes().to_vec(),
+        value: 0,
+        size: u64::from(params.data_len),
+        kind: SymbolKind::Data,
+        scope: SymbolScope::Linkage,
+        weak: false,
+        section: SymbolSection::Section(data_id),
         flags: SymbolFlags::None,
     });
 

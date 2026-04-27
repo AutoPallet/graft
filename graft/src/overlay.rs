@@ -774,6 +774,13 @@ pub struct Slack {
     pub rodata_start: u64,
     /// Length of `GRAFT_RODATA_SLACK` in bytes.
     pub rodata_len: u64,
+    /// Start vaddr of `GRAFT_DATA_SLACK` in base.elf — overlay's
+    /// `dram_seg` ORIGIN. Carved out of base's `.data` so overlay's
+    /// writable static data can splice in without colliding with
+    /// base's `.data`/`.bss`/`.stack`.
+    pub data_start: u64,
+    /// Length of `GRAFT_DATA_SLACK` in bytes.
+    pub data_len: u64,
 }
 
 /// Look up `GRAFT_TEXT_SLACK` and `GRAFT_RODATA_SLACK` in base.elf's
@@ -789,29 +796,38 @@ fn compute_slack(base_bytes: &[u8]) -> Result<Slack> {
     let elf = object::File::parse(base_bytes).context("parse base ELF for xtensa slack")?;
     let mut text: Option<(u64, u64)> = None;
     let mut rodata: Option<(u64, u64)> = None;
+    let mut data: Option<(u64, u64)> = None;
     for sym in elf.symbols() {
         let Ok(name) = sym.name() else { continue };
         match name {
             "GRAFT_TEXT_SLACK" => text = Some((sym.address(), sym.size())),
             "GRAFT_RODATA_SLACK" => rodata = Some((sym.address(), sym.size())),
+            "GRAFT_DATA_SLACK" => data = Some((sym.address(), sym.size())),
             _ => {}
         }
     }
     let (text_start, text_len) = text.ok_or_else(|| {
         anyhow!(
             "base ELF: GRAFT_TEXT_SLACK symbol not found \
-             (fixture must declare a #[link_section = \".text.graft_slack\"] static)"
+             (synthetic slack `.o` must be in base's link argv)"
         )
     })?;
     let (rodata_start, rodata_len) = rodata.ok_or_else(|| {
         anyhow!(
             "base ELF: GRAFT_RODATA_SLACK symbol not found \
-             (fixture must declare a #[link_section = \".rodata.graft_slack\"] static)"
+             (synthetic slack `.o` must be in base's link argv)"
         )
     })?;
-    if text_start & 3 != 0 || rodata_start & 3 != 0 {
+    let (data_start, data_len) = data.ok_or_else(|| {
+        anyhow!(
+            "base ELF: GRAFT_DATA_SLACK symbol not found \
+             (synthetic slack `.o` must be in base's link argv)"
+        )
+    })?;
+    if text_start & 3 != 0 || rodata_start & 3 != 0 || data_start & 3 != 0 {
         bail!(
-            "GRAFT_*_SLACK must be 4-byte aligned — got irom={text_start:#x}, drom={rodata_start:#x}"
+            "GRAFT_*_SLACK must be 4-byte aligned — got \
+             irom={text_start:#x}, drom={rodata_start:#x}, dram={data_start:#x}"
         );
     }
     Ok(Slack {
@@ -819,6 +835,8 @@ fn compute_slack(base_bytes: &[u8]) -> Result<Slack> {
         text_len,
         rodata_start,
         rodata_len,
+        data_start,
+        data_len,
     })
 }
 
@@ -831,6 +849,7 @@ fn mutate_memory_x(content: &str, slack: &Slack) -> Result<String> {
     let mut out = String::with_capacity(content.len() + 256);
     let mut found_irom = false;
     let mut found_drom = false;
+    let mut found_dram = false;
     for line in content.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with("irom_seg") && trimmed.contains("ORIGIN") {
@@ -849,6 +868,19 @@ fn mutate_memory_x(content: &str, slack: &Slack) -> Result<String> {
             )
             .unwrap();
             found_drom = true;
+        } else if trimmed.starts_with("dram_seg") && trimmed.contains("ORIGIN") {
+            // Pin overlay's dram_seg to the data slack range. Overlay's
+            // `.data`/`.bss`/`.stack` all use this region via the
+            // `RWDATA` REGION_ALIAS; .stack and .bss are NOLOAD so
+            // they don't touch flash. Only `.data` (PROGBITS) gets
+            // bytes spliced into base via combine.
+            writeln!(
+                out,
+                "  dram_seg ( RW ) : ORIGIN = {:#x}, len = {:#x}",
+                slack.data_start, slack.data_len
+            )
+            .unwrap();
+            found_dram = true;
         } else {
             out.push_str(line);
             out.push('\n');
@@ -859,6 +891,9 @@ fn mutate_memory_x(content: &str, slack: &Slack) -> Result<String> {
     }
     if !found_drom {
         bail!("memory.x: no drom_seg ORIGIN line found — esp-hal layout changed?");
+    }
+    if !found_dram {
+        bail!("memory.x: no dram_seg ORIGIN line found — esp-hal layout changed?");
     }
     Ok(out)
 }
@@ -1003,16 +1038,14 @@ fn setup_xtensa_layout(
 /// ESP32-S3 IRAM region, per esp-hal `memory.x`:
 /// `0x4037_0000 .. 0x4040_0000`. Used to bucket base PT_LOADs.
 const ESP32S3_IRAM_RANGE: (u64, u64) = (0x40370000, 0x40400000);
-/// ESP32-S3 DRAM region: `0x3FC8_8000 .. 0x3FCF_0000`.
-const ESP32S3_DRAM_RANGE: (u64, u64) = (0x3FC88000, 0x3FCF0000);
 
 /// Bytes already used by base in IRAM. Counted from `iram_seg`'s
 /// lowest base PT_LOAD start to its highest end. Drives the size of
 /// the NOLOAD blocker so overlay's `.rwtext` is placed past base's
-/// IRAM usage. DRAM doesn't get a blocker — base fully consumes
-/// `dram_seg` (`.stack` extends to `ORIGIN(RWDATA)+LENGTH(RWDATA)`),
-/// so we redirect overlay's `RWDATA` REGION_ALIAS to `dram2_seg`
-/// instead (see `mutate_alias_x`).
+/// IRAM usage. DRAM doesn't need a blocker because overlay's
+/// `dram_seg` is pinned to the data slack vaddr+len (see
+/// `mutate_memory_x`); base's `.stack` lives at *its* dram_seg end,
+/// not overlay's, so they don't collide.
 #[derive(Debug, Clone, Copy)]
 pub struct RamUsage {
     pub iram_blocker_bytes: u64,
@@ -1067,7 +1100,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mutate_memory_x_replaces_two_lines() {
+    fn mutate_memory_x_replaces_three_lines() {
         let input = "\
 RESERVE_ICACHE = 0x8000;
 MEMORY
@@ -1075,6 +1108,7 @@ MEMORY
   vectors_seg ( RX )     : ORIGIN = 0x40378000, len = 0x400
   irom_seg ( RX )        : ORIGIN = 0x42000020, len = 32M - 0x20
   drom_seg ( R )         : ORIGIN = 0x3C000020, len = 32M - 0x20
+  dram_seg ( RW )        : ORIGIN = 0x3FC88000, len = 0x53700
   rtc_fast_seg(RWX) : ORIGIN = 0x600fe000, len = 8k
 }
 ";
@@ -1083,11 +1117,13 @@ MEMORY
             text_len: 0x10000,
             rodata_start: 0x3C00_2000,
             rodata_len: 0x10000,
+            data_start: 0x3FC8_A000,
+            data_len: 0x1000,
         };
         let out = mutate_memory_x(input, &slack).unwrap();
         assert!(out.contains("irom_seg ( RX ) : ORIGIN = 0x42017000"));
         assert!(out.contains("drom_seg ( R ) : ORIGIN = 0x3c002000"));
-        // Other lines preserved.
+        assert!(out.contains("dram_seg ( RW ) : ORIGIN = 0x3fc8a000"));
         assert!(out.contains("vectors_seg ( RX )     : ORIGIN = 0x40378000"));
         assert!(out.contains("rtc_fast_seg(RWX) : ORIGIN = 0x600fe000"));
     }
@@ -1100,6 +1136,8 @@ MEMORY
             text_len: 0x10000,
             rodata_start: 0,
             rodata_len: 0x10000,
+            data_start: 0,
+            data_len: 0x1000,
         };
         assert!(mutate_memory_x(input, &slack).is_err());
     }

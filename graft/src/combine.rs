@@ -670,11 +670,13 @@ fn read_slack_regions(base: &object::File) -> Result<Vec<SlackRegion>> {
     use object::ObjectSymbol;
     let mut text: Option<(u64, u64)> = None;
     let mut rodata: Option<(u64, u64)> = None;
+    let mut data: Option<(u64, u64)> = None;
     for sym in base.symbols() {
         let Ok(name) = sym.name() else { continue };
         match name {
             crate::slack::TEXT_SYMBOL => text = Some((sym.address(), sym.size())),
             crate::slack::RODATA_SYMBOL => rodata = Some((sym.address(), sym.size())),
+            crate::slack::DATA_SYMBOL => data = Some((sym.address(), sym.size())),
             _ => {}
         }
     }
@@ -685,10 +687,13 @@ fn read_slack_regions(base: &object::File) -> Result<Vec<SlackRegion>> {
     if let Some((s, l)) = rodata {
         regions.push(SlackRegion { name: "rodata", start: s, len: l });
     }
+    if let Some((s, l)) = data {
+        regions.push(SlackRegion { name: "data", start: s, len: l });
+    }
     if regions.is_empty() {
         bail!(
-            "base ELF has neither GRAFT_TEXT_SLACK nor GRAFT_RODATA_SLACK — \
-             splice mode requires at least one slack region"
+            "base ELF has no GRAFT_*_SLACK symbols — splice mode requires \
+             at least one slack region"
         );
     }
     Ok(regions)
