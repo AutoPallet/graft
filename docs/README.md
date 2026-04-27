@@ -64,6 +64,10 @@ plan.
    what's actually built vs the plan, every decision changed along the
    way, the open hang, and what's left to measure. **Read this for
    "where are we right now."**
+9. [`09-roborack3.md`](./09-roborack3.md) — bring-up notes for using
+   graft as the base linker on the user's real ESP32-S3 project (vs
+   the `esp32s3-hello` fixture). Container setup, `secrets.rs` stub,
+   linker swap via env vars, current status.
 
 ## TL;DR
 

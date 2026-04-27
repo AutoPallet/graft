@@ -46,6 +46,14 @@ pub fn link(argv: Vec<String>) -> ExitCode {
 fn run(argv: Vec<String>) -> Result<()> {
     let t_start = std::time::Instant::now();
 
+    // Mirror base mode's `--ldproxy-cwd` handling so relative archive
+    // paths from esp-idf-sys (e.g. `esp-idf/xtensa/libxtensa.a`)
+    // resolve the same way base saw them.
+    if let Some(cwd) = crate::base::extract_flag(&argv, "--ldproxy-cwd") {
+        std::env::set_current_dir(&cwd)
+            .with_context(|| format!("chdir to --ldproxy-cwd {cwd}"))?;
+    }
+
     let link_args = argv::parse(&argv);
     let output = link_args
         .output

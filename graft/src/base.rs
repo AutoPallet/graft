@@ -33,6 +33,18 @@ pub fn link(argv: Vec<String>) -> ExitCode {
 }
 
 fn run(argv: Vec<String>) -> Result<()> {
+    // ldproxy (esp-idf-sys's link wrapper) can ask the real linker
+    // to chdir before resolving relative archive paths via the
+    // `--ldproxy-cwd <dir>` flag. Inputs in argv after that flag
+    // (e.g. `esp-idf/xtensa/libxtensa.a`) are relative to that dir,
+    // not to graft's cwd. Apply it here so both the pre-scan and
+    // the linker invocation see the same view. ldproxy itself still
+    // sees the flag in passthrough — chdir is idempotent.
+    if let Some(cwd) = extract_flag(&argv, "--ldproxy-cwd") {
+        std::env::set_current_dir(&cwd)
+            .with_context(|| format!("chdir to --ldproxy-cwd {cwd}"))?;
+    }
+
     let link_args = argv::parse(&argv);
     let output = link_args.output.clone().ok_or_else(|| anyhow!("no -o <path> in argv"))?;
 
@@ -319,6 +331,21 @@ fn toolchain_stamp() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.lines().find_map(|l| l.strip_prefix("commit-hash: ")).unwrap_or("?").to_string())
         .unwrap_or_else(|| "?".into())
+}
+
+/// Find `--flag value` or `--flag=value` in argv; return value if present.
+pub(crate) fn extract_flag(argv: &[String], flag: &str) -> Option<String> {
+    let prefix_eq = format!("{flag}=");
+    let mut iter = argv.iter();
+    while let Some(a) = iter.next() {
+        if a == flag {
+            return iter.next().cloned();
+        }
+        if let Some(v) = a.strip_prefix(&prefix_eq) {
+            return Some(v.to_string());
+        }
+    }
+    None
 }
 
 fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<()> {
