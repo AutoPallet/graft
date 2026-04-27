@@ -514,8 +514,13 @@ fn run_real_linker(
     cmd.arg("-T").arg(all_base_symbols);
 
     if let Some(x) = xtensa {
-        // Prepend our work_dir so ld's INCLUDE "memory.x" inside
-        // linkall.x finds our mutated copy first.
+        // Prepend our work_dir so ld's INCLUDE "memory.x" /
+        // INCLUDE "esp32s3.x" inside linkall.x find our mutated
+        // copies first. The mutated esp32s3.x INCLUDEs
+        // `graft_blockers.ld` after memory.x has declared
+        // `iram_seg` / `dram_seg`, which we couldn't do with a
+        // command-line `-T` (script ordering puts that before
+        // memory.x).
         cmd.arg("-L").arg(&x.work_dir);
     } else {
         // x86 path: layout script bumps everything from OVERLAY_BASE_ADDR.
@@ -902,15 +907,28 @@ fn mutate_esp32s3_x(content: &str) -> Result<String> {
          .rodata land in disjoint slack ranges, so the DROM/IROM-overlap \
          skip is unnecessary. */\n",
     );
-    out.push_str(&content[block_end..]);
+    let after_dummy = &content[block_end..];
+
+    // Insert `INCLUDE "graft_blockers.ld"` BEFORE the SECTIONS block
+    // that pulls in `rwtext.x` / `rwdata.x`. ld's section-ordering is
+    // script order within a memory region, so emitting the blocker
+    // first guarantees it lands at iram_seg/dram_seg ORIGIN — without
+    // needing INSERT BEFORE (which fails when the target section is
+    // empty after --gc-sections).
+    let anchor = "SECTIONS {\n  INCLUDE \"rwtext.x\"";
+    let split = after_dummy.find(anchor).ok_or_else(|| {
+        anyhow!("esp32s3.x: no `SECTIONS {{ INCLUDE \"rwtext.x\"` block to anchor blocker before")
+    })?;
+    out.push_str(&after_dummy[..split]);
+    out.push_str("INCLUDE \"graft_blockers.ld\"\n\n");
+    out.push_str(&after_dummy[split..]);
     Ok(out)
 }
 
 /// Find esp-hal's `memory.x` and `esp32s3.x` by scanning argv's `-L`
-/// paths. Returns the resolved memory.x path, the resolved
-/// esp32s3.x path, and the full list of `-L` directories so the
-/// caller can preserve them (we'll prepend `work_dir` then add
-/// these for fallthrough).
+/// paths. Returns the resolved paths plus the full list of `-L`
+/// directories so the caller can preserve them (we'll prepend
+/// `work_dir` then add these for fallthrough).
 fn find_memory_x_and_paths(argv: &[String]) -> Result<(PathBuf, PathBuf, Vec<PathBuf>)> {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut i = 0;
@@ -956,6 +974,7 @@ fn setup_xtensa_layout(
     argv: &[String],
 ) -> Result<XtensaLayout> {
     let slack = compute_slack(base_bytes)?;
+    let ram = compute_xtensa_ram_usage(base_bytes)?;
     let (memory_x, esp32s3_x, search_paths) = find_memory_x_and_paths(argv)?;
 
     let memory_orig = std::fs::read_to_string(&memory_x)
@@ -970,11 +989,77 @@ fn setup_xtensa_layout(
     std::fs::write(work_dir.join("esp32s3.x"), esp_mutated)
         .with_context(|| format!("write {}/esp32s3.x", work_dir.display()))?;
 
+    let blockers = render_blockers_ld(&ram);
+    std::fs::write(work_dir.join("graft_blockers.ld"), blockers)
+        .with_context(|| format!("write {}/graft_blockers.ld", work_dir.display()))?;
+
     Ok(XtensaLayout {
         work_dir: work_dir.to_path_buf(),
         search_paths,
         slack,
     })
+}
+
+/// ESP32-S3 IRAM region, per esp-hal `memory.x`:
+/// `0x4037_0000 .. 0x4040_0000`. Used to bucket base PT_LOADs.
+const ESP32S3_IRAM_RANGE: (u64, u64) = (0x40370000, 0x40400000);
+/// ESP32-S3 DRAM region: `0x3FC8_8000 .. 0x3FCF_0000`.
+const ESP32S3_DRAM_RANGE: (u64, u64) = (0x3FC88000, 0x3FCF0000);
+
+/// Bytes already used by base in IRAM. Counted from `iram_seg`'s
+/// lowest base PT_LOAD start to its highest end. Drives the size of
+/// the NOLOAD blocker so overlay's `.rwtext` is placed past base's
+/// IRAM usage. DRAM doesn't get a blocker — base fully consumes
+/// `dram_seg` (`.stack` extends to `ORIGIN(RWDATA)+LENGTH(RWDATA)`),
+/// so we redirect overlay's `RWDATA` REGION_ALIAS to `dram2_seg`
+/// instead (see `mutate_alias_x`).
+#[derive(Debug, Clone, Copy)]
+pub struct RamUsage {
+    pub iram_blocker_bytes: u64,
+}
+
+fn compute_xtensa_ram_usage(base_bytes: &[u8]) -> Result<RamUsage> {
+    use object::{Object, ObjectSegment};
+    let elf = object::File::parse(base_bytes).context("parse base ELF for RAM usage")?;
+    let mut iram_lo = u64::MAX;
+    let mut iram_hi = 0u64;
+    for seg in elf.segments() {
+        if seg.size() == 0 {
+            continue;
+        }
+        let s = seg.address();
+        let e = s + seg.size();
+        if s >= ESP32S3_IRAM_RANGE.0 && e <= ESP32S3_IRAM_RANGE.1 {
+            iram_lo = iram_lo.min(s);
+            iram_hi = iram_hi.max(e);
+        }
+    }
+    let iram_blocker_bytes = if iram_lo == u64::MAX { 0 } else { iram_hi - iram_lo };
+    // 16-byte aligned so the linker has breathing room for ALIGN()s.
+    let align_up = |n: u64| (n + 15) & !15;
+    Ok(RamUsage {
+        iram_blocker_bytes: align_up(iram_blocker_bytes),
+    })
+}
+
+/// Emit a NOLOAD reservation that eats the first `iram_blocker_bytes`
+/// of `iram_seg`. Placement comes from the `> iram_seg` clause;
+/// ordering relative to esp-hal's `.rwtext` is handled by
+/// `mutate_esp32s3_x` INCLUDEing this script *before* the SECTIONS
+/// block that pulls in `rwtext.x`, so ld lays out the blocker first.
+/// (DRAM is handled by `mutate_alias_x` redirecting RWDATA →
+/// `dram2_seg`; no blocker needed there.)
+fn render_blockers_ld(ram: &RamUsage) -> String {
+    format!(
+        "/* graft overlay: reserve base's already-used IRAM bytes so \
+         overlay's `.rwtext` lands at a fresh vaddr past base. */\n\
+         SECTIONS {{\n  \
+         .graft_iram_blocker (NOLOAD) : {{\n    \
+         . = . + {iram:#x};\n  \
+         }} > iram_seg\n\
+         }}\n",
+        iram = ram.iram_blocker_bytes,
+    )
 }
 
 #[cfg(test)]
@@ -1020,7 +1105,7 @@ MEMORY
     }
 
     #[test]
-    fn mutate_esp32s3_x_drops_rotext_dummy() {
+    fn mutate_esp32s3_x_drops_rotext_dummy_and_injects_blockers_include() {
         let input = "\
 INCLUDE exception.x
 
@@ -1035,8 +1120,10 @@ SECTIONS {
 INSERT BEFORE .text;
 
 SECTIONS {
-  INCLUDE \"text.x\"
+  INCLUDE \"rwtext.x\"
+  INCLUDE \"rwdata.x\"
 }
+INCLUDE \"text.x\"
 ";
         let out = mutate_esp32s3_x(input).unwrap();
         // The actual SECTIONS clause and INSERT directive are gone
@@ -1047,6 +1134,12 @@ SECTIONS {
         // Other content preserved.
         assert!(out.contains("INCLUDE exception.x"));
         assert!(out.contains("INCLUDE \"text.x\""));
+        // Blocker INCLUDE lands BEFORE the SECTIONS block that pulls
+        // in rwtext.x — that's how ld's first-in-region ordering picks
+        // the blocker as the leading clause in iram_seg / dram_seg.
+        let blocker_pos = out.find("INCLUDE \"graft_blockers.ld\"").unwrap();
+        let rwtext_pos = out.find("INCLUDE \"rwtext.x\"").unwrap();
+        assert!(blocker_pos < rwtext_pos);
     }
 
     #[test]

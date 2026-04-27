@@ -364,13 +364,15 @@ fn combine_splice(
     let mut total_spliced: u64 = 0;
     let mut overlay_vaddr_first: u64 = 0;
 
+    // Pass 1: per-section splice for SHF_ALLOC sections that land in a
+    // declared slack region. Sections outside slack are *not* errors
+    // here — they're handled by the append pass below. Sections that
+    // overlap a non-slack base PT_LOAD *are* errors (silent clobber).
     for sec in overlay_obj.sections() {
         let SectionFlags::Elf { sh_flags } = sec.flags() else { continue };
         if sh_flags & u64::from(SHF_ALLOC) == 0 {
             continue;
         }
-        // NOBITS (e.g. .bss) has no file_range; skip — base's
-        // corresponding region won't have content to overwrite.
         let Some((sec_off, sec_size)) = sec.file_range() else { continue };
         if sec_size == 0 {
             continue;
@@ -379,13 +381,6 @@ fn combine_splice(
         let v_end = v_start + sec_size;
         let sec_name = sec.name().unwrap_or("?");
 
-        // Splice mode requires every overlay section to land inside a
-        // declared slack region. Anything else risks silently
-        // overwriting live base content (real `.data`, real `.text`,
-        // base's stack/heap region, etc.). Clobbering base RW with
-        // overlay `.data` was the M1.n surprise — the symptom is
-        // silent: overlay's bytes go into whatever base section
-        // happens to share the vaddr. Guard rather than warn.
         let in_slack = slack_regions
             .iter()
             .any(|r| v_start >= r.start && v_end <= r.start + r.len);
@@ -393,17 +388,17 @@ fn combine_splice(
             let in_base_load = base_loads
                 .iter()
                 .any(|p| v_start < p.p_vaddr + p.p_filesz && v_end > p.p_vaddr);
-            let detail = if in_base_load {
-                "would overwrite live base content — overlay was linked at \
-                 a vaddr inside a non-slack base PT_LOAD"
-            } else {
-                "vaddr is outside every base PT_LOAD — splice mode requires \
-                 overlay sections to land in a declared slack region"
-            };
-            bail!(
-                "overlay section {sec_name:?} at {v_start:#x}+{sec_size:#x}: \
-                 {detail}. Slack regions: {slack_regions:?}"
-            );
+            if in_base_load {
+                bail!(
+                    "overlay section {sec_name:?} at {v_start:#x}+{sec_size:#x}: \
+                     would overwrite live base content — overlay was linked at \
+                     a vaddr inside a non-slack base PT_LOAD. Slack regions: \
+                     {slack_regions:?}"
+                );
+            }
+            // Outside slack and outside every base PT_LOAD — handled
+            // by the append pass.
+            continue;
         }
 
         let load = base_loads
@@ -425,8 +420,78 @@ fn combine_splice(
         total_spliced += sec_size;
     }
 
-    // Trampoline on entry symbol — same as the appendpath, just on the
-    // splice-modified buffer.
+    // Pass 2: collect overlay PT_LOADs whose sections aren't already
+    // handled by the splice loop above and which lie entirely outside
+    // base's PT_LOADs. A LOAD is slack-bound if any of its sections
+    // falls in a slack region — those bytes were already spliced
+    // section-by-section. The LOAD's leading page-alignment padding
+    // (zeros between p_vaddr and the first section's vaddr) is *not*
+    // appended either; splicing those zeros into base would corrupt
+    // bytes outside slack.
+    let ov_phdrs = read_program_headers(overlay_bytes, class)?;
+    let mut append_loads: Vec<Phdr> = Vec::new();
+    for ov in ov_phdrs.iter().filter(|p| p.p_type == PT_LOAD && p.p_filesz > 0) {
+        // Find all overlay sections that fall inside this PT_LOAD's
+        // vaddr range. file_range is keyed off p_offset, vaddrs come
+        // from sec.address(), so use vaddrs to associate.
+        let load_v_start = ov.p_vaddr;
+        let load_v_end = ov.p_vaddr + ov.p_memsz;
+        let mut any_slack = false;
+        let mut any_outside_base = false;
+        let mut any_in_base = false;
+        for sec in overlay_obj.sections() {
+            let SectionFlags::Elf { sh_flags } = sec.flags() else { continue };
+            if sh_flags & u64::from(SHF_ALLOC) == 0 {
+                continue;
+            }
+            if sec.size() == 0 {
+                continue;
+            }
+            let s = sec.address();
+            let e = s + sec.size();
+            if s < load_v_start || e > load_v_end {
+                continue;
+            }
+            let in_slack = slack_regions
+                .iter()
+                .any(|r| s >= r.start && e <= r.start + r.len);
+            if in_slack {
+                any_slack = true;
+                continue;
+            }
+            let in_base = base_loads
+                .iter()
+                .any(|p| s < p.p_vaddr + p.p_memsz && e > p.p_vaddr);
+            if in_base {
+                any_in_base = true;
+            } else {
+                any_outside_base = true;
+            }
+        }
+        if any_slack {
+            continue; // splice path handled it
+        }
+        if any_in_base {
+            // The section-walk error path will have fired on the
+            // offending section; this is a defensive bail in case the
+            // PT_LOAD covers only a NOBITS section (size 0 contents)
+            // that overlaps base.
+            bail!(
+                "overlay PT_LOAD at {load_v_start:#x}+{:#x}: contains \
+                 sections that overlap a non-slack base PT_LOAD",
+                ov.p_memsz
+            );
+        }
+        if !any_outside_base {
+            // PT_LOAD with no SHF_ALLOC sections at all (just padding
+            // for alignment): nothing to append.
+            continue;
+        }
+        append_loads.push(*ov);
+    }
+
+    // Trampoline on entry symbol — same as the append path, just on
+    // the splice-modified buffer.
     let manifest_bytes = elf_attach::read_section(base_bytes, metadata::SECTION_MANIFEST)?
         .ok_or_else(|| anyhow!("{}: no {}", base_path.display(), metadata::SECTION_MANIFEST))?;
     let manifest = metadata::decode_manifest(manifest_bytes)?;
@@ -444,7 +509,7 @@ fn combine_splice(
         None => Vec::new(),
     };
 
-    if trampolines.is_empty() && total_spliced == 0 {
+    if trampolines.is_empty() && total_spliced == 0 && append_loads.is_empty() {
         // Nothing changed; emit base verbatim.
         write_executable(output_path, base_bytes)?;
         return Ok(Stats {
@@ -460,14 +525,111 @@ fn combine_splice(
         apply_trampolines(&mut out, &base_phdrs, &trampolines, e_machine)?;
     }
 
+    let mut appended_filesz: u64 = 0;
+    if !append_loads.is_empty() {
+        // for_hosted_kernel = false: xtensa firmware target (the only
+        // path that reaches this splice flow). Don't pad to memsz.
+        let new_loads =
+            append_pt_loads(&mut out, overlay_bytes, &append_loads, &base_phdrs, class, false)?;
+        appended_filesz = new_loads.iter().map(|p| p.p_filesz).sum();
+        if overlay_vaddr_first == 0
+            && let Some(p) = new_loads.first()
+        {
+            overlay_vaddr_first = p.p_vaddr;
+        }
+    }
+
     write_executable(output_path, &out)?;
 
     Ok(Stats {
         trampolines,
-        overlay_load_size: total_spliced,
+        overlay_load_size: total_spliced + appended_filesz,
         overlay_vaddr: overlay_vaddr_first,
         combined_size: out.len() as u64,
     })
+}
+
+/// Append a set of overlay PT_LOADs to `out`, extend the PHT, and add
+/// matching SHT entries so espflash's section-walking image builder
+/// emits image segments for them. Used by both the x86 hosted append
+/// path and the xtensa splice path's RAM-resident segment append.
+///
+/// `for_hosted_kernel`: when `true` (x86 hosted), pads each appended
+/// LOAD to memsz with zeros and stretches the last LOAD to cover the
+/// trailing PHT, so musl's `__init_libc` can map AT_PHDR. When
+/// `false` (xtensa firmware), keeps `p_memsz = p_filesz` and writes
+/// no NOBITS-filling zeros — the bootloader doesn't care about
+/// AT_PHDR, and zero-padding the appended LOAD to overlay's full
+/// `memsz` would overflow `dram2_seg` into heap territory (overlay's
+/// `.stack` is a NOBITS region absorbing all of RWDATA).
+fn append_pt_loads(
+    out: &mut Vec<u8>,
+    overlay_bytes: &[u8],
+    overlay_loads: &[Phdr],
+    base_phdrs: &[Phdr],
+    class: ElfClass,
+    for_hosted_kernel: bool,
+) -> Result<Vec<Phdr>> {
+    let mut new_loads: Vec<Phdr> = Vec::with_capacity(overlay_loads.len());
+    for ov_load in overlay_loads {
+        align_up(out, 0x1000);
+        let new_offset = out.len() as u64;
+        let load_data = &overlay_bytes
+            [ov_load.p_offset as usize..(ov_load.p_offset + ov_load.p_filesz) as usize];
+        out.extend_from_slice(load_data);
+        let memsz = if for_hosted_kernel {
+            // Pad output bytes to memsz so the kernel sees the full
+            // BSS-extended LOAD even though the file content stops at
+            // filesz.
+            if ov_load.p_memsz > ov_load.p_filesz {
+                out.resize(out.len() + (ov_load.p_memsz - ov_load.p_filesz) as usize, 0);
+            }
+            ov_load.p_memsz
+        } else {
+            ov_load.p_filesz
+        };
+        new_loads.push(Phdr {
+            p_type: PT_LOAD,
+            p_flags: ov_load.p_flags,
+            p_offset: new_offset,
+            p_vaddr: ov_load.p_vaddr,
+            p_paddr: ov_load.p_vaddr,
+            p_filesz: ov_load.p_filesz,
+            p_memsz: memsz,
+            p_align: 0x1000,
+        });
+    }
+
+    align_up(out, 8);
+    let new_phoff = out.len() as u64;
+    let new_phnum = base_phdrs.len() + new_loads.len();
+    let pht_size = new_phnum * class.phdr_size();
+
+    if for_hosted_kernel
+        && let Some(last) = new_loads.last_mut()
+    {
+        // ELF64 hosted (x86 musl): kernel needs e_phoff inside *some*
+        // PT_LOAD for AT_PHDR validity. Stretch the last new LOAD to
+        // cover the trailing PHT.
+        let new_filesz = (new_phoff + pht_size as u64) - last.p_offset;
+        last.p_filesz = new_filesz;
+        last.p_memsz = new_filesz;
+    }
+
+    for p in base_phdrs.iter().chain(new_loads.iter()) {
+        out.extend_from_slice(&p.to_le_bytes(class));
+    }
+
+    let ho = class.header_offsets();
+    match ho.e_phoff_size {
+        4 => out[ho.e_phoff..ho.e_phoff + 4].copy_from_slice(&(new_phoff as u32).to_le_bytes()),
+        8 => out[ho.e_phoff..ho.e_phoff + 8].copy_from_slice(&new_phoff.to_le_bytes()),
+        n => bail!("unexpected e_phoff_size {n}"),
+    }
+    out[ho.e_phnum..ho.e_phnum + 2].copy_from_slice(&(new_phnum as u16).to_le_bytes());
+
+    add_overlay_section_headers(out, &new_loads, class)?;
+    Ok(new_loads)
 }
 
 pub struct Stats {
