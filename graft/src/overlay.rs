@@ -968,11 +968,63 @@ fn mutate_esp32s3_x(content: &str) -> Result<String> {
     Ok(out)
 }
 
-/// Find esp-hal's `memory.x` and `esp32s3.x` by scanning argv's `-L`
-/// paths. Returns the resolved paths plus the full list of `-L`
-/// directories so the caller can preserve them (we'll prepend
-/// `work_dir` then add these for fallthrough).
-fn find_memory_x_and_paths(argv: &[String]) -> Result<(PathBuf, PathBuf, Vec<PathBuf>)> {
+/// Two flavors of esp32s3 link layout we know how to mutate. esp-hal
+/// ships its own `memory.x` + `esp32s3.x`; esp-idf-sys ships
+/// `memory.ld` + `sections.ld` (preprocessed from `.in` templates).
+/// Region names, address arithmetic, and the rodata-dummy section
+/// all differ. `detect` picks based on which files appear in the
+/// linker's `-L` paths; same -L set carries through to the real
+/// linker untouched.
+#[derive(Debug)]
+enum Layout {
+    EspHal {
+        memory_x: PathBuf,
+        esp32s3_x: PathBuf,
+    },
+    EspIdf {
+        memory_ld: PathBuf,
+        sections_ld: PathBuf,
+    },
+}
+
+impl Layout {
+    fn detect(argv: &[String]) -> Result<(Self, Vec<PathBuf>)> {
+        let paths = collect_l_paths(argv);
+        // Prefer esp-idf when both candidates exist (esp-idf-sys can
+        // ship esp-hal scripts as transitive dev-deps; the
+        // authoritative chain is the one rustc actually `-T`s).
+        let memory_ld = paths.iter().find_map(|p| {
+            let c = p.join("memory.ld");
+            c.exists().then_some(c)
+        });
+        let sections_ld = paths.iter().find_map(|p| {
+            let c = p.join("sections.ld");
+            c.exists().then_some(c)
+        });
+        if let (Some(memory_ld), Some(sections_ld)) = (memory_ld, sections_ld) {
+            return Ok((Self::EspIdf { memory_ld, sections_ld }, paths));
+        }
+        let memory_x = paths.iter().find_map(|p| {
+            let c = p.join("memory.x");
+            c.exists().then_some(c)
+        });
+        let esp32s3_x = paths.iter().find_map(|p| {
+            let c = p.join("esp32s3.x");
+            c.exists().then_some(c)
+        });
+        if let (Some(memory_x), Some(esp32s3_x)) = (memory_x, esp32s3_x) {
+            return Ok((Self::EspHal { memory_x, esp32s3_x }, paths));
+        }
+        bail!(
+            "no recognized linker-script layout found in {} -L path(s) — \
+             expected esp-idf (memory.ld + sections.ld) or esp-hal \
+             (memory.x + esp32s3.x)",
+            paths.len()
+        );
+    }
+}
+
+fn collect_l_paths(argv: &[String]) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut i = 0;
     while i < argv.len() {
@@ -988,27 +1040,7 @@ fn find_memory_x_and_paths(argv: &[String]) -> Result<(PathBuf, PathBuf, Vec<Pat
         }
         i += 1;
     }
-    let mut memory_x: Option<PathBuf> = None;
-    let mut esp32s3_x: Option<PathBuf> = None;
-    for p in &paths {
-        if memory_x.is_none() {
-            let c = p.join("memory.x");
-            if c.exists() {
-                memory_x = Some(c);
-            }
-        }
-        if esp32s3_x.is_none() {
-            let c = p.join("esp32s3.x");
-            if c.exists() {
-                esp32s3_x = Some(c);
-            }
-        }
-    }
-    let memory_x = memory_x
-        .ok_or_else(|| anyhow!("memory.x not found in any -L path ({} searched)", paths.len()))?;
-    let esp32s3_x = esp32s3_x
-        .ok_or_else(|| anyhow!("esp32s3.x not found in any -L path ({} searched)", paths.len()))?;
-    Ok((memory_x, esp32s3_x, paths))
+    paths
 }
 
 fn setup_xtensa_layout(
@@ -1018,29 +1050,157 @@ fn setup_xtensa_layout(
 ) -> Result<XtensaLayout> {
     let slack = compute_slack(base_bytes)?;
     let ram = compute_xtensa_ram_usage(base_bytes)?;
-    let (memory_x, esp32s3_x, search_paths) = find_memory_x_and_paths(argv)?;
+    let (layout, search_paths) = Layout::detect(argv)?;
 
-    let memory_orig = std::fs::read_to_string(&memory_x)
-        .with_context(|| format!("read {}", memory_x.display()))?;
-    let memory_mutated = mutate_memory_x(&memory_orig, &slack)?;
-    std::fs::write(work_dir.join("memory.x"), memory_mutated)
-        .with_context(|| format!("write {}/memory.x", work_dir.display()))?;
+    match &layout {
+        Layout::EspHal { memory_x, esp32s3_x } => {
+            let memory_orig = std::fs::read_to_string(memory_x)
+                .with_context(|| format!("read {}", memory_x.display()))?;
+            let memory_mutated = mutate_memory_x(&memory_orig, &slack)?;
+            std::fs::write(work_dir.join("memory.x"), memory_mutated)
+                .with_context(|| format!("write {}/memory.x", work_dir.display()))?;
 
-    let esp_orig = std::fs::read_to_string(&esp32s3_x)
-        .with_context(|| format!("read {}", esp32s3_x.display()))?;
-    let esp_mutated = mutate_esp32s3_x(&esp_orig)?;
-    std::fs::write(work_dir.join("esp32s3.x"), esp_mutated)
-        .with_context(|| format!("write {}/esp32s3.x", work_dir.display()))?;
+            let esp_orig = std::fs::read_to_string(esp32s3_x)
+                .with_context(|| format!("read {}", esp32s3_x.display()))?;
+            let esp_mutated = mutate_esp32s3_x(&esp_orig)?;
+            std::fs::write(work_dir.join("esp32s3.x"), esp_mutated)
+                .with_context(|| format!("write {}/esp32s3.x", work_dir.display()))?;
 
-    let blockers = render_blockers_ld(&ram);
-    std::fs::write(work_dir.join("graft_blockers.ld"), blockers)
-        .with_context(|| format!("write {}/graft_blockers.ld", work_dir.display()))?;
+            let blockers = render_blockers_ld_esp_hal(&ram);
+            std::fs::write(work_dir.join("graft_blockers.ld"), blockers)
+                .with_context(|| format!("write {}/graft_blockers.ld", work_dir.display()))?;
+        }
+        Layout::EspIdf { memory_ld, sections_ld } => {
+            let memory_orig = std::fs::read_to_string(memory_ld)
+                .with_context(|| format!("read {}", memory_ld.display()))?;
+            let memory_mutated = mutate_memory_ld(&memory_orig, &slack)?;
+            std::fs::write(work_dir.join("memory.ld"), memory_mutated)
+                .with_context(|| format!("write {}/memory.ld", work_dir.display()))?;
+
+            let sections_orig = std::fs::read_to_string(sections_ld)
+                .with_context(|| format!("read {}", sections_ld.display()))?;
+            let sections_mutated = mutate_sections_ld(&sections_orig)?;
+            std::fs::write(work_dir.join("sections.ld"), sections_mutated)
+                .with_context(|| format!("write {}/sections.ld", work_dir.display()))?;
+
+            let blockers = render_blockers_ld_esp_idf(&ram);
+            std::fs::write(work_dir.join("graft_blockers.ld"), blockers)
+                .with_context(|| format!("write {}/graft_blockers.ld", work_dir.display()))?;
+        }
+    }
 
     Ok(XtensaLayout {
         work_dir: work_dir.to_path_buf(),
         search_paths,
         slack,
     })
+}
+
+/// Mutate esp-idf's `memory.ld`: bump `iram0_2_seg` (IROM),
+/// `drom0_0_seg` (DROM), and `dram0_0_seg` (DRAM) ORIGINs to the
+/// slack vaddrs. Same purpose as `mutate_memory_x` for esp-hal but
+/// against esp-idf's region naming.
+fn mutate_memory_ld(content: &str, slack: &Slack) -> Result<String> {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(content.len() + 256);
+    let mut found_irom = false;
+    let mut found_drom = false;
+    let mut found_dram = false;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("iram0_2_seg") && trimmed.contains("org") {
+            writeln!(
+                out,
+                "  iram0_2_seg (RX) : org = {:#x}, len = {:#x}",
+                slack.text_start, slack.text_len
+            )
+            .unwrap();
+            found_irom = true;
+        } else if trimmed.starts_with("drom0_0_seg") && trimmed.contains("org") {
+            writeln!(
+                out,
+                "  drom0_0_seg (R) : org = {:#x}, len = {:#x}",
+                slack.rodata_start, slack.rodata_len
+            )
+            .unwrap();
+            found_drom = true;
+        } else if trimmed.starts_with("dram0_0_seg") && trimmed.contains("org") {
+            writeln!(
+                out,
+                "  dram0_0_seg (RW) : org = {:#x}, len = {:#x}",
+                slack.data_start, slack.data_len
+            )
+            .unwrap();
+            found_dram = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !found_irom {
+        bail!("memory.ld: no iram0_2_seg org line found — esp-idf layout changed?");
+    }
+    if !found_drom {
+        bail!("memory.ld: no drom0_0_seg org line found — esp-idf layout changed?");
+    }
+    if !found_dram {
+        bail!("memory.ld: no dram0_0_seg org line found — esp-idf layout changed?");
+    }
+    Ok(out)
+}
+
+/// Mutate esp-idf's `sections.ld`: strip the `.flash_rodata_dummy`
+/// (analog of esp-hal's `.rotext_dummy`, ensures DROM/IROM cache
+/// alignment by burning rodata-side space equal to .flash.text size)
+/// and INCLUDE `graft_blockers.ld` near the start so the IRAM
+/// blocker is parsed before `.iram0.text`. The
+/// `_flash_rodata_dummy_start = ABSOLUTE(ORIGIN(default_rodata_seg))`
+/// ASSERT in memory.ld is gated on `_flash_rodata_dummy_start`
+/// existing — replace the dummy clause with a stub that defines
+/// the symbol at the slack origin.
+fn mutate_sections_ld(content: &str) -> Result<String> {
+    // Replace the `.flash_rodata_dummy` body. Keep the section name
+    // so the assert in memory.ld still finds `_flash_rodata_dummy_start`,
+    // but drop the size-of-flash-text gap (overlay's `.rodata` doesn't
+    // span the same range as base's `.text` — it lives in a slack
+    // region with a fixed size).
+    let block_start = content
+        .find(".flash_rodata_dummy (NOLOAD):")
+        .ok_or_else(|| anyhow!("sections.ld: no `.flash_rodata_dummy` clause"))?;
+    let body_open = content[block_start..]
+        .find('{')
+        .ok_or_else(|| anyhow!("sections.ld: malformed flash_rodata_dummy (no `{{`)"))?;
+    let body_close_rel = content[block_start + body_open..]
+        .find('}')
+        .ok_or_else(|| anyhow!("sections.ld: malformed flash_rodata_dummy (no `}}`)"))?;
+    let body_close = block_start + body_open + body_close_rel;
+
+    let mut out = String::with_capacity(content.len() + 256);
+    out.push_str(&content[..block_start + body_open + 1]);
+    out.push_str(
+        "\n    /* graft overlay: original .flash_rodata_dummy gap removed; \
+         overlay's .rodata lands in slack and doesn't need DROM/IROM size \
+         alignment with .flash.text. */\n    \
+         _flash_rodata_dummy_start = ABSOLUTE(.);\n  ",
+    );
+    out.push_str(&content[body_close..]);
+
+    // Inject blocker INCLUDE at the top of the SECTIONS{} block (after
+    // the opening brace). Matches the position where esp-idf's first
+    // section clause appears.
+    let sections_open = out
+        .find("SECTIONS\n{")
+        .or_else(|| out.find("SECTIONS {"))
+        .ok_or_else(|| anyhow!("sections.ld: no `SECTIONS {{` block"))?;
+    let brace = out[sections_open..]
+        .find('{')
+        .ok_or_else(|| anyhow!("sections.ld: SECTIONS without `{{`"))?;
+    let injection_point = sections_open + brace + 1;
+    let mut final_out = String::with_capacity(out.len() + 64);
+    final_out.push_str(&out[..injection_point]);
+    final_out.push_str("\n  INCLUDE \"graft_blockers.ld\"\n");
+    final_out.push_str(&out[injection_point..]);
+    Ok(final_out)
 }
 
 /// ESP32-S3 IRAM region, per esp-hal `memory.x`:
@@ -1083,22 +1243,36 @@ fn compute_xtensa_ram_usage(base_bytes: &[u8]) -> Result<RamUsage> {
     })
 }
 
-/// Emit a NOLOAD reservation that eats the first `iram_blocker_bytes`
-/// of `iram_seg`. Placement comes from the `> iram_seg` clause;
-/// ordering relative to esp-hal's `.rwtext` is handled by
-/// `mutate_esp32s3_x` INCLUDEing this script *before* the SECTIONS
-/// block that pulls in `rwtext.x`, so ld lays out the blocker first.
-/// (DRAM is handled by `mutate_alias_x` redirecting RWDATA →
-/// `dram2_seg`; no blocker needed there.)
-fn render_blockers_ld(ram: &RamUsage) -> String {
+/// esp-hal blocker: NOLOAD reservation in `iram_seg`. Placement
+/// comes from `> iram_seg`; ordering relative to esp-hal's `.rwtext`
+/// is handled by `mutate_esp32s3_x` INCLUDEing this script before
+/// the SECTIONS block that pulls in `rwtext.x`. (DRAM uses slack-
+/// reservation via `mutate_memory_x`; no IRAM-style blocker.)
+fn render_blockers_ld_esp_hal(ram: &RamUsage) -> String {
     format!(
-        "/* graft overlay: reserve base's already-used IRAM bytes so \
-         overlay's `.rwtext` lands at a fresh vaddr past base. */\n\
+        "/* graft overlay (esp-hal): reserve base's used IRAM bytes \
+         so overlay's `.rwtext` lands at a fresh vaddr past base. */\n\
          SECTIONS {{\n  \
          .graft_iram_blocker (NOLOAD) : {{\n    \
          . = . + {iram:#x};\n  \
          }} > iram_seg\n\
          }}\n",
+        iram = ram.iram_blocker_bytes,
+    )
+}
+
+/// esp-idf blocker: NOLOAD reservation in `iram0_0_seg`, INSERTed
+/// BEFORE `.iram0.vectors` (the first section in iram0_0_seg in
+/// esp-idf's sections.ld). Same effect as the esp-hal blocker — eat
+/// base's used IRAM so overlay's IRAM clauses land past it.
+fn render_blockers_ld_esp_idf(ram: &RamUsage) -> String {
+    format!(
+        "/* graft overlay (esp-idf): reserve base's used IRAM bytes \
+         so overlay's `.iram0.text` / `.iram0.vectors` etc. land at \
+         fresh vaddrs past base. */\n\
+         .graft_iram_blocker (NOLOAD) : {{\n  \
+         . = . + {iram:#x};\n\
+         }} > iram0_0_seg\n",
         iram = ram.iram_blocker_bytes,
     )
 }

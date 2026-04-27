@@ -92,28 +92,45 @@ on the host, visible inside the container at
 
 Override the linker via env (no `.cargo/config.toml` edit needed):
 ```bash
-docker exec graft-roborack3 bash -c '
+GRAFT_BIN=/workspaces/graft/target/x86_64-unknown-linux-musl/release/graft
+
+# Base link
+docker exec graft-roborack3 bash -c "
   cd /workspaces/roborack3 && \
-  CARGO_TARGET_XTENSA_ESP32S3_ESPIDF_LINKER=/workspaces/graft/target/x86_64-unknown-linux-musl/release/graft \
+  rm -rf target/xtensa-esp32s3-espidf/vehicle/deps/deploy-* && \
+  CARGO_TARGET_XTENSA_ESP32S3_ESPIDF_LINKER=$GRAFT_BIN \
   GRAFT_REAL_LD=ldproxy \
   GRAFT=base \
-  GRAFT_ENTRY_SYMBOL=app_main \
-  cargo bflash --no-default-features --features run_mode_fallback'
+  GRAFT_ENTRY_SYMBOL=main \
+  GRAFT_TEXT_SLACK_LEN=2000000 \
+  GRAFT_RODATA_SLACK_LEN=400000 \
+  GRAFT_DATA_SLACK_LEN=200000 \
+  cargo bflash --no-default-features --features run_mode_fallback"
+
+cp /workspaces/roborack3/target/xtensa-esp32s3-espidf/vehicle/deploy /tmp/base.elf
+
+# Overlay link (after editing source)
+docker exec graft-roborack3 bash -c "
+  cd /workspaces/roborack3 && \
+  rm -rf target/xtensa-esp32s3-espidf/vehicle/deps/deploy-* && \
+  touch <edited-file> && \
+  CARGO_TARGET_XTENSA_ESP32S3_ESPIDF_LINKER=$GRAFT_BIN \
+  GRAFT_REAL_LD=ldproxy \
+  GRAFT=overlay \
+  GRAFT_BASE_ELF=/tmp/base.elf \
+  GRAFT_ENTRY_SYMBOL=main \
+  cargo bflash --no-default-features --features run_mode_fallback"
 ```
 
-`GRAFT=base` makes graft run base mode (scan inputs, compute
-trans_hashes, exec real linker, attach `.graft.manifest` +
-`.graft.symhash` to the output ELF). `GRAFT_ENTRY_SYMBOL=app_main`
-points at the ESP-IDF entry — espidf-sys's `app_main` is what the
-runtime calls into; it's what overlay's trampoline will redirect.
+`GRAFT=base` runs base mode (scan inputs, compute trans_hashes,
+exec real linker, attach `.graft.manifest` + `.graft.symhash` to
+the output ELF, inject the synthetic slack `.o`).
 
-For overlay rebuilds:
-```bash
-GRAFT=overlay \
-GRAFT_BASE_ELF=/path/to/saved/base.elf \
-GRAFT_ENTRY_SYMBOL=app_main \
-cargo bflash --no-default-features --features run_mode_fallback
-```
+`GRAFT=overlay` runs overlay mode (mutate `memory.ld` to retarget
+overlay's regions at the slack vaddrs, mutate `sections.ld` to
+strip `.flash_rodata_dummy` + INCLUDE the IRAM blocker, prune
+inputs, link a tiny overlay ELF, splice + append into base.elf,
+patch the trampoline at `main`).
 
 ## Status
 
@@ -122,8 +139,8 @@ cargo bflash --no-default-features --features run_mode_fallback
 | Container up, host caches isolated | done |
 | First fallback-only `cargo bflash` (no graft) | **done** (4m 20s incremental; cold first build with esp-idf clone is ~30 min) |
 | Graft as base linker | **done** — `.graft.manifest`/`.graft.symhash` attached, slack symbols (`GRAFT_TEXT_SLACK`/`GRAFT_RODATA_SLACK`/`GRAFT_DATA_SLACK`) successfully placed by esp-idf's `*(.text.*)`/`*(.rodata.*)`/`*(.data.*)` wildcards |
-| Graft as overlay linker | **blocked on esp-idf linker-script port** — see "esp-idf vs esp-hal layout" below |
-| Hardware boot test | not started |
+| Graft as overlay linker | **done** — esp-idf layout port (memory.ld / sections.ld mutation, IRAM blocker via INCLUDE) lands |
+| Hardware boot test | **done** — base flashes & boots; overlay edit (`v1` → `v2 EDITED`) flashes, boots, runs, serial shows `graft overlay test marker v2 EDITED` |
 
 Picks up from M1.o (graft fixture pipeline working end-to-end on
 ESP32-S3-DevKitC). M1.p milestone is "graft works as the base linker
@@ -156,39 +173,60 @@ preprocessing expand to wildcards including `*(.text.*)`,
 get scooped by those wildcards exactly the same way they do under
 esp-hal. No esp-idf-specific code needed for base mode.
 
-### Blocker for overlay mode: esp-idf's linker-script chain
+### Single graft for both layouts
 
-`overlay.rs::setup_xtensa_layout` was written for esp-hal's layout
-and looks for files that don't exist under esp-idf:
+A `Layout` enum dispatches between esp-hal and esp-idf at the start
+of `setup_xtensa_layout`, picking based on which scripts appear in
+the `-L` paths (esp-idf preferred when both exist). Each branch
+reads, mutates, and writes its own flavor of the chain:
 
-| esp-hal expects | esp-idf has |
-|---|---|
-| `memory.x` (with `irom_seg`/`drom_seg`/`dram_seg` named regions) | `memory.ld` with `iram_seg`/`drom_seg`/`dram_seg`/`extern_ram_seg`/etc. |
-| `esp32s3.x` (containing `.rotext_dummy`) | `sections.ld.in` template, processed into `sections.ld` at cmake build time |
-| esp-hal's `*.x` files via `-L <esp-hal-out-dir>` | `-L <esp-idf-out>/build/esp-idf/esp_system/ld` etc. |
+| Layer | esp-hal | esp-idf |
+|---|---|---|
+| memory regions | `memory.x` (`irom_seg`/`drom_seg`/`dram_seg`) | `memory.ld` (`iram0_2_seg`/`drom0_0_seg`/`dram0_0_seg`) |
+| sections | `esp32s3.x` (with `.rotext_dummy`) | `sections.ld` (with `.flash_rodata_dummy`) |
+| dummy clause | strip `.rotext_dummy` | replace `.flash_rodata_dummy` body with `_flash_rodata_dummy_start = ABSOLUTE(.)` stub |
+| IRAM blocker | INCLUDE in mutated `esp32s3.x` before `INCLUDE "rwtext.x"` | INCLUDE near top of `SECTIONS{}` in `sections.ld`, before `.iram0.text` |
+| blocker region | `> iram_seg` | `> iram0_0_seg` |
 
-Overlay mode hits this immediately:
+Both write `graft_blockers.ld` to `work_dir`; the INCLUDE inside
+the mutated sections script picks it up. ld's section-ordering
+puts the blocker first in the IRAM region, pushing overlay's
+`.iram0.text` past base's used IRAM.
+
+### Trampoline target on espidf: prefer `main` over `app_main`
+
+The xtensa skip-then-load trampoline is **18 bytes**. esp-idf's
+C-side `app_main` is exactly 16 bytes (4 instructions —
+`link_patches();` then `rust_main();`), so trampolining at
+`app_main` overflows by 2 bytes into the next function (`atexit`),
+corrupting it. Use `GRAFT_ENTRY_SYMBOL=main` instead — Rust's
+`fn main()` is 32 bytes, plenty of room. Base's `app_main` runs
+unchanged and calls `main` as usual; the trampoline at `main`
+redirects to overlay's `main`, which calls overlay's
+`deploy::main` → `esp_main` → `fallback`.
+
+Future work: graft could pick a longer base function automatically
+(scan symhash for the entry's caller chain) or compress the
+trampoline. Not urgent — `main` works.
+
+### Slack sizes for roborack3
+
+The fixture defaults (64 KB text / 64 KB rodata / 4 KB data) are
+*much* too small for roborack3. The closure for any non-trivial
+edit pulls in formatting machinery, `log::info!` plumbing, anyhow
+glue, plus several support nodes' constructors:
+
+```bash
+GRAFT_TEXT_SLACK_LEN=2000000      # 2 MB
+GRAFT_RODATA_SLACK_LEN=400000     # 400 KB
+GRAFT_DATA_SLACK_LEN=200000       # 200 KB
 ```
-graft overlay: memory.x not found in any -L path (6 searched)
-```
 
-The work needed for overlay support:
-1. Detect esp-idf vs esp-hal at runtime (look for `memory.ld` first;
-   fall back to `memory.x`).
-2. Write an esp-idf-flavored `mutate_memory_ld` that bumps the
-   relevant region ORIGINs to the slack vaddrs (region names
-   differ — `iram_seg`, `dram_seg` are shared, but the IROM/DROM
-   regions are merged into one external-flash region and the
-   address arithmetic is different).
-3. Find the equivalent of esp-hal's `.rotext_dummy` strip — esp-idf
-   has `.flash_rodata_dummy` which serves the same DROM/IROM
-   alignment role; need to either remove it or work with it.
-4. Update the IRAM blocker (`graft_blockers.ld`) for esp-idf's
-   `iram_seg` (which has different ORIGIN/LENGTH than esp-hal's).
-
-Estimate: ~300-500 LOC of plumbing, mostly in `overlay.rs`.
-Behavior should be identical conceptually; the linker-script
-mutation just runs against a different starting layout.
+Used during base-link via env. Tune down once an actual fixture
+edit pattern is settled. (Without LTO — `--profile vehicle`
+inherits `dev` — cross-TU inlining is reduced compared to the
+M1.n fixture's `--release` build, but every constructor in
+`fallback()` is a separate fn and they all land in the closure.)
 
 ## Open questions / known gotchas
 

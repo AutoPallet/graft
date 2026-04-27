@@ -431,14 +431,18 @@ fn combine_splice(
     let ov_phdrs = read_program_headers(overlay_bytes, class)?;
     let mut append_loads: Vec<Phdr> = Vec::new();
     for ov in ov_phdrs.iter().filter(|p| p.p_type == PT_LOAD && p.p_filesz > 0) {
-        // Find all overlay sections that fall inside this PT_LOAD's
-        // vaddr range. file_range is keyed off p_offset, vaddrs come
-        // from sec.address(), so use vaddrs to associate.
         let load_v_start = ov.p_vaddr;
         let load_v_end = ov.p_vaddr + ov.p_memsz;
         let mut any_slack = false;
         let mut any_outside_base = false;
         let mut any_in_base = false;
+        // Track the lowest PROGBITS section vaddr in this LOAD so we
+        // can trim leading NOBITS (e.g. graft's IRAM blocker, which
+        // shares the LOAD with the actual `.iram0.text` content). The
+        // blocker reserves memsz inside iram0_0_seg but writes no
+        // flash bytes; if we appended at the LOAD's full vaddr range
+        // we'd overlap base's IRAM PT_LOAD without need.
+        let mut first_progbits_vaddr: Option<u64> = None;
         for sec in overlay_obj.sections() {
             let SectionFlags::Elf { sh_flags } = sec.flags() else { continue };
             if sh_flags & u64::from(SHF_ALLOC) == 0 {
@@ -447,11 +451,19 @@ fn combine_splice(
             if sec.size() == 0 {
                 continue;
             }
+            // NOBITS sections (e.g. graft's IRAM blocker, .bss) carry
+            // no flash content — they only consume memsz at boot.
+            // They can't clobber base because no bytes get written.
+            // Skip them when classifying the enclosing PT_LOAD.
+            if sec.file_range().is_none() {
+                continue;
+            }
             let s = sec.address();
             let e = s + sec.size();
             if s < load_v_start || e > load_v_end {
                 continue;
             }
+            first_progbits_vaddr = Some(first_progbits_vaddr.map_or(s, |v| v.min(s)));
             let in_slack = slack_regions
                 .iter()
                 .any(|r| s >= r.start && e <= r.start + r.len);
@@ -472,10 +484,6 @@ fn combine_splice(
             continue; // splice path handled it
         }
         if any_in_base {
-            // The section-walk error path will have fired on the
-            // offending section; this is a defensive bail in case the
-            // PT_LOAD covers only a NOBITS section (size 0 contents)
-            // that overlaps base.
             bail!(
                 "overlay PT_LOAD at {load_v_start:#x}+{:#x}: contains \
                  sections that overlap a non-slack base PT_LOAD",
@@ -483,11 +491,24 @@ fn combine_splice(
             );
         }
         if !any_outside_base {
-            // PT_LOAD with no SHF_ALLOC sections at all (just padding
-            // for alignment): nothing to append.
             continue;
         }
-        append_loads.push(*ov);
+        // Trim the LOAD to start at the first PROGBITS section's
+        // vaddr. ld page-aligns p_vaddr down by 0x1000 and may also
+        // include leading NOBITS (the IRAM blocker), neither of which
+        // need to be appended.
+        let mut trimmed = *ov;
+        if let Some(content_start) = first_progbits_vaddr
+            && content_start > ov.p_vaddr
+        {
+            let trim = content_start - ov.p_vaddr;
+            trimmed.p_offset += trim;
+            trimmed.p_vaddr += trim;
+            trimmed.p_paddr += trim;
+            trimmed.p_filesz = trimmed.p_filesz.saturating_sub(trim);
+            trimmed.p_memsz = trimmed.p_memsz.saturating_sub(trim);
+        }
+        append_loads.push(trimmed);
     }
 
     // Trampoline on entry symbol — same as the append path, just on
