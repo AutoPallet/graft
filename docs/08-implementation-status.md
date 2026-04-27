@@ -1,7 +1,7 @@
 # 08 — Implementation status & decision log
 
 Where the work actually stands relative to the design in 05 / 06, and
-what got changed along the way. As of `edcea78` (M1.g.8).
+what got changed along the way. As of M1.k.
 
 ## Status snapshot
 
@@ -24,6 +24,8 @@ what got changed along the way. As of `edcea78` (M1.g.8).
 | M1.g.8 — overlay mode on hardware | **done** — non-empty overlay boots and runs edited code |
 | M1.h — re-run churn experiments through graft | done; **regression vs stock + pageflash** — see below |
 | M1.i — drop rotext_dummy padding from overlay link | done; payload 14× smaller; full-flash 2.2× faster; pageflash now segment-shift bound |
+| M1.j — runtime-MMU 4-segment exploration | abandoned — see `m1j-runtime-mmu-attempt` branch |
+| M1.k — slack-section overlay layout (splice into base.elf) | done; image stays same shape/size as base; no segment-shift |
 
 ## Key decisions changed from the 05 plan
 
@@ -105,40 +107,26 @@ jx; jumps to overlay's `main + 3` to skip overlay's own `entry`
 must match base's (always true for "same Rust source, same
 compiler"), or the windowed-ABI assumption breaks.
 
-### "Section headers, not just program headers" for combine
+### "Section headers, not just program headers" for combine *(x86 path only after M1.k)*
 
 espflash's `save-image` builds image segments by walking the ELF's
 *section table* (filter: SHF_ALLOC + SHT_PROGBITS, sh_offset > 0,
-size > 0). Combine therefore appends both PHT entries *and* matching
-SHT entries (`.graft.overlay.<idx>`) for each spliced overlay LOAD,
-plus extends `.shstrtab`. Without the section headers, overlay bytes
-end up in the file but invisible to espflash. (For x86 Linux this
-didn't matter because `mmap` walks PHT directly.) See
-`combine.rs::add_overlay_section_headers`.
+size > 0). Combine's x86 (append) path therefore writes both PHT
+entries *and* matching SHT entries (`.graft.overlay.<idx>`) for each
+appended overlay LOAD, plus extends `.shstrtab`. The xtensa splice
+path (M1.k) doesn't need this — overlay bytes land inside base's
+existing `.text` / `.rodata` sections, which are already in the SHT.
+See `combine.rs::add_overlay_section_headers` (x86) and
+`combine_xtensa_splice` (xtensa).
 
-### Overlap-trim, not overlap-drop, for overlay LOADs
+### Overlap-trim, not overlap-drop, for overlay LOADs *(x86 path only after M1.k)*
 
-esp-hal's scripts emit dummy LOADs at base's RAM addresses
-(`.rwdata_dummy`, `.vectors`) and *also* page-align flash LOADs down
-to a 4 KB boundary even when the actual content sits well past that
-— overlay's `.rodata` at `0x3c0019ac` lives in a LOAD with
-`p_vaddr=0x3c001000`. Dropping wholesale loses overlay's literal
-pool. Combine **trims each overlay LOAD to its non-overlapping
-subrange** and keeps only the bytes whose vaddrs are strictly past
-every base PT_LOAD. See `combine.rs::combine`'s `min_keep_vaddr`
-loop.
-
-### 4-byte slack alignment, with esp-hal's 64 KB filler
-
-Overlay's IROM/DROM start needs to be ≤3 bytes past base's
-corresponding end so espflash's `merge_adjacent_segments` (3-byte
-gap tolerance) folds them into one image segment — the bootloader
-errors with "Image contains multiple IROM segments. Only the last
-one will be mapped" if not. compute_xtensa_slack rounds to 4-byte
-alignment for that reason. The much larger gap that
-`.rotext_dummy`'s `ALIGN(0x10000)+0x20` introduces lives *inside*
-the merged segment as zero bytes (no separate LOAD), so it doesn't
-trip the multiple-segments check.
+x86 hosted layout puts overlay at addresses past every base PT_LOAD,
+but linker page-alignment can introduce trailing-page overlap with
+base's last LOAD. Combine **trims each overlay LOAD to its
+non-overlapping subrange** in the x86 path. The xtensa splice path
+walks overlay sections directly (skipping any leading PT_LOAD
+zero-padding) so trim isn't needed there.
 
 ### ELF class awareness
 
@@ -394,6 +382,125 @@ the diff) — paddr layout, not real content change.
    final partial cache page that overflows into overlay's IROM; in
    pathological cases this could double-count the boundary page.
    Audit at implementation time.
+
+## M1.j — runtime-MMU exploration (abandoned)
+
+Tried to break the segment-shift bottleneck (M1.i follow-up #1) by
+giving overlay its own 64 KB-aligned IROM/DROM segments mapped at
+runtime via direct MMU table writes from `main`, before handoff to
+`graft_entry`. Hit two blockers:
+
+1. **ESP-IDF bootloader maps only one DROM and one IROM segment.**
+   Confirmed in `bootloader_utility.c` (master + v5.3): segment-walk
+   stores the first match in scalar `drom_addr` / `irom_addr` and
+   logs `"Image contains multiple %s segments. Only the last one
+   will be mapped."` for any further DROM/IROM segment.
+2. **The 512-entry MMU table is shared between IBUS and DBUS.**
+   `mmu_ll_get_entry_id(vaddr) = (vaddr & 0x1FFFFFF) >> 16`, so
+   `0x42010000` and `0x3C010000` both index entry 1. Mapping
+   overlay's `.rodata` at `0x3C010000` would unmap base's `.text`
+   at `0x42010000`. Verified empirically: direct MMU table writes
+   *do* work (overlay code briefly executed before crashing on the
+   unmapped sibling region), but no naive (vaddr_text, vaddr_rodata)
+   pair avoids a base-conflict for non-trivial bases.
+
+Branch `m1j-runtime-mmu-attempt` (tip `83c8ee9`) preserves the
+exploration: bundle post-processor that patched a `GRAFT_OVERLAY_INFO`
+struct in `.data`, runtime MMU stub in `rwtext`, direct table-write
+debug code in `main`. Useful if we ever revisit a custom-bootloader
+path or need the same suspend/invalidate sequence elsewhere.
+
+## M1.k — slack-section overlay layout
+
+Resolves M1.i follow-up #1 (segment-shift). Approach: have base
+reserve fixed-vaddr, fixed-paddr regions in flash that overlay can
+splice into without changing any base offsets.
+
+### Mechanism
+
+1. **Fixture declares two 0xFF-filled statics**, `GRAFT_TEXT_SLACK`
+   and `GRAFT_RODATA_SLACK`, with `link_section = ".text.graft_slack"`
+   / `".rodata.graft_slack"`. esp-hal's existing
+   `*(.text .literal.*)` and `*(.rodata .rodata.*)` wildcards scoop
+   them into base's `.text` / `.rodata` output sections; the existing
+   `.rotext_dummy` clause automatically grows `SIZEOF(.rodata)` to
+   match, pushing `.text` past the new slack's MMU entries. No
+   linker-script mutation needed in base.
+2. **Overlay link reads `GRAFT_TEXT_SLACK` / `GRAFT_RODATA_SLACK`
+   symbol values from base.elf** (`compute_xtensa_slack` in
+   `overlay.rs`) and writes a `memory.x` with `irom_seg ORIGIN =
+   slack.irom_start, len = slack.irom_len` (likewise drom). Overlay's
+   `.text` / `.rodata` land inside the slack region.
+3. **Combine splices**: `combine_xtensa_splice` walks overlay's
+   SHF_ALLOC SHT_PROGBITS sections, finds each one's vaddr inside
+   a base PT_LOAD, and overwrites `out[base_file_offset..]` with
+   the section's bytes. No new PT_LOADs, no PHT/SHT extension, no
+   appended payload. Trampoline patch on the entry symbol is
+   unchanged. Output ELF has identical shape and identical size to
+   base.elf.
+
+### Why 0xFF fill (not 0x00)
+
+Flash erase state is 0xFF on the SPI NOR parts ESP32-S3 talks to.
+Filling slack with 0xFF means a fresh-erased sector and an
+unwritten-overlay sector are bit-identical — pageflash can skip
+already-erased sectors without writing redundant 0xFF bytes.
+
+### MMU-aliasing analysis
+
+Slack regions stay inside base's already-mapped MMU pages, so no
+new MMU programming is needed at runtime. The IROM/DROM aliasing
+that blocked M1.j doesn't bite here: the slack vaddrs are just
+offsets within base's `.text` / `.rodata`, so they share base's
+MMU entries. Overlay's `.text` (slack vaddr ~0x42026900) and
+overlay's `.rodata` (slack vaddr ~0x3C000524) are in disjoint MMU
+entries (entry 2 vs entry 0) by virtue of being inside base's
+already-disjoint regions.
+
+### Numbers (Hello → Howdy)
+
+- **Image size**: 223,568 bytes; same as base, *exactly* (down from
+  M1.i's 94 KB combined image, because no separate overlay segment).
+- **Bytes that differ between base.img and spliced.img**: 2,945
+  (overlay payload 2,898 + trampoline patch 27 + boundary alignment
+  ~20).
+- **Slack overhead in base.img**: 64 KB IROM + 64 KB DROM = 128 KB
+  unconditional cost per base build, regardless of overlay presence.
+  Knob: `GRAFT_*_SLACK_LEN` consts in fixture's `main.rs`.
+- **Bootloader segments**: 1 DROM (72,368 bytes) + 1 IRAM/load + 1
+  IROM (92,416 bytes); no `multiple X segments` warnings.
+
+### Trade-offs
+
+- Base build pays the full slack size every time — 128 KB of 0xFF
+  bytes get flashed even when no overlay is loaded. Acceptable for
+  M1.k; the eventual fix is a delta-flasher that skips 0xFF sectors
+  (already-erased = no-op for NOR flash).
+- Overlay growth is bounded by slack size. If overlay's `.text`
+  exceeds `GRAFT_TEXT_SLACK_LEN`, ld errors out at the overlay link
+  ("section .text will not fit in region irom_seg"). Recovery: bump
+  the const in the fixture and rebuild base.
+- Slack regions occupy MMU entries inside base's already-mapped
+  IROM/DROM space, so the MMU-aliasing constraint that blocked M1.j
+  is automatically satisfied — but only because base's `.rotext_dummy`
+  mechanism already enforces it for base. Any future move away from
+  esp-hal's linker-script chain needs to re-check.
+
+### Followups
+
+1. **Delta-flasher that skips 0xFF sectors.** With slack 0xFF-filled,
+   pageflash can compare base.img sectors against the spliced image
+   and write only sectors where bytes differ. The 128 KB slack cost
+   becomes a no-op for the unchanged-overlay case.
+
+2. **Per-string sub-sectioning** (carryover from M1.i follow-up #2).
+   Still relevant: even with splice, overlay carries the whole
+   merged-strings section, not just edited strings.
+
+3. **Slack size auto-tuning.** Right now `GRAFT_*_SLACK_LEN` is a
+   manually-chosen const. Could infer from a sliding window of recent
+   overlay sizes, or have graft warn at base-link time if the slack
+   looks too small for typical edits. Not urgent.
 
 ## Things that turned out to not matter (or got simpler)
 

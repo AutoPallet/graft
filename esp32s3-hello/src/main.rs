@@ -9,6 +9,34 @@ use esp_println::println;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
+// graft slack: zero-cost (in source) reserved flash regions for an
+// overlay's `.text` and `.rodata` to land in. Filled with 0xFF so flash
+// erase-state and slack-state coincide — overlay-flash writes can skip
+// already-erased sectors. The wildcard matchers in esp-hal's linker
+// (`*(.rodata .rodata.*)`, `*(.text .literal.*)`) scoop these into the
+// existing IROM/DROM output sections, and `rotext_dummy` automatically
+// grows `SIZEOF(.rodata)` so `.text` lands past the slack's MMU entries.
+//
+// The overlay link reads the start vaddr and size of these symbols from
+// base.elf and points overlay's `irom_seg` / `drom_seg` at them.
+const GRAFT_TEXT_SLACK_LEN: usize = 64 * 1024;
+const GRAFT_RODATA_SLACK_LEN: usize = 64 * 1024;
+
+#[repr(C, align(4))]
+struct GraftSlack<const N: usize>([u8; N]);
+
+#[unsafe(no_mangle)]
+#[used]
+#[unsafe(link_section = ".text.graft_slack")]
+static GRAFT_TEXT_SLACK: GraftSlack<GRAFT_TEXT_SLACK_LEN> =
+    GraftSlack([0xFF; GRAFT_TEXT_SLACK_LEN]);
+
+#[unsafe(no_mangle)]
+#[used]
+#[unsafe(link_section = ".rodata.graft_slack")]
+static GRAFT_RODATA_SLACK: GraftSlack<GRAFT_RODATA_SLACK_LEN> =
+    GraftSlack([0xFF; GRAFT_RODATA_SLACK_LEN]);
+
 // graft installs its single trampoline at `graft_entry` (set via
 // `GRAFT_ENTRY_SYMBOL=graft_entry` at base build) rather than at
 // `main`, so `main` runs base's init/UART setup unconditionally and

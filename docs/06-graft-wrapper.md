@@ -28,6 +28,12 @@ Companion to `05-esp32-adaptation.md` (the *what*); this doc is the
 >   (with its preserve-`entry` form on xtensa) is the only target-
 >   specific code; everything else is class-aware (ELF32/64) and
 >   target-neutral.
+> - **xtensa combine path is splice, not append** (post-M1.k).
+>   `combine_xtensa_splice` writes overlay's section bytes into
+>   base's existing IROM/DROM sections at the slack file offset —
+>   no new PT_LOADs, no PHT/SHT extension. The append-style code
+>   (PHT rewrite, `add_overlay_section_headers`, overlap-trim)
+>   only runs on x86 hosted now. See 08 § M1.k.
 
 ## Shape
 

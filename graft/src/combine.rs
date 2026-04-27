@@ -29,8 +29,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use object::{
-    Object, ObjectSymbol,
-    elf::{PT_LOAD, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_PROGBITS},
+    Object, ObjectSection, ObjectSymbol, SectionFlags,
+    elf::{EM_XTENSA, PT_LOAD, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_PROGBITS},
 };
 
 use crate::{elf_attach, metadata};
@@ -129,6 +129,18 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
             "ELF class mismatch: base {:?}, overlay {:?}",
             base_class,
             ov_class
+        );
+    }
+
+    let e_machine = u16::from_le_bytes(base_bytes[18..20].try_into().unwrap());
+    if e_machine == EM_XTENSA {
+        return combine_xtensa_splice(
+            base_path,
+            &base_bytes,
+            overlay_path,
+            &overlay_bytes,
+            base_class,
+            output_path,
         );
     }
 
@@ -281,14 +293,7 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
     // *some* PT_LOAD for AT_PHDR to be a valid virtual address (else
     // musl SEGVs in __init_libc reading phdrs for TLS setup). Stretch
     // the last new LOAD to cover the trailing PHT.
-    //
-    // ELF32 xtensa: bootloader walks PHT directly from the file via
-    // e_phoff, doesn't require it to be inside a LOAD. Skip the stretch
-    // there to avoid declaring extra memory the bootloader would try
-    // to map.
-    if base_class == ElfClass::Elf64
-        && let Some(last) = new_loads.last_mut()
-    {
+    if let Some(last) = new_loads.last_mut() {
         let new_filesz = (new_phoff + pht_size as u64) - last.p_offset;
         last.p_filesz = new_filesz;
         last.p_memsz = new_filesz;
@@ -321,6 +326,116 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
         trampolines,
         overlay_load_size: total_overlay_filesz,
         overlay_vaddr: primary_load.p_vaddr,
+        combined_size: out.len() as u64,
+    })
+}
+
+/// Xtensa splice path (M1.k): overlay's `.text` and `.rodata` are linked
+/// into base's slack regions (`GRAFT_TEXT_SLACK`, `GRAFT_RODATA_SLACK`),
+/// so they live *inside* base's existing IROM/DROM PT_LOADs. Combine
+/// just splices the overlay section bytes over the slack-filling 0xFFs
+/// in the base ELF, then patches the entry trampoline. No new PT_LOADs,
+/// no PHT rewrite, no SHT extension — espflash sees a single IROM and
+/// single DROM segment exactly as it did for plain base.
+fn combine_xtensa_splice(
+    base_path: &Path,
+    base_bytes: &[u8],
+    overlay_path: &Path,
+    overlay_bytes: &[u8],
+    class: ElfClass,
+    output_path: &Path,
+) -> Result<Stats> {
+    let base_phdrs = read_program_headers(base_bytes, class)?;
+    let base_loads: Vec<Phdr> = base_phdrs
+        .iter()
+        .copied()
+        .filter(|p| p.p_type == PT_LOAD && p.p_filesz > 0)
+        .collect();
+
+    let mut out = base_bytes.to_vec();
+
+    let overlay_obj = object::File::parse(overlay_bytes)
+        .with_context(|| format!("parse {}", overlay_path.display()))?;
+
+    let mut total_spliced: u64 = 0;
+    let mut overlay_vaddr_first: u64 = 0;
+
+    for sec in overlay_obj.sections() {
+        let SectionFlags::Elf { sh_flags } = sec.flags() else { continue };
+        if sh_flags & u64::from(SHF_ALLOC) == 0 {
+            continue;
+        }
+        // NOBITS (e.g. .bss) has no file_range; skip — base's
+        // corresponding region won't have content to overwrite.
+        let Some((sec_off, sec_size)) = sec.file_range() else { continue };
+        if sec_size == 0 {
+            continue;
+        }
+        let v_start = sec.address();
+        let v_end = v_start + sec_size;
+        let load = base_loads
+            .iter()
+            .find(|p| v_start >= p.p_vaddr && v_end <= p.p_vaddr + p.p_filesz)
+            .ok_or_else(|| {
+                anyhow!(
+                    "overlay section {:?} at {v_start:#x}+{sec_size:#x} \
+                     does not fit in any base PT_LOAD — slack overflowed \
+                     or overlay laid out at wrong vaddr",
+                    sec.name().unwrap_or("?")
+                )
+            })?;
+        let base_off = (load.p_offset + (v_start - load.p_vaddr)) as usize;
+        let src = &overlay_bytes[sec_off as usize..(sec_off + sec_size) as usize];
+        out[base_off..base_off + sec_size as usize].copy_from_slice(src);
+        if overlay_vaddr_first == 0 {
+            overlay_vaddr_first = v_start;
+        }
+        total_spliced += sec_size;
+    }
+
+    // Trampoline on entry symbol — same as the appendpath, just on the
+    // splice-modified buffer.
+    let manifest_bytes = elf_attach::read_section(base_bytes, metadata::SECTION_MANIFEST)?
+        .ok_or_else(|| anyhow!("{}: no {}", base_path.display(), metadata::SECTION_MANIFEST))?;
+    let manifest = metadata::decode_manifest(manifest_bytes)?;
+    let entry = manifest.entry_symbol.as_str();
+
+    let base_obj = object::File::parse(base_bytes)
+        .with_context(|| format!("parse {}", base_path.display()))?;
+    let base_entry_addr = find_text_def(&base_obj, entry)
+        .ok_or_else(|| anyhow!("entry symbol {entry:?} not defined in base"))?;
+    let overlay_entry_addr = find_text_def(&overlay_obj, entry);
+    let trampolines: Vec<Trampoline> = match overlay_entry_addr {
+        Some(a) => vec![Trampoline {
+            name: entry.to_string(),
+            base_addr: base_entry_addr,
+            overlay_addr: a,
+        }],
+        None => Vec::new(),
+    };
+
+    if trampolines.is_empty() && total_spliced == 0 {
+        // Nothing changed; emit base verbatim.
+        write_executable(output_path, base_bytes)?;
+        return Ok(Stats {
+            trampolines,
+            overlay_load_size: 0,
+            overlay_vaddr: 0,
+            combined_size: base_bytes.len() as u64,
+        });
+    }
+
+    if !trampolines.is_empty() {
+        let e_machine = u16::from_le_bytes(base_bytes[18..20].try_into().unwrap());
+        apply_trampolines(&mut out, &base_phdrs, &trampolines, e_machine)?;
+    }
+
+    write_executable(output_path, &out)?;
+
+    Ok(Stats {
+        trampolines,
+        overlay_load_size: total_spliced,
+        overlay_vaddr: overlay_vaddr_first,
         combined_size: out.len() as u64,
     })
 }

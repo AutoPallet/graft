@@ -6,11 +6,15 @@
 > [`08-implementation-status.md`](./08-implementation-status.md)
 > captures every delta. Specifically:
 >
-> - **Destination is option B** (slack at end of app partition).
+> - **Destination is option B** (slack), but post-M1.k it's *named
+>   slack symbols inside base's `.text` / `.rodata`* rather than
+>   trailing flash past base's segments. See 08 § M1.k for why.
 > - **Output is a single combined ELF**, not a base + overlay pair —
 >   no runtime launcher, no `OverlayHeader`, no on-device wire
 >   format. `combine` is invoked internally by overlay mode and writes
->   straight to cargo's `-o` path.
+>   straight to cargo's `-o` path. On xtensa, combine **splices**
+>   overlay bytes into base's existing IROM/DROM sections (no new
+>   PT_LOADs, identical image shape).
 > - **One trampoline only**, at the entry symbol; the per-call-site
 >   `-mlongcalls` machinery in §"ESP32-S3 and Xtensa specifics" is
 >   not used.

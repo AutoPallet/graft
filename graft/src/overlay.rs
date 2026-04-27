@@ -708,54 +708,61 @@ pub struct XtensaLayout {
 
 #[derive(Debug, Clone, Copy)]
 pub struct XtensaSlack {
-    /// First 4KB-aligned IROM-bus vaddr past base's last IROM section.
+    /// Start vaddr of `GRAFT_TEXT_SLACK` in base.elf — overlay's
+    /// `irom_seg` ORIGIN.
     pub irom_start: u64,
-    /// First 4KB-aligned DROM-bus vaddr past base's last DROM section.
+    /// Length of `GRAFT_TEXT_SLACK` in bytes.
+    pub irom_len: u64,
+    /// Start vaddr of `GRAFT_RODATA_SLACK` in base.elf — overlay's
+    /// `drom_seg` ORIGIN.
     pub drom_start: u64,
+    /// Length of `GRAFT_RODATA_SLACK` in bytes.
+    pub drom_len: u64,
 }
 
-/// IROM bus base on ESP32-S3: `0x4200_0000..0x4400_0000` (32 MB).
-const ESP32S3_IROM_BASE: u64 = 0x4200_0000;
-const ESP32S3_IROM_END: u64 = 0x4400_0000;
-/// DROM bus base on ESP32-S3: `0x3C00_0000..0x3E00_0000` (32 MB).
-const ESP32S3_DROM_BASE: u64 = 0x3C00_0000;
-const ESP32S3_DROM_END: u64 = 0x3E00_0000;
-
+/// Look up `GRAFT_TEXT_SLACK` and `GRAFT_RODATA_SLACK` in base.elf's
+/// symtab and return their (vaddr, size). The fixture defines them
+/// as `[u8; N]` statics with `link_section` attributes that funnel
+/// them into base's `.text` / `.rodata` output sections (via the
+/// existing `*(.rodata .rodata.*)` / `*(.text .literal.*)` wildcards),
+/// so they sit *inside* base's already-mapped IROM/DROM segments.
+/// Overlay then aims its `.text` / `.rodata` at those vaddrs and the
+/// bundle post-processor splices the bytes into base.img.
 fn compute_xtensa_slack(base_bytes: &[u8]) -> Result<XtensaSlack> {
-    use object::{Object, ObjectSection, SectionFlags};
+    use object::{Object, ObjectSymbol};
     let elf = object::File::parse(base_bytes).context("parse base ELF for xtensa slack")?;
-    let mut irom_max: u64 = 0;
-    let mut drom_max: u64 = 0;
-    for sec in elf.sections() {
-        let alloc = matches!(
-            sec.flags(),
-            SectionFlags::Elf { sh_flags } if (sh_flags & u64::from(object::elf::SHF_ALLOC)) != 0
+    let mut text: Option<(u64, u64)> = None;
+    let mut rodata: Option<(u64, u64)> = None;
+    for sym in elf.symbols() {
+        let Ok(name) = sym.name() else { continue };
+        match name {
+            "GRAFT_TEXT_SLACK" => text = Some((sym.address(), sym.size())),
+            "GRAFT_RODATA_SLACK" => rodata = Some((sym.address(), sym.size())),
+            _ => {}
+        }
+    }
+    let (irom_start, irom_len) = text.ok_or_else(|| {
+        anyhow!(
+            "base ELF: GRAFT_TEXT_SLACK symbol not found \
+             (fixture must declare a #[link_section = \".text.graft_slack\"] static)"
+        )
+    })?;
+    let (drom_start, drom_len) = rodata.ok_or_else(|| {
+        anyhow!(
+            "base ELF: GRAFT_RODATA_SLACK symbol not found \
+             (fixture must declare a #[link_section = \".rodata.graft_slack\"] static)"
+        )
+    })?;
+    if irom_start & 3 != 0 || drom_start & 3 != 0 {
+        bail!(
+            "GRAFT_*_SLACK must be 4-byte aligned — got irom={irom_start:#x}, drom={drom_start:#x}"
         );
-        if !alloc {
-            continue;
-        }
-        let v = sec.address();
-        let end = v + sec.size();
-        if (ESP32S3_IROM_BASE..ESP32S3_IROM_END).contains(&v) {
-            irom_max = irom_max.max(end);
-        } else if (ESP32S3_DROM_BASE..ESP32S3_DROM_END).contains(&v) {
-            drom_max = drom_max.max(end);
-        }
     }
-    if irom_max == 0 || drom_max == 0 {
-        bail!("base ELF has no xtensa IROM or DROM sections — wrong target?");
-    }
-    // 4-byte alignment, NOT 4KB. Reason: ESP-IDF's 2nd-stage bootloader
-    // refuses to map more than one IROM (or DROM) segment per image —
-    // it warns "Image contains multiple IROM segments. Only the last
-    // one will be mapped." espflash save-image's `merge_adjacent_segments`
-    // collapses sections whose vaddrs are within 3 bytes of each other
-    // (rounding up to 4-byte boundary, padding the gap with zeros).
-    // So overlay's IROM/DROM start has to be 4-byte aligned and ≤ 3
-    // bytes past base's end to get folded into one big image segment.
     Ok(XtensaSlack {
-        irom_start: (irom_max + 3) & !3,
-        drom_start: (drom_max + 3) & !3,
+        irom_start,
+        irom_len,
+        drom_start,
+        drom_len,
     })
 }
 
@@ -771,22 +778,18 @@ fn mutate_memory_x(content: &str, slack: &XtensaSlack) -> Result<String> {
     for line in content.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with("irom_seg") && trimmed.contains("ORIGIN") {
-            // 32 MB irom region minus the slack offset still leaves
-            // plenty for any conceivable overlay.
-            let len = ESP32S3_IROM_END - slack.irom_start;
             writeln!(
                 out,
                 "  irom_seg ( RX ) : ORIGIN = {:#x}, len = {:#x}",
-                slack.irom_start, len
+                slack.irom_start, slack.irom_len
             )
             .unwrap();
             found_irom = true;
         } else if trimmed.starts_with("drom_seg") && trimmed.contains("ORIGIN") {
-            let len = ESP32S3_DROM_END - slack.drom_start;
             writeln!(
                 out,
                 "  drom_seg ( R ) : ORIGIN = {:#x}, len = {:#x}",
-                slack.drom_start, len
+                slack.drom_start, slack.drom_len
             )
             .unwrap();
             found_drom = true;
@@ -941,7 +944,9 @@ MEMORY
 ";
         let slack = XtensaSlack {
             irom_start: 0x4201_7000,
+            irom_len: 0x10000,
             drom_start: 0x3C00_2000,
+            drom_len: 0x10000,
         };
         let out = mutate_memory_x(input, &slack).unwrap();
         assert!(out.contains("irom_seg ( RX ) : ORIGIN = 0x42017000"));
@@ -956,7 +961,9 @@ MEMORY
         let input = "MEMORY { ram (RW) : ORIGIN = 0, len = 1k }\n";
         let slack = XtensaSlack {
             irom_start: 0,
+            irom_len: 0x10000,
             drom_start: 0,
+            drom_len: 0x10000,
         };
         assert!(mutate_memory_x(input, &slack).is_err());
     }
