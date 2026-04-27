@@ -76,17 +76,55 @@ impl Fixture {
     }
 
     fn combine_stats(&self) -> Stats {
+        let work_dir = self.graft_work_dir();
+        let stats_path = work_dir.join("combine-stats.json");
+        let s = std::fs::read_to_string(&stats_path)
+            .unwrap_or_else(|_| panic!("read {}", stats_path.display()));
+        Stats::parse(&s)
+    }
+
+    fn graft_work_dir(&self) -> PathBuf {
         let deps = self.dir.join("target/x86_64-unknown-linux-musl/debug/deps");
         for e in std::fs::read_dir(&deps).unwrap_or_else(|_| panic!("read {}", deps.display())) {
             let p = e.unwrap().path();
             if p.is_dir() && p.extension().and_then(|s| s.to_str()) == Some("graft-work") {
-                let stats_path = p.join("combine-stats.json");
-                let s = std::fs::read_to_string(&stats_path)
-                    .unwrap_or_else(|_| panic!("read {}", stats_path.display()));
-                return Stats::parse(&s);
+                return p;
             }
         }
         panic!("no *.graft-work dir inside {}", deps.display());
+    }
+
+    fn graft_log_path(&self) -> PathBuf {
+        self.dir.join("target").join("graft-summary.log")
+    }
+
+    /// Read graft's overlay summary line (which carries closure-size,
+    /// payload-size, per-phase timings) from the GRAFT_LOG sidecar
+    /// the most recent overlay run wrote.
+    fn graft_summary(&self) -> String {
+        let log = self.graft_log_path();
+        std::fs::read_to_string(&log)
+            .unwrap_or_else(|_| panic!("read {}", log.display()))
+    }
+
+    /// Pull `closure N sections` out of the graft summary.
+    fn closure_sections(&self) -> usize {
+        let s = self.graft_summary();
+        let key = "closure ";
+        let i = s.find(key).expect("no `closure ` in graftlog");
+        let rest = &s[i + key.len()..];
+        let n_end = rest.find(' ').expect("no space after closure number");
+        rest[..n_end].parse().expect("closure size not numeric")
+    }
+
+    /// Pull `overlay payload N` out of the graft summary.
+    fn overlay_payload(&self) -> usize {
+        let s = self.graft_summary();
+        let key = "overlay payload ";
+        let i = s.find(key).expect("no `overlay payload ` in graftlog");
+        let rest = &s[i + key.len()..];
+        let n_end = rest.find(' ').expect("no space after payload number");
+        rest[..n_end].parse().expect("payload size not numeric")
     }
 
     fn app_bin(&self) -> PathBuf {
@@ -199,4 +237,97 @@ fn full_cycle() {
         std::fs::read(&fx.app_bin()).unwrap(),
         "D: combined should be byte-identical to base",
     );
+}
+
+/// For small, focused source mutations, graft's *overlay payload*
+/// (the bytes that get spliced/appended into the combined ELF and
+/// flashed) should be proportional to the source change — a few
+/// hundred bytes to a few KB, not megabytes. The closure section
+/// count itself is less interesting (it can include linker-noise
+/// inputs like `.note.gnu.property` that pass through to overlay's
+/// link as KEEP()'d but don't materially inflate the output), so we
+/// assert on payload bytes and leave room for the closure to carry
+/// dozens of trivial-pass-through sections.
+///
+/// This test mirrors the M1.q.1 roborack3 mutation matrix on x86 so
+/// we can iterate the canonicalization fixes locally.
+#[test]
+#[ignore]
+fn payload_sizes_for_typical_edits() {
+    let fx = Fixture::new();
+    let log_path = fx.graft_log_path();
+
+    fx.cargo_build(&[("GRAFT", "base")]);
+    let base_elf = std::env::temp_dir().join("graft-e2e-tight-base.elf");
+    std::fs::copy(fx.app_bin(), &base_elf).unwrap();
+    make_executable(&base_elf);
+
+    let base_env_owned = base_elf.to_string_lossy().into_owned();
+    let log_env_owned = log_path.to_string_lossy().into_owned();
+    let overlay_env: &[(&str, &str)] = &[
+        ("GRAFT", "overlay"),
+        ("GRAFT_BASE_ELF", base_env_owned.as_str()),
+        ("GRAFT_LOG", log_env_owned.as_str()),
+    ];
+
+    // Loose ceiling: any small-source-mutation overlay should fit in
+    // 4 KB. Anything more means a real cascade — trans_hash
+    // canonicalization is letting name-noise propagate through the
+    // SCC graph and pulling unrelated sections into the closure.
+    // 4 KB is comfortably above what each scenario actually
+    // produces (A/B/C ~1 KB, D ~1.5 KB) — adjust down if any
+    // scenario regresses well below.
+    const TIGHT: usize = 4096;
+
+    let mut report = Vec::<(&str, usize, usize)>::new();
+    let mut run = |label: &'static str| {
+        fx.cargo_build(overlay_env);
+        let n = fx.closure_sections();
+        let p = fx.overlay_payload();
+        println!("{label}: closure={n} payload={p}");
+        report.push((label, n, p));
+        assert!(
+            p <= TIGHT,
+            "{label} payload={p} > {TIGHT} — cascade pulled \
+             unrelated content into the overlay output"
+        );
+    };
+
+    // A. leaf arithmetic edit (no new strings/format).
+    fx.edit("base/src/lib.rs", "wrapping_mul(7)", "wrapping_mul(13)");
+    run("A leaf-arith");
+    fx.edit("base/src/lib.rs", "wrapping_mul(13)", "wrapping_mul(7)");
+
+    // B. mid-graph edit (mix). compute stays.
+    fx.edit("base/src/lib.rs", "rotate_left(3)", "rotate_left(5)");
+    run("B mid-graph");
+    fx.edit("base/src/lib.rs", "rotate_left(5)", "rotate_left(3)");
+
+    // C. top-level edit (app/main, base unchanged).
+    fx.edit("app/src/main.rs", r#"greet("graft")"#, r#"greet("world")"#);
+    run("C top-edit");
+    fx.edit("app/src/main.rs", r#"greet("world")"#, r#"greet("graft")"#);
+
+    // D. introduce a format/println call into a function that
+    //    previously had none. This is the roborack3 fallback-string
+    //    pattern. Format infra is already in base (app uses println!
+    //    everywhere); reaching it from compute should hit Provided
+    //    after one hop, not cascade through everything.
+    fx.edit(
+        "base/src/lib.rs",
+        "    acc\n}",
+        "    println!(\"compute trace acc={acc}\");\n    acc\n}",
+    );
+    run("D introduce-format");
+    fx.edit(
+        "base/src/lib.rs",
+        "    println!(\"compute trace acc={acc}\");\n    acc\n}",
+        "    acc\n}",
+    );
+
+    // E. change a string literal in a function that already uses
+    //    format (greet uses `format!`).
+    fx.edit("base/src/lib.rs", r#""hello, {name}!""#, r#""HOWDY, {name}!""#);
+    run("E string-edit");
+    fx.edit("base/src/lib.rs", r#""HOWDY, {name}!""#, r#""hello, {name}!""#);
 }
