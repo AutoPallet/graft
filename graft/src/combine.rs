@@ -30,7 +30,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use object::{
     Object, ObjectSection, ObjectSymbol, SectionFlags,
-    elf::{EM_XTENSA, PT_LOAD, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_PROGBITS},
+    elf::{PT_LOAD, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_PROGBITS},
 };
 
 use crate::{elf_attach, metadata};
@@ -133,8 +133,9 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
     }
 
     let e_machine = u16::from_le_bytes(base_bytes[18..20].try_into().unwrap());
-    if e_machine == EM_XTENSA {
-        return combine_xtensa_splice(
+    let mode = crate::slack::Mode::resolve(e_machine)?;
+    if mode == crate::slack::Mode::Splice {
+        return combine_splice(
             base_path,
             &base_bytes,
             overlay_path,
@@ -337,7 +338,7 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
 /// in the base ELF, then patches the entry trampoline. No new PT_LOADs,
 /// no PHT rewrite, no SHT extension — espflash sees a single IROM and
 /// single DROM segment exactly as it did for plain base.
-fn combine_xtensa_splice(
+fn combine_splice(
     base_path: &Path,
     base_bytes: &[u8],
     overlay_path: &Path,

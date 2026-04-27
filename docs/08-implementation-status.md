@@ -26,6 +26,7 @@ what got changed along the way. As of M1.k.
 | M1.i — drop rotext_dummy padding from overlay link | done; payload 14× smaller; full-flash 2.2× faster; pageflash now segment-shift bound |
 | M1.j — runtime-MMU 4-segment exploration | abandoned — see `m1j-runtime-mmu-attempt` branch |
 | M1.k — slack-section overlay layout (splice into base.elf) | done; image stays same shape/size as base; no segment-shift |
+| M1.l — synthetic-.o slack injection + arch-neutral splice mode | done; fixture stays graft-agnostic; x86 + xtensa share splice path |
 
 ## Key decisions changed from the 05 plan
 
@@ -501,6 +502,52 @@ already-disjoint regions.
    manually-chosen const. Could infer from a sliding window of recent
    overlay sizes, or have graft warn at base-link time if the slack
    looks too small for typical edits. Not urgent.
+
+## M1.l — synthetic-.o slack injection + arch-neutral splice mode
+
+Cleanup pass on M1.k:
+
+- **Slack reservation moves from fixture source to graft.** New module
+  `graft/src/slack.rs` synthesizes a relocatable ELF (via
+  `object::write::Object`) carrying `.text.graft_slack` /
+  `.rodata.graft_slack` PROGBITS sections (0xFF-filled, sized via
+  `GRAFT_TEXT_SLACK_LEN` / `GRAFT_RODATA_SLACK_LEN` env vars,
+  default 64 KB) plus `GRAFT_TEXT_SLACK` / `GRAFT_RODATA_SLACK`
+  globals. Base mode writes the `.o` next to the output and appends
+  it to the linker argv along with `-Wl,--undefined=GRAFT_*_SLACK`
+  (so `--gc-sections` keeps them). Fixtures no longer carry slack
+  boilerplate.
+- **`GRAFT_OVERLAY_MODE` flag** (`splice` | `append`). Defaults to
+  `splice` on xtensa (the bootloader requires it), `append` on x86
+  hosted (legacy default; can be opted into splice for delta-flash
+  benefits and identical-shape images). Resolved in
+  `slack::Mode::resolve(e_machine)`.
+- **Arch-neutral splice path.** `combine_xtensa_splice` →
+  `combine_splice`; dispatched on `Mode` rather than `e_machine`. A
+  matching x86 `write_overlay_layout_ld_splice` places overlay's
+  `.text*` at `slack.text_start` and `.rodata*` / `.data.rel.ro*` at
+  `slack.rodata_start`, with `ASSERT(_graft_*_end <= ...)` guards at
+  the script's top level (inside-`SECTIONS` ASSERTs are rejected by
+  some ld versions). Discards `.eh_frame` / `.data` / `.bss` /
+  unwind-header sections — splice mode covers only the two slack
+  regions; everything else must come from base. (Not a regression
+  for the existing fixtures, which produce only `.text` + `.rodata`
+  in overlay.)
+- **`Slack`** (was `XtensaSlack`) with `text_*` / `rodata_*` field
+  names instead of `irom_*` / `drom_*`, since both x86 and xtensa
+  use it now. `compute_xtensa_slack` → `compute_slack`.
+
+Verified:
+- x86 e2e cycle (default `append`) — unchanged, passes.
+- x86 splice mode — `GRAFT_OVERLAY_MODE=splice` end-to-end works;
+  combined ELF identical size to base, 964-byte overlay payload
+  spliced, single trampoline.
+- xtensa hardware — `Hello`→`Howdy` overlay boots and runs;
+  bootloader still maps single DROM (72 KB) + IROM (92 KB)
+  segments; image size 223,568 bytes (matches M1.k baseline).
+
+The fixture-side slack statics in `esp32s3-hello/src/main.rs` are
+removed — the fixture is now graft-agnostic across both targets.
 
 ## Things that turned out to not matter (or got simpler)
 

@@ -106,20 +106,34 @@ fn run(argv: Vec<String>) -> Result<()> {
     let base_bytes_for_layout =
         std::fs::read(&base_path).with_context(|| format!("read {}", base_path.display()))?;
     let e_machine = base_e_machine(&base_bytes_for_layout)?;
+    let mode = crate::slack::Mode::resolve(e_machine)?;
+    if mode == crate::slack::Mode::Append && e_machine == object::elf::EM_XTENSA {
+        bail!(
+            "GRAFT_OVERLAY_MODE=append is unsupported on xtensa: the ESP-IDF bootloader \
+             maps only one IROM/DROM segment per image. Use splice mode."
+        );
+    }
+
     let xtensa_layout = if e_machine == object::elf::EM_XTENSA {
         Some(setup_xtensa_layout(&work_dir, &base_bytes_for_layout, &argv)?)
     } else {
         None
     };
-    // x86 layout script lives even in the xtensa branch — `run_real_linker`
-    // unconditionally passes `-T overlay_layout.ld`. For xtensa we hand
-    // it an empty stub so we can rely on linkall.x's own SECTIONS.
-    let overlay_base_addr = compute_overlay_base_addr(&base_path)?;
+    // overlay_layout.ld is always passed to ld (run_real_linker
+    // unconditionally adds `-T overlay_layout.ld`). The contents differ
+    // by (mode, target):
+    //   - xtensa: empty stub; layout comes from linkall.x + memory.x.
+    //   - x86 splice: SECTIONS placing .text/.rodata at slack vaddrs.
+    //   - x86 append: SECTIONS placing all alloc'd at OVERLAY_BASE_ADDR.
     let layout_script = work_dir.join("overlay_layout.ld");
     if xtensa_layout.is_some() {
         std::fs::write(&layout_script, b"/* xtensa: linkall.x carries the layout. */\n")
             .with_context(|| format!("write {}", layout_script.display()))?;
+    } else if mode == crate::slack::Mode::Splice {
+        let slack = compute_slack(&base_bytes_for_layout)?;
+        write_overlay_layout_ld_splice(&layout_script, &slack)?;
     } else {
+        let overlay_base_addr = compute_overlay_base_addr(&base_path)?;
         write_overlay_layout_ld(&layout_script, overlay_base_addr)?;
     }
 
@@ -350,6 +364,43 @@ fn compute_overlay_base_addr(base_path: &Path) -> Result<u64> {
     }
     const PAGE: u64 = 0x1000;
     Ok((max_end + PAGE - 1) & !(PAGE - 1))
+}
+
+/// Splice-mode layout for non-xtensa hosted targets (x86_64 today).
+/// Places overlay's `.text*` at the slack `.text` vaddr and overlay's
+/// `.rodata*` / `.data.rel.ro*` at the slack `.rodata` vaddr. Discards
+/// any non-text/rodata alloc sections — splice mode covers only the
+/// two slack-reserved regions, so anything else (`.data`, `.bss`,
+/// `.eh_frame_hdr`, …) must come from base. ASSERTs guard against
+/// silent slack overflow at link time.
+fn write_overlay_layout_ld_splice(path: &Path, slack: &Slack) -> Result<()> {
+    // ASSERT-on-overflow lives at the top level (outside SECTIONS) so
+    // it sees the placement-final symbols `_graft_text_end` /
+    // `_graft_rodata_end`. Inside SECTIONS, top-level ASSERTs get
+    // rejected by some ld versions.
+    let script = format!(
+        "/* graft overlay layout (splice): place .text/.rodata at \
+         base's reserved slack vaddrs. */\n\
+         SECTIONS {{\n\
+         \x20  . = {text_start:#x};\n\
+         \x20  .text : {{ *(.text .text.*) }}\n\
+         \x20  _graft_text_end = .;\n\
+         \x20  . = {rodata_start:#x};\n\
+         \x20  .rodata : {{ *(.rodata .rodata.* .rodata..L*) }}\n\
+         \x20  .data.rel.ro : {{ *(.data.rel.ro .data.rel.ro.* .data.rel.ro..L*) }}\n\
+         \x20  _graft_rodata_end = .;\n\
+         \x20  /DISCARD/ : {{ *(.eh_frame .eh_frame_hdr .gcc_except_table* \
+         .data .data.* .bss .bss.* COMMON .note.* .comment .gnu_debuglink) }}\n\
+         }}\n\
+         ASSERT(_graft_text_end <= {text_end:#x}, \"overlay .text overflows GRAFT_TEXT_SLACK\")\n\
+         ASSERT(_graft_rodata_end <= {rodata_end:#x}, \"overlay .rodata overflows GRAFT_RODATA_SLACK\")\n",
+        text_start = slack.text_start,
+        text_end = slack.text_start + slack.text_len,
+        rodata_start = slack.rodata_start,
+        rodata_end = slack.rodata_start + slack.rodata_len,
+    );
+    std::fs::write(path, script).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
 }
 
 fn write_overlay_layout_ld(path: &Path, base_addr: u64) -> Result<()> {
@@ -703,21 +754,21 @@ fn base_e_machine(bytes: &[u8]) -> Result<u16> {
 pub struct XtensaLayout {
     pub work_dir: PathBuf,
     pub search_paths: Vec<PathBuf>,
-    pub slack: XtensaSlack,
+    pub slack: Slack,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct XtensaSlack {
+pub struct Slack {
     /// Start vaddr of `GRAFT_TEXT_SLACK` in base.elf — overlay's
     /// `irom_seg` ORIGIN.
-    pub irom_start: u64,
+    pub text_start: u64,
     /// Length of `GRAFT_TEXT_SLACK` in bytes.
-    pub irom_len: u64,
+    pub text_len: u64,
     /// Start vaddr of `GRAFT_RODATA_SLACK` in base.elf — overlay's
     /// `drom_seg` ORIGIN.
-    pub drom_start: u64,
+    pub rodata_start: u64,
     /// Length of `GRAFT_RODATA_SLACK` in bytes.
-    pub drom_len: u64,
+    pub rodata_len: u64,
 }
 
 /// Look up `GRAFT_TEXT_SLACK` and `GRAFT_RODATA_SLACK` in base.elf's
@@ -728,7 +779,7 @@ pub struct XtensaSlack {
 /// so they sit *inside* base's already-mapped IROM/DROM segments.
 /// Overlay then aims its `.text` / `.rodata` at those vaddrs and the
 /// bundle post-processor splices the bytes into base.img.
-fn compute_xtensa_slack(base_bytes: &[u8]) -> Result<XtensaSlack> {
+fn compute_slack(base_bytes: &[u8]) -> Result<Slack> {
     use object::{Object, ObjectSymbol};
     let elf = object::File::parse(base_bytes).context("parse base ELF for xtensa slack")?;
     let mut text: Option<(u64, u64)> = None;
@@ -741,28 +792,28 @@ fn compute_xtensa_slack(base_bytes: &[u8]) -> Result<XtensaSlack> {
             _ => {}
         }
     }
-    let (irom_start, irom_len) = text.ok_or_else(|| {
+    let (text_start, text_len) = text.ok_or_else(|| {
         anyhow!(
             "base ELF: GRAFT_TEXT_SLACK symbol not found \
              (fixture must declare a #[link_section = \".text.graft_slack\"] static)"
         )
     })?;
-    let (drom_start, drom_len) = rodata.ok_or_else(|| {
+    let (rodata_start, rodata_len) = rodata.ok_or_else(|| {
         anyhow!(
             "base ELF: GRAFT_RODATA_SLACK symbol not found \
              (fixture must declare a #[link_section = \".rodata.graft_slack\"] static)"
         )
     })?;
-    if irom_start & 3 != 0 || drom_start & 3 != 0 {
+    if text_start & 3 != 0 || rodata_start & 3 != 0 {
         bail!(
-            "GRAFT_*_SLACK must be 4-byte aligned — got irom={irom_start:#x}, drom={drom_start:#x}"
+            "GRAFT_*_SLACK must be 4-byte aligned — got irom={text_start:#x}, drom={rodata_start:#x}"
         );
     }
-    Ok(XtensaSlack {
-        irom_start,
-        irom_len,
-        drom_start,
-        drom_len,
+    Ok(Slack {
+        text_start,
+        text_len,
+        rodata_start,
+        rodata_len,
     })
 }
 
@@ -770,7 +821,7 @@ fn compute_xtensa_slack(base_bytes: &[u8]) -> Result<XtensaSlack> {
 /// the slack addresses (overlay's flash region) instead of base's
 /// flash region. Line-based; idempotent re-runs on the same input
 /// produce identical output.
-fn mutate_memory_x(content: &str, slack: &XtensaSlack) -> Result<String> {
+fn mutate_memory_x(content: &str, slack: &Slack) -> Result<String> {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(content.len() + 256);
     let mut found_irom = false;
@@ -781,7 +832,7 @@ fn mutate_memory_x(content: &str, slack: &XtensaSlack) -> Result<String> {
             writeln!(
                 out,
                 "  irom_seg ( RX ) : ORIGIN = {:#x}, len = {:#x}",
-                slack.irom_start, slack.irom_len
+                slack.text_start, slack.text_len
             )
             .unwrap();
             found_irom = true;
@@ -789,7 +840,7 @@ fn mutate_memory_x(content: &str, slack: &XtensaSlack) -> Result<String> {
             writeln!(
                 out,
                 "  drom_seg ( R ) : ORIGIN = {:#x}, len = {:#x}",
-                slack.drom_start, slack.drom_len
+                slack.rodata_start, slack.rodata_len
             )
             .unwrap();
             found_drom = true;
@@ -904,7 +955,7 @@ fn setup_xtensa_layout(
     base_bytes: &[u8],
     argv: &[String],
 ) -> Result<XtensaLayout> {
-    let slack = compute_xtensa_slack(base_bytes)?;
+    let slack = compute_slack(base_bytes)?;
     let (memory_x, esp32s3_x, search_paths) = find_memory_x_and_paths(argv)?;
 
     let memory_orig = std::fs::read_to_string(&memory_x)
@@ -942,11 +993,11 @@ MEMORY
   rtc_fast_seg(RWX) : ORIGIN = 0x600fe000, len = 8k
 }
 ";
-        let slack = XtensaSlack {
-            irom_start: 0x4201_7000,
-            irom_len: 0x10000,
-            drom_start: 0x3C00_2000,
-            drom_len: 0x10000,
+        let slack = Slack {
+            text_start: 0x4201_7000,
+            text_len: 0x10000,
+            rodata_start: 0x3C00_2000,
+            rodata_len: 0x10000,
         };
         let out = mutate_memory_x(input, &slack).unwrap();
         assert!(out.contains("irom_seg ( RX ) : ORIGIN = 0x42017000"));
@@ -959,11 +1010,11 @@ MEMORY
     #[test]
     fn mutate_memory_x_errors_if_lines_missing() {
         let input = "MEMORY { ram (RW) : ORIGIN = 0, len = 1k }\n";
-        let slack = XtensaSlack {
-            irom_start: 0,
-            irom_len: 0x10000,
-            drom_start: 0,
-            drom_len: 0x10000,
+        let slack = Slack {
+            text_start: 0,
+            text_len: 0x10000,
+            rodata_start: 0,
+            rodata_len: 0x10000,
         };
         assert!(mutate_memory_x(input, &slack).is_err());
     }

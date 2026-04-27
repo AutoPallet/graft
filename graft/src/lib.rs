@@ -17,6 +17,7 @@ pub mod overlay;
 pub mod prune;
 pub mod roots;
 pub mod scan;
+pub mod slack;
 pub mod subcommands;
 pub mod telemetry;
 
