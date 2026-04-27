@@ -549,6 +549,39 @@ Verified:
 The fixture-side slack statics in `esp32s3-hello/src/main.rs` are
 removed — the fixture is now graft-agnostic across both targets.
 
+## M1.m candidate followups (from closure-dump audit)
+
+A `Hello`→`Howdy` overlay payload of ~2898 bytes splits as:
+
+| section | bytes | actually changed? |
+|---|---:|---|
+| `.text.graft_entry` | 1062 | yes |
+| `.literal.graft_entry` | 112 | yes |
+| `.rodata.str1.1` | 1655 | **no** |
+| `.Lanon….4` (format-pieces slice) | 24 | **no** |
+| `.Lanon….5` (the user string) | 26 | yes |
+| `.Lanon….877` (cross-TU constant) | 16 | **no** |
+| `.note.GNU-stack` × 2 | 0 | n/a |
+
+**~58% of the payload is unchanged content** that graft re-emits because `classify()` returns `Included` for any section with no matchable defined symbols (comment in `overlay.rs:711`). The 1655-byte `.rodata.str1.1` is *not* user strings — it's panic-info file paths from LTO-inlined `panic_const_*` sites. The user-visible "Howdy from ESP32-S3! tick=" lives in a per-literal `.Lanon` section (26 bytes).
+
+So the per-string sub-sectioning idea (M1.i followup #2) is mis-targeted for our actual edit costs — the *real* gap is anonymous-section classification.
+
+### M1.m.1 — drop non-allocated sections from the graph
+
+`.note.GNU-stack` (and similar SHF_ALLOC=0 metadata sections) shouldn't be graph nodes. Zero-byte, but they pollute the closure dump and waste classify() work. One-line filter in `scan.rs` at graph construction.
+
+### M1.m.2 — content-match path for anonymous sections
+
+For sections with `STT_SECTION`-only definitions (`.rodata.str1.*`, `.rodata..Lanon.*`, `.eh_frame`, etc.), classify currently bails to `Included`. Two parts to a fix:
+
+- **Detection**: scan.rs emits synthetic locals for these sections (e.g., `__graft_anon@<tu_id>:<section_name>`), tu-keyed so the same anonymous section in two TUs doesn't collide. trans_hash for each goes into symhash.
+- **Resolution**: at base-link time, graft injects anchor symbols (similar to the slack-`.o` trick) at the start of each tracked anonymous section, so overlay's link can PROVIDE a stable base-side address. Without anchors, overlay can't refer to base's content — the merged-strings dedup pass means there's no canonical "address of `.rodata.str1.1` from cgu.0.o" in base.elf.
+
+Estimated payload reduction on the current fixture: ~1700 bytes (~58%). The remaining ~1200 bytes are `graft_entry` itself plus the user string — what we'd want.
+
+Caveat: synthetic anchors may interact with ld's `--gc-sections` or `SHF_MERGE` dedup. Anchor symbols would need either `KEEP()` or `--undefined=` to survive, and probably need to *not* land inside a mergeable section (so they sit at a stable address rather than being deduplicated away).
+
 ## Things that turned out to not matter (or got simpler)
 
 - **Per-call-site `l32r` literals.** Not needed — only one

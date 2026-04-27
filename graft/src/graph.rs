@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use crate::elf::{ParsedObject, SymbolBind};
+use object::elf::SHF_ALLOC;
 
 pub type NodeId = u32;
 
@@ -60,7 +61,16 @@ pub fn build(objects: &[ParsedObject]) -> Graph {
     let mut nodes: Vec<NodeMeta> = Vec::new();
     let mut node_of: HashMap<(u32, u32), NodeId> = HashMap::new();
     for (oi, obj) in objects.iter().enumerate() {
-        for (si, _) in obj.sections.iter().enumerate() {
+        for (si, sec) in obj.sections.iter().enumerate() {
+            // Skip non-allocated sections (`.note.GNU-stack`, `.comment`,
+            // debug info, etc.) — they don't reach runtime, so they can't
+            // be reached by the closure walk and shouldn't pollute it.
+            // Anything with `SHF_ALLOC` clear lives only in the object
+            // file; relocs targeting such a section (rare in practice)
+            // resolve to nothing and end up as external sentinels.
+            if sec.sh_flags & u64::from(SHF_ALLOC) == 0 {
+                continue;
+            }
             let nid = nodes.len() as NodeId;
             nodes.push(NodeMeta { object: oi as u32, section: si as u32 });
             node_of.insert((oi as u32, si as u32), nid);
@@ -105,16 +115,19 @@ pub fn build(objects: &[ParsedObject]) -> Graph {
     let mut external_counts: Vec<u32> = vec![0; nodes.len()];
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
-            let nid = node_of[&(oi as u32, si as u32)];
+            let Some(&nid) = node_of.get(&(oi as u32, si as u32)) else {
+                continue; // section was filtered (non-allocated)
+            };
             for r in &sec.relocs {
                 // STT_SECTION / direct-section targets are encoded as
                 // `<section:name>` by elf::parse. Resolve those within
                 // the current object's sections; everything else goes
-                // through the flat symbol index.
+                // through the flat symbol index. A target that resolves
+                // to a filtered section becomes an external sentinel.
                 let target = if let Some(sec_name) = strip_section_marker(&r.target) {
                     section_by_name_per_obj[oi]
                         .get(sec_name)
-                        .map(|&s_i| node_of[&(oi as u32, s_i)])
+                        .and_then(|&s_i| node_of.get(&(oi as u32, s_i)).copied())
                 } else {
                     symbols
                         .resolve_global(&r.target)
