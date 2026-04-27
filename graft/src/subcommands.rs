@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::{combine, elf_attach, metadata};
+use crate::{combine, elf_attach, metadata, scan};
 
 pub fn cache_info(args: &[String]) -> ExitCode {
     let path = match args.first() {
@@ -121,4 +121,65 @@ pub fn combine(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Scan a set of inputs and dump per-section content/reloc fingerprints.
+/// Output is one line per allocated section, in a stable text format
+/// suitable for diffing two scans of the "same" inputs (e.g. before
+/// and after a source change) to see which sections drifted and why.
+///
+/// Format:
+///   <obj-basename>	<section-name>	bytes=<hash>	relocs=<hash>	[reloc:target+addend ...]
+///
+/// `bytes` is blake3 of the section bytes (truncated to 8 bytes hex).
+/// `relocs` is blake3 of postcard-encoded reloc list (same input
+/// graft uses to compute per-section content-hash). Each reloc is
+/// rendered as `<target>+<addend>` for inspection.
+pub fn scan_dump(args: &[String]) -> ExitCode {
+    if args.is_empty() {
+        eprintln!("usage: graft scan-dump <input>...");
+        return ExitCode::from(2);
+    }
+    let inputs: Vec<_> = args.iter().map(std::path::PathBuf::from).collect();
+    let scan_result = match scan::run(&inputs) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("graft scan-dump: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
+    let h8 = |bytes: &[u8]| -> String {
+        bytes.iter().take(8).map(|b| format!("{b:02x}")).collect()
+    };
+
+    for (nid, nm) in scan_result.graph.nodes.iter().enumerate() {
+        let obj = &scan_result.objects[nm.object as usize];
+        let sec = &obj.sections[nm.section as usize];
+        let obj_name = scan_result.inputs[nm.object as usize].label();
+
+        let bytes_hash = h8(blake3::hash(&sec.bytes).as_bytes());
+        let reloc_blob = postcard::to_allocvec(&sec.relocs).unwrap_or_default();
+        let relocs_hash = h8(blake3::hash(&reloc_blob).as_bytes());
+        let trans_hash: String = scan_result.trans_hash[nid]
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+
+        let _ = write!(
+            out,
+            "{obj_name}\t{}\tbytes={bytes_hash}\trelocs={relocs_hash}\ttrans={trans_hash}",
+            sec.name,
+        );
+        for r in &sec.relocs {
+            let _ = write!(out, "\t{}+{}", r.target, r.addend);
+        }
+        let _ = writeln!(out);
+    }
+    ExitCode::SUCCESS
 }

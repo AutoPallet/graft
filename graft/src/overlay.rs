@@ -711,6 +711,7 @@ fn classify(nid: NodeId, scan: &ScanResult, base: &BaseMetadata) -> Classificati
     let mut any_match = false;
     let mut any_defined_symbol = false;
 
+    let dump_path = std::env::var("GRAFT_DEBUG_MISMATCH").ok();
     for &sym_idx in &sec.defined_symbols {
         let sym = &obj.symbols[sym_idx];
         if sym.name.is_empty() {
@@ -723,6 +724,14 @@ fn classify(nid: NodeId, scan: &ScanResult, base: &BaseMetadata) -> Classificati
                     if e.trans_hash == th {
                         any_match = true;
                         globals.push((sym.name.clone(), e.address, e.size));
+                    } else if let Some(p) = dump_path.as_ref() {
+                        let bh: String = e.trans_hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+                        let oh: String = th[..8].iter().map(|b| format!("{b:02x}")).collect();
+                        let _ = std::fs::OpenOptions::new()
+                            .create(true).append(true).open(p)
+                            .and_then(|mut f| std::io::Write::write_all(&mut f,
+                                format!("G {} base={bh} overlay={oh} sec={}\n",
+                                    sym.name, sec.name).as_bytes()));
                     }
                 }
             }
@@ -731,6 +740,14 @@ fn classify(nid: NodeId, scan: &ScanResult, base: &BaseMetadata) -> Classificati
                     if e.trans_hash == th {
                         any_match = true;
                         locals.push((sym.name.clone(), obj.tu_id, e.address, e.size));
+                    } else if let Some(p) = dump_path.as_ref() {
+                        let bh: String = e.trans_hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+                        let oh: String = th[..8].iter().map(|b| format!("{b:02x}")).collect();
+                        let _ = std::fs::OpenOptions::new()
+                            .create(true).append(true).open(p)
+                            .and_then(|mut f| std::io::Write::write_all(&mut f,
+                                format!("L {} base={bh} overlay={oh} sec={}\n",
+                                    sym.name, sec.name).as_bytes()));
                     }
                 }
             }

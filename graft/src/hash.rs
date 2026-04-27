@@ -23,7 +23,7 @@
 //! Successor hashes are sorted so edge-order shifts (e.g. reloc
 //! dedup / resort) don't affect the result.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::graph::{Graph, SccResult};
 use crate::elf::{CanonicalReloc, ParsedObject};
@@ -39,15 +39,31 @@ pub fn compute(
     graph: &Graph,
     scc: &SccResult,
 ) -> Vec<TransHash> {
-    // Per-member hash input: blake3(bytes || postcard(canonical_relocs)).
+    // Two-pass member hashing. Pass 1: per-section blake3 of just the
+    // section bytes — used as a stable content fingerprint that
+    // doesn't depend on names, ordering, or other build-time noise.
+    // Pass 2: full per-section hash (bytes + canonicalized reloc list,
+    // where reloc target names are rewritten to content-fingerprints
+    // whenever the name itself is build-time noise — see
+    // `canonicalize_target`).
+    let bytes_hashes: Vec<blake3::Hash> = graph
+        .nodes
+        .iter()
+        .map(|nm| {
+            blake3::hash(&objects[nm.object as usize].sections[nm.section as usize].bytes)
+        })
+        .collect();
+    let resolver = ContentResolver::build(objects, graph, &bytes_hashes);
+
     let member_input_hash: Vec<blake3::Hash> = graph
         .nodes
         .iter()
         .map(|nm| {
-            let sec = &objects[nm.object as usize].sections[nm.section as usize];
+            let obj = &objects[nm.object as usize];
+            let sec = &obj.sections[nm.section as usize];
             let mut h = blake3::Hasher::new();
             h.update(&sec.bytes);
-            let encoded = encode_relocs(&sec.relocs);
+            let encoded = encode_relocs(&sec.relocs, nm.object, obj.tu_id, &resolver);
             h.update(&encoded);
             h.finalize()
         })
@@ -99,8 +115,135 @@ pub fn compute(
     }).collect()
 }
 
-fn encode_relocs(relocs: &[CanonicalReloc]) -> Vec<u8> {
+fn encode_relocs(
+    relocs: &[CanonicalReloc],
+    obj_idx: u32,
+    tu_id: [u8; 8],
+    resolver: &ContentResolver,
+) -> Vec<u8> {
     // postcard gives us a stable, compact, order-preserving encoding of
-    // the sorted reloc list. Relocs are pre-sorted by parse().
-    postcard::to_allocvec(relocs).unwrap_or_default()
+    // the sorted reloc list. Relocs are pre-sorted by parse(). Before
+    // encoding, rewrite each in-scope reloc target as a content
+    // fingerprint of its target section so two scans of the same
+    // source produce byte-identical encodings under any compiler-
+    // internal renaming (CGU re-partitioning, .llvm.<id> suffix
+    // drift, STT_SECTION-vs-symbol-target form changes).
+    let canonical: Vec<CanonicalReloc> = relocs
+        .iter()
+        .map(|r| CanonicalReloc {
+            offset: r.offset,
+            target: resolver.canonicalize_target(&r.target, obj_idx, tu_id),
+            r_type: r.r_type,
+            addend: r.addend,
+        })
+        .collect();
+    postcard::to_allocvec(&canonical).unwrap_or_default()
+}
+
+/// Rewrite each reloc target name to a *content fingerprint* of the
+/// section the target ultimately resolves to (when it's in-scope), so
+/// `member_input_hash` is invariant under any build-time renaming
+/// where the target's identity is content-defined.
+///
+/// Two scans of the same source can disagree on a reloc target's
+/// name in three observed ways, none of which change semantics:
+///
+/// 1. **CGU re-partition shifts STT_SECTION targets.** When cargo
+///    incremental re-emits a CGU, identical functions can be moved
+///    to a different CGU with a different fingerprint, which changes
+///    section names like `.text.<mangled>.llvm.<id>` and
+///    `.rodata..Lanon.<fp>.<n>`.
+/// 2. **STT_SECTION ↔ symbol reloc form.** A reloc that's a
+///    section-target (`<section:...>`) in one CGU layout becomes a
+///    global-symbol reloc when the target ends up in a different
+///    object file under another layout.
+/// 3. **`.llvm.<digits>` internal-linkage suffix drift.** rustc
+///    appends a per-build suffix derived from CGU content; identical
+///    functions get different suffixes when partitioning shifts.
+///
+/// All three become noise if we encode each in-scope target as
+/// `@<bytes_hash>` instead of by its name. Out-of-scope targets
+/// (genuine externals) keep their name, which is fine because the
+/// SCC trans_hash already includes a separate external sentinel
+/// count for those.
+struct ContentResolver {
+    /// (object_idx, section_name) → 8-byte content fingerprint.
+    /// Used for `<section:NAME>` reloc-target resolution. Keyed
+    /// per-object because multiple objects can have sections of the
+    /// same name (e.g., every CGU emits `.text`).
+    section: HashMap<(u32, String), [u8; 8]>,
+    /// Global symbol name → defining-section content fingerprint.
+    /// Same name across objects collapses to one entry — globals are
+    /// (by definition) unique by name, so identical content is
+    /// expected.
+    global: HashMap<String, [u8; 8]>,
+    /// (local symbol name, defining tu_id) → defining-section
+    /// content fingerprint. Locals can repeat by name across TUs;
+    /// the tu_id disambiguates.
+    local: HashMap<(String, [u8; 8]), [u8; 8]>,
+}
+
+impl ContentResolver {
+    fn build(
+        objects: &[ParsedObject],
+        graph: &Graph,
+        bytes_hashes: &[blake3::Hash],
+    ) -> Self {
+        use crate::elf::SymbolBind;
+        let mut section = HashMap::new();
+        let mut global = HashMap::new();
+        let mut local = HashMap::new();
+        for (nid, nm) in graph.nodes.iter().enumerate() {
+            let mut h = [0u8; 8];
+            h.copy_from_slice(&bytes_hashes[nid].as_bytes()[..8]);
+            let obj = &objects[nm.object as usize];
+            let sec = &obj.sections[nm.section as usize];
+            section.insert((nm.object, sec.name.clone()), h);
+            for &sym_idx in &sec.defined_symbols {
+                let sym = &obj.symbols[sym_idx];
+                if sym.name.is_empty() {
+                    continue;
+                }
+                match sym.bind {
+                    SymbolBind::Global | SymbolBind::Weak => {
+                        global.insert(sym.name.clone(), h);
+                    }
+                    SymbolBind::Local => {
+                        local.insert((sym.name.clone(), obj.tu_id), h);
+                    }
+                }
+            }
+        }
+        Self { section, global, local }
+    }
+
+    fn canonicalize_target(&self, name: &str, obj_idx: u32, tu_id: [u8; 8]) -> String {
+        // Section-targeted reloc.
+        if let Some(inner) = name.strip_prefix("<section:").and_then(|s| s.strip_suffix('>'))
+            && let Some(h) = self.section.get(&(obj_idx, inner.to_string()))
+        {
+            return format!("@{}", hex8(h));
+        }
+        // Global symbol reloc. Look up by full name (with whatever
+        // `.llvm.<id>` suffix it carries — both base and overlay see
+        // the same suffix when the target is in-scope, since the
+        // suffix comes from the target's own CGU). Falls through if
+        // the symbol isn't in our inputs (e.g., resolved later via
+        // `-l<lib>` static archive that scan doesn't see, or libc).
+        if let Some(h) = self.global.get(name) {
+            return format!("@{}", hex8(h));
+        }
+        // Local symbol reloc.
+        if let Some(h) = self.local.get(&(name.to_string(), tu_id)) {
+            return format!("@{}", hex8(h));
+        }
+        // Out-of-scope target: keep the original name. The SCC
+        // walker counts these as externals (sentinel hash), so the
+        // name itself is never compared between scans.
+        name.to_string()
+    }
+}
+
+fn hex8(bytes: &[u8; 8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
