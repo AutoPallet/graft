@@ -6,9 +6,11 @@ fn main() {
     let sum = base::compute(data);
     let mixed = base::mix(data, black_box(17));
     let doubled = base::dispatch(&|x| x.wrapping_mul(2), black_box(21));
+    let cshim = base::cshim(black_box(10));
 
     println!("{msg}");
     println!("sum = {sum}");
     println!("mixed = {mixed}");
     println!("doubled = {doubled}");
+    println!("cshim = {cshim}");
 }

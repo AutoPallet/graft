@@ -26,3 +26,15 @@ pub fn mix(xs: &[u32], salt: u32) -> u32 {
 pub fn dispatch(f: &dyn Fn(u32) -> u32, x: u32) -> u32 {
     f(x)
 }
+
+// Forwards into the C static-archive shim. `outer` calls `inner`
+// across a different `.o` in the same archive, so an overlay edit
+// to `inner.c` must drag `outer.o` into the closure too — the
+// archive-walking case that's not exercised by Rust-only fixtures.
+unsafe extern "C" {
+    fn cshim_outer(x: core::ffi::c_uint) -> core::ffi::c_uint;
+}
+
+pub fn cshim(x: u32) -> u32 {
+    unsafe { cshim_outer(x) }
+}

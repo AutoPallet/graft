@@ -2,10 +2,14 @@
 //! e2e/x86 fixture's built objects; self-skips if the fixture hasn't been
 //! built yet.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use graft::prune;
+
+fn empty_resolver() -> (HashMap<String, u64>, HashMap<(String, [u8; 8]), u64>) {
+    (HashMap::new(), HashMap::new())
+}
 
 fn fixture_deps() -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -43,7 +47,9 @@ fn prune_keep_all_preserves_shape() {
         keep.insert(idx0);
     }
 
-    let result = prune::prune_object(&bytes, [0; 8], &keep)
+    let (g, l) = empty_resolver();
+    let resolver = prune::BaseResolver { globals: &g, locals: &l };
+    let result = prune::prune_object(&bytes, [0; 8], &keep, &resolver)
         .unwrap_or_else(|e| panic!("prune {}: {e:#}", path.display()));
     // Re-parse.
     let _ = object::File::parse(&*result.bytes)
@@ -65,11 +71,13 @@ fn prune_keep_none_still_parses() {
 
     // Drop every section.
     let keep: HashSet<u32> = HashSet::new();
-    let result = prune::prune_object(&bytes, [0xAB; 8], &keep).unwrap_or_else(|e| {
+    let (g, l) = empty_resolver();
+    let resolver = prune::BaseResolver { globals: &g, locals: &l };
+    let result = prune::prune_object(&bytes, [0xAB; 8], &keep, &resolver).unwrap_or_else(|e| {
         // If there are relocs into sections we dropped, we expect an error.
         // That's OK — just make sure we fail cleanly, not panic.
         eprintln!("(expected) keep-none errored: {e:#}");
-        return prune::Pruned { bytes: Vec::new(), kept_sections: 0, renamed_locals: 0 };
+        prune::Pruned { bytes: Vec::new(), kept_sections: 0, abs_rewrites: 0 }
     });
     if !result.bytes.is_empty() {
         let _ = object::File::parse(&*result.bytes).unwrap();

@@ -85,9 +85,13 @@ pub fn build(objects: &[ParsedObject]) -> Graph {
             let Some(&nid) = node_of.get(&(oi as u32, sec_idx as u32)) else { continue };
             match sym.bind {
                 SymbolBind::Global | SymbolBind::Weak => {
-                    // Globals are unambiguous by name; last-write-wins on
-                    // duplicates (which should only happen for weak overrides).
-                    symbols.globals.insert(sym.name.clone(), nid);
+                    // First-write-wins on duplicate globals — mirrors
+                    // ld's archive-resolution semantics (left-to-right
+                    // argv search, first defining archive binds). Order-
+                    // independent across base/overlay scans, which load
+                    // archives in different sequences once lazy
+                    // discovery lands.
+                    symbols.globals.entry(sym.name.clone()).or_insert(nid);
                 }
                 SymbolBind::Local => {
                     symbols.locals.insert((sym.name.clone(), obj.tu_id), nid);

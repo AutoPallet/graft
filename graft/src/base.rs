@@ -7,7 +7,6 @@
 //! `.graft.manifest` + `.graft.symhash` as SHF_ALLOC=0 sections.
 
 use std::io::Write;
-use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -54,10 +53,13 @@ fn run(argv: Vec<String>) -> Result<()> {
     // same files (read-only), so there's no contention. Scan sees only
     // the user-supplied inputs — the synthetic slack `.o` (if any) is
     // pure linker-side machinery and shouldn't appear in the call graph.
-    let scan_inputs: Vec<PathBuf> = link_args.inputs.clone();
+    let driver = crate::argv::driver_path(&argv);
+    let (eager_inputs, deferred_inputs) =
+        crate::overlay::resolve_scan_inputs(&link_args, &driver);
+    let extra_roots = link_args.undefined.clone();
     let scan_handle = std::thread::spawn(move || {
         let t = std::time::Instant::now();
-        let r = scan::run(&scan_inputs);
+        let r = scan::run(&eager_inputs, &deferred_inputs, &extra_roots);
         (r, t.elapsed())
     });
 

@@ -65,9 +65,11 @@ fn run(argv: Vec<String>) -> Result<()> {
         .map_err(|_| anyhow!("GRAFT_BASE_ELF not set"))?;
     let base = load_base_metadata(&base_path)?;
 
-    let scan_inputs: Vec<PathBuf> = link_args.inputs.clone();
+    let driver = crate::argv::driver_path(&argv);
+    let (eager_inputs, deferred_inputs) = resolve_scan_inputs(&link_args, &driver);
     let t_scan_start = std::time::Instant::now();
-    let scan = scan::run(&scan_inputs).context("overlay pre-scan")?;
+    let scan = scan::run(&eager_inputs, &deferred_inputs, &link_args.undefined)
+        .context("overlay pre-scan")?;
     let t_scan = t_scan_start.elapsed();
 
     let t_closure_start = std::time::Instant::now();
@@ -85,16 +87,44 @@ fn run(argv: Vec<String>) -> Result<()> {
     std::fs::create_dir_all(&work_dir)
         .with_context(|| format!("create {}", work_dir.display()))?;
 
+    // Build base symbol resolver: every defined symbol in base.elf's
+    // .symtab keyed by name (catches static-lib symbols rustc never
+    // saw), plus tu-id-discriminated locals from base's .graft.symhash
+    // (the elf scan can't disambiguate same-named locals across TUs;
+    // base scan recorded the tu_ids).
+    let base_resolver_globals = collect_base_globals(&base_path)?;
+    let base_resolver_locals: HashMap<(String, [u8; 8]), u64> = base
+        .symhash_by_local
+        .iter()
+        .map(|((n, t), e)| ((n.clone(), *t), e.address))
+        .collect();
+    let base_resolver = prune::BaseResolver {
+        globals: &base_resolver_globals,
+        locals: &base_resolver_locals,
+    };
+
     // Prune each source object; collect the pruned-.o paths.
     let t_prune_start = std::time::Instant::now();
-    let pruned = prune_all(&scan, &closure, &work_dir)?;
+    let pruned = prune_all(&scan, &closure, &base_resolver, &work_dir)?;
     let t_prune = t_prune_start.elapsed();
-    let renamed_total: usize = pruned.iter().map(|p| p.renamed_locals).sum();
+    let abs_rewrites_total: usize = pruned.iter().map(|p| p.abs_rewrites).sum();
     let kept_sec_total: usize = pruned.iter().map(|p| p.kept_sections).sum();
 
-    // Write base_symbols.ld.
-    let ld_script = work_dir.join("base_symbols.ld");
-    write_base_symbols_ld(&closure, &ld_script)?;
+    // Compute the set of `-l<name>` flags the link argv should drop:
+    // every name whose resolved archive path was actually walked by
+    // scan. Walked archives are now in `pruned` as filtered `.a`s; if
+    // we left the original `-l<name>` in, ld would pull the unfiltered
+    // version alongside, causing duplicate symbols.
+    let stripped_libs: HashSet<String> = link_args
+        .libs
+        .iter()
+        .filter_map(|name| {
+            let path = crate::argv::resolve_lib(name, &link_args.library_paths)
+                .or_else(|| crate::argv::resolve_lib_via_driver(name, &driver))?;
+            let canon = std::fs::canonicalize(&path).unwrap_or(path);
+            scan.walked_archives.contains(&canon).then(|| name.clone())
+        })
+        .collect();
 
     // Overlay is a **full** static link — every symbol it references is
     // either defined in the closure's own pruned .o's or PROVIDEd at a
@@ -151,17 +181,6 @@ fn run(argv: Vec<String>) -> Result<()> {
         write_overlay_layout_ld(&layout_script, overlay_base_addr)?;
     }
 
-    // Extend base_symbols.ld with PROVIDEs for *every* symbol in base's
-    // .symtab. The closure walk only gives us ones we saw reloc-targeted,
-    // but overlay's link (with `--no-undefined`-like semantics) will
-    // want every weak-personality ref, unwind table, libc internal
-    // resolvable. Reading base.elf's symtab directly is authoritative
-    // — it includes symbols from static libraries (`libunwind.a`,
-    // `libc.a`) that scan never saw because they come through `-l`
-    // rather than as `.o` / `.rlib` inputs.
-    let all_base_syms_script = work_dir.join("base_addresses.ld");
-    write_all_base_symbols_ld(&base_path, &all_base_syms_script)?;
-
     let overlay_elf = work_dir.join("overlay.elf");
     let t_link_start = std::time::Instant::now();
     if pruned.is_empty() {
@@ -169,12 +188,11 @@ fn run(argv: Vec<String>) -> Result<()> {
     } else {
         let ld_status = run_real_linker(
             &pruned,
-            &ld_script,
-            &all_base_syms_script,
             &layout_script,
             &overlay_elf,
             xtensa_layout.as_ref(),
             &argv,
+            &stripped_libs,
             base.manifest.entry_symbol.as_str(),
         )?;
         if !ld_status.success() {
@@ -214,8 +232,8 @@ fn run(argv: Vec<String>) -> Result<()> {
 
     let summary = format!(
         "graft overlay: base {} symhash · overlay {} objs / {} sections · \
-         closure {} sections · provides {} globals / {} locals · \
-         pruned {} objs / {} sections / {} renamed-locals · \
+         closure {} sections · \
+         pruned {} objs / {} sections / {} abs-rewrites · \
          combined {} bytes (overlay payload {} @ {:#x}, {} trampolines) · \
          scan {:.1?} · closure {:.1?} · prune {:.1?} · link {:.1?} · combine {:.1?} · \
          total {:.1?}\n\
@@ -224,11 +242,9 @@ fn run(argv: Vec<String>) -> Result<()> {
         scan.objects.len(),
         scan.graph.nodes.len(),
         closure.closure.len(),
-        closure.provide_globals.len(),
-        closure.provide_locals.len(),
         pruned.len(),
         kept_sec_total,
-        renamed_total,
+        abs_rewrites_total,
         combine_stats.combined_size,
         combine_stats.overlay_load_size,
         combine_stats.overlay_vaddr,
@@ -253,6 +269,37 @@ fn run(argv: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// Compose the scan inputs, split into eager and deferred buckets:
+///   - **eager**: `.o` and `.rlib` paths that always parse fully.
+///   - **deferred**: `.a` archives (direct paths from argv + every
+///     `-l<name>` resolved against `-L` paths or the driver sysroot)
+///     where members get parsed only when reachability demands it.
+/// `-l<name>` flags that don't resolve are skipped (e.g. linker-script
+/// stubs that ld processes directly); the link step still gets them
+/// via forwarded argv.
+pub(crate) fn resolve_scan_inputs(
+    args: &crate::argv::LinkArgs,
+    driver: &Path,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut eager: Vec<PathBuf> = Vec::new();
+    let mut deferred: Vec<PathBuf> = Vec::new();
+    for p in &args.inputs {
+        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
+        match ext {
+            "a" => deferred.push(p.clone()),
+            _ => eager.push(p.clone()),
+        }
+    }
+    for name in &args.libs {
+        let resolved = crate::argv::resolve_lib(name, &args.library_paths)
+            .or_else(|| crate::argv::resolve_lib_via_driver(name, driver));
+        if let Some(path) = resolved {
+            deferred.push(path);
+        }
+    }
+    (eager, deferred)
+}
+
 fn work_dir_for(output: &Path) -> PathBuf {
     // `target/debug/app` → `target/debug/app.graft-work`
     let mut p = output.as_os_str().to_os_string();
@@ -263,10 +310,23 @@ fn work_dir_for(output: &Path) -> PathBuf {
 struct PrunedEntry {
     path: PathBuf,
     kept_sections: usize,
-    renamed_locals: usize,
+    abs_rewrites: usize,
+    /// If true, this entry is a filtered archive (`.a` file) graft
+    /// emitted from pruned members. Wrap with
+    /// `-Wl,--whole-archive .. -Wl,--no-whole-archive` when invoking
+    /// ld so it doesn't require a symbol table (the `ar` crate
+    /// doesn't emit one) and so every pruned member is force-loaded
+    /// (graft already filtered to closure-touching members; demand-
+    /// loading is unnecessary).
+    is_archive: bool,
 }
 
-fn prune_all(scan: &ScanResult, closure: &Closure, work_dir: &Path) -> Result<Vec<PrunedEntry>> {
+fn prune_all(
+    scan: &ScanResult,
+    closure: &Closure,
+    base_resolver: &prune::BaseResolver<'_>,
+    work_dir: &Path,
+) -> Result<Vec<PrunedEntry>> {
     // Group closure sections by object.
     let mut by_obj: HashMap<u32, HashSet<u32>> = HashMap::new();
     for &nid in &closure.closure {
@@ -274,33 +334,101 @@ fn prune_all(scan: &ScanResult, closure: &Closure, work_dir: &Path) -> Result<Ve
         by_obj.entry(nm.object).or_default().insert(nm.section);
     }
 
-    let mut out: Vec<PrunedEntry> = Vec::new();
+    // First pass: prune each object whose sections appear in the
+    // closure. We split into two buckets: loose pruned `.o`s
+    // (member_name=None inputs) and per-archive grouped pruned
+    // members. The grouping is keyed on the archive's source path so
+    // every member of `libdeploy.rlib` gets bundled together.
+    struct LooseEntry {
+        path: PathBuf,
+        kept_sections: usize,
+        abs_rewrites: usize,
+        is_archive: bool,
+    }
+    struct ArchiveMember {
+        member_name: String,
+        bytes: Vec<u8>,
+        kept_sections: usize,
+        abs_rewrites: usize,
+    }
+    let mut loose: Vec<LooseEntry> = Vec::new();
+    let mut archives: HashMap<PathBuf, Vec<ArchiveMember>> = HashMap::new();
     for (obj_idx, keep_set) in by_obj {
         let input = &scan.inputs[obj_idx as usize];
         let parsed = &scan.objects[obj_idx as usize];
-        let p = prune::prune_object(&input.bytes, parsed.tu_id, &keep_set)
+        let p = prune::prune_object(&input.bytes, parsed.tu_id, &keep_set, base_resolver)
             .with_context(|| format!("prune {}", input.label()))?;
-        // Derive a stable filename — rcgu-object basename, flattened.
-        let stem = input
-            .member_name
-            .as_deref()
-            .map(|n| n.replace('/', "_"))
-            .unwrap_or_else(|| {
-                input
+        match input.member_name.as_deref() {
+            None => {
+                // Loose .o input. Write to work_dir as a standalone file.
+                let stem = input
                     .source_path
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("obj")
-                    .to_string()
-            });
-        let filename = format!("{obj_idx:04}_{stem}");
-        let path = work_dir.join(&filename);
-        std::fs::write(&path, &p.bytes)
-            .with_context(|| format!("write {}", path.display()))?;
+                    .to_string();
+                let filename = format!("{obj_idx:04}_{stem}");
+                let path = work_dir.join(&filename);
+                std::fs::write(&path, &p.bytes)
+                    .with_context(|| format!("write {}", path.display()))?;
+                loose.push(LooseEntry {
+                    path,
+                    kept_sections: p.kept_sections,
+                    abs_rewrites: p.abs_rewrites,
+                    is_archive: false,
+                });
+            }
+            Some(member_name) => {
+                // Archive member. Stash for second-pass bundling.
+                archives
+                    .entry(input.source_path.clone())
+                    .or_default()
+                    .push(ArchiveMember {
+                        member_name: member_name.replace('/', "_"),
+                        bytes: p.bytes,
+                        kept_sections: p.kept_sections,
+                        abs_rewrites: p.abs_rewrites,
+                    });
+            }
+        }
+    }
+
+    // Second pass: bundle archive members into one filtered archive
+    // per source archive. ld sees only what the closure asked for —
+    // members of the original archive that no closure section
+    // referenced are not in the filtered version, so ld can't pull
+    // them in via `-u SYM` / KEEP() / undefined-symbol resolution.
+    // Filename matches the source archive's basename so
+    // `forwarded_link_args` (which strips direct-path archive inputs
+    // via `is_input`) doesn't double-feed the original.
+    let mut out: Vec<PrunedEntry> = Vec::new();
+    for entry in loose {
+        out.push(PrunedEntry {
+            path: entry.path,
+            kept_sections: entry.kept_sections,
+            abs_rewrites: entry.abs_rewrites,
+            is_archive: entry.is_archive,
+        });
+    }
+    for (source_path, members) in archives {
+        let basename = source_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("filtered");
+        let path = work_dir.join(basename);
+        let kept_sections: usize = members.iter().map(|m| m.kept_sections).sum();
+        let abs_rewrites: usize = members.iter().map(|m| m.abs_rewrites).sum();
+        let payload: Vec<(&str, &[u8])> = members
+            .iter()
+            .map(|m| (m.member_name.as_str(), m.bytes.as_slice()))
+            .collect();
+        write_filtered_archive(&path, &payload)
+            .with_context(|| format!("write filtered archive {}", path.display()))?;
         out.push(PrunedEntry {
             path,
-            kept_sections: p.kept_sections,
-            renamed_locals: p.renamed_locals,
+            kept_sections,
+            abs_rewrites,
+            is_archive: true,
         });
     }
     // Sort for deterministic linker invocation order.
@@ -308,18 +436,22 @@ fn prune_all(scan: &ScanResult, closure: &Closure, work_dir: &Path) -> Result<Ve
     Ok(out)
 }
 
-fn write_base_symbols_ld(closure: &Closure, path: &Path) -> Result<()> {
-    use std::fmt::Write;
-    let mut s = String::new();
-    writeln!(s, "/* Generated by graft overlay: PROVIDEs base addresses for overlay's UND refs. */").unwrap();
-    for (name, addr, _) in &closure.provide_globals {
-        writeln!(s, "PROVIDE({name} = {addr:#x});").unwrap();
+/// Build a Unix `ar`-format archive at `path` containing each pruned
+/// member as an entry. The `ar` crate handles long-name tables
+/// (BSD-style `#1/<n>` extended names) for member names that don't
+/// fit ar's 16-byte header field — graft's archive members from
+/// rustc rlibs typically have names like
+/// `deploy-<hash>.<cgu>.<seq>.rcgu.o` that exceed 16 bytes.
+fn write_filtered_archive(path: &Path, members: &[(&str, &[u8])]) -> Result<()> {
+    let f = std::fs::File::create(path)
+        .with_context(|| format!("create {}", path.display()))?;
+    let mut builder = ar::Builder::new(f);
+    for (name, bytes) in members {
+        let header = ar::Header::new(name.as_bytes().to_vec(), bytes.len() as u64);
+        builder
+            .append(&header, *bytes)
+            .with_context(|| format!("append {name} to {}", path.display()))?;
     }
-    for (name, tu, addr, _) in &closure.provide_locals {
-        let tu_hex: String = tu.iter().map(|b| format!("{b:02x}")).collect();
-        writeln!(s, "PROVIDE(\"{name}@{tu_hex}\" = {addr:#x});").unwrap();
-    }
-    std::fs::write(path, s).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -464,22 +596,20 @@ fn write_overlay_layout_ld(path: &Path, base_addr: u64) -> Result<()> {
     Ok(())
 }
 
-fn write_all_base_symbols_ld(base_path: &Path, path: &Path) -> Result<()> {
+/// Build a `name → vaddr` map of every defined symbol in base.elf's
+/// `.symtab`. Used by prune to resolve overlay reloc targets, and
+/// (until lazy-archive walking lands fully) emitted as a global
+/// PROVIDE script so ld can resolve UND references inside forwarded
+/// `-l<lib>` content that graft doesn't yet expand.
+/// First-seen-wins on duplicate names — base occasionally has
+/// same-named locals across TUs, but for global-name resolution any
+/// of their addresses suffices (ld would have picked one).
+fn collect_base_globals(base_path: &Path) -> Result<HashMap<String, u64>> {
     use object::{Object, ObjectSymbol};
-    use std::fmt::Write;
-
     let bytes = std::fs::read(base_path)
         .with_context(|| format!("read {}", base_path.display()))?;
     let elf = object::File::parse(&*bytes).context("parse base ELF")?;
-
-    let mut s = String::new();
-    writeln!(s, "/* Every base-defined symbol as a PROVIDE: overlay's link resolves */\n\
-                 /* UND references against these constants. Generated by graft overlay. */").unwrap();
-
-    // Deduplicate by name — base occasionally has duplicate local-scope
-    // entries with the same name across TUs; for PROVIDE purposes the
-    // first address is sufficient (ld will warn on repeats).
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut map: HashMap<String, u64> = HashMap::new();
     for sym in elf.symbols() {
         if sym.is_undefined() {
             continue;
@@ -488,23 +618,19 @@ fn write_all_base_symbols_ld(base_path: &Path, path: &Path) -> Result<()> {
             Ok(n) if !n.is_empty() => n,
             _ => continue,
         };
-        if !seen.insert(name.to_string()) {
-            continue;
-        }
-        writeln!(s, "PROVIDE(\"{name}\" = {:#x});", sym.address()).unwrap();
+        map.entry(name.to_string()).or_insert_with(|| sym.address());
     }
-    std::fs::write(path, s).with_context(|| format!("write {}", path.display()))?;
-    Ok(())
+    Ok(map)
 }
+
 
 fn run_real_linker(
     pruned: &[PrunedEntry],
-    base_symbols: &Path,
-    all_base_symbols: &Path,
     layout: &Path,
     output: &Path,
     xtensa: Option<&XtensaLayout>,
     rustc_argv: &[String],
+    stripped_libs: &HashSet<String>,
     entry_symbol: &str,
 ) -> Result<std::process::ExitStatus> {
     // Invoke the gcc-style driver rustc gave us (gcc handles `-Wl,…`,
@@ -528,14 +654,23 @@ fn run_real_linker(
     // entire pruned input.
     cmd.arg(format!("-Wl,-u,{entry_symbol}"));
 
-    // Our scripts MUST come before any of rustc's `-T` (notably
-    // linkall.x): hal-defaults.x has `PROVIDE(__post_init =
-    // no_init_hook)` which references a symbol undefined in
-    // overlay's pruned input. Our base_addresses.ld defines
-    // __post_init at base's address first, so linkall.x's PROVIDE
-    // is suppressed.
-    cmd.arg("-T").arg(base_symbols);
-    cmd.arg("-T").arg(all_base_symbols);
+    // Suppress gcc's implicit startup-file injection (`crti.o`,
+    // `crtbegin.o`, `crtend.o`, `crtn.o`). Those carry `_init`/`_fini`
+    // which the linker script's KEEP(*(.init.text)) etc. would pull
+    // into a `.iram0.vectors` segment in overlay's output — content
+    // base already has, ending up appended as a new PT_LOAD past
+    // base's IRAM. Overlay never invokes init/fini chains; base does
+    // that once at boot. -nostartfiles is per-overlay-link only;
+    // base's link still gets them through normal gcc behavior.
+    cmd.arg("-nostartfiles");
+
+    // No PROVIDE-based symbol resolution: every base-bound reloc in
+    // graft's pruned `.o`s is already encoded as
+    // `(__graft_const, base_vaddr + addend)` at prune time, and every
+    // `-l<name>` archive whose content reaches the closure has been
+    // walked + emitted as a filtered `.a`. Linker scripts that
+    // PROVIDE() defaults for would-be-UND base symbols are harmless:
+    // nothing references those names anymore.
 
     if let Some(x) = xtensa {
         // Prepend our work_dir so ld's INCLUDE "memory.x" /
@@ -551,14 +686,26 @@ fn run_real_linker(
         cmd.arg("-T").arg(layout);
     }
 
-    // Now forward rustc's link args verbatim (sans inputs and `-o`).
-    for a in crate::argv::forwarded_link_args(rustc_argv) {
+    // Forward rustc's link args (sans inputs, `-o`, walked-`-l`s and
+    // every `-L`).
+    for a in crate::argv::forwarded_link_args(rustc_argv, stripped_libs) {
         cmd.arg(a);
     }
 
     // Pruned closure inputs replace rustc's original inputs.
+    // Archive entries get bracketed with `--whole-archive` so ld
+    // accepts our `ar`-crate-emitted archives without a symbol-table
+    // index (we generate none) and so every pruned member is force-
+    // loaded — graft already filtered the archive to closure-touching
+    // members, so demand-loading would be redundant.
     for p in pruned {
-        cmd.arg(&p.path);
+        if p.is_archive {
+            cmd.arg("-Wl,--whole-archive");
+            cmd.arg(&p.path);
+            cmd.arg("-Wl,--no-whole-archive");
+        } else {
+            cmd.arg(&p.path);
+        }
     }
     let status = cmd.status().with_context(|| format!("exec {real}"))?;
     Ok(status)
@@ -614,14 +761,10 @@ fn load_base_metadata(path: &std::path::Path) -> Result<BaseMetadata> {
 
 pub(crate) struct Closure {
     /// Nodes we must include in the overlay link (their trans_hash did
-    /// not match base's).
+    /// not match base's). Sections matching base by trans_hash are
+    /// skipped at the closure-walk boundary; their content is reached
+    /// via base addresses, encoded as SHN_ABS+addend at prune time.
     pub closure: Vec<NodeId>,
-    /// Defined globals we can satisfy from base — `(name, address, size)`.
-    /// Emitted as `PROVIDE(name = 0x…);` in base_symbols.ld.
-    pub provide_globals: Vec<(String, u64, u32)>,
-    /// Defined locals we need to satisfy from base, renamed to
-    /// `<name>@<tu_id>` when pruning.
-    pub provide_locals: Vec<(String, [u8; 8], u64, u32)>,
 }
 
 fn compute_closure(
@@ -630,8 +773,6 @@ fn compute_closure(
     roots: &[NodeId],
 ) -> Result<Closure> {
     let mut closure: Vec<NodeId> = Vec::new();
-    let mut provide_globals: Vec<(String, u64, u32)> = Vec::new();
-    let mut provide_locals: Vec<(String, [u8; 8], u64, u32)> = Vec::new();
 
     // Per-node state: Unknown / Included / Provided. We don't walk into
     // nodes marked Provided — base already satisfies everything reachable
@@ -653,114 +794,75 @@ fn compute_closure(
         if decision[nid as usize] != Decision::Unknown {
             continue;
         }
-        match classify(nid, scan, base) {
-            Classification::Provided { globals, locals } => {
-                decision[nid as usize] = Decision::Provided;
-                provide_globals.extend(globals);
-                provide_locals.extend(locals);
-            }
-            Classification::Included => {
-                decision[nid as usize] = Decision::Included;
-                closure.push(nid);
-                // Walk forward reloc targets. Any already-classified
-                // node is a cache hit; Unknown nodes go back on the
-                // stack.
-                for &succ in &scan.graph.edges[nid as usize] {
-                    if decision[succ as usize] == Decision::Unknown {
-                        stack.push(succ);
-                    }
+        if classify_provided(nid, scan, base) {
+            decision[nid as usize] = Decision::Provided;
+        } else {
+            decision[nid as usize] = Decision::Included;
+            closure.push(nid);
+            for &succ in &scan.graph.edges[nid as usize] {
+                if decision[succ as usize] == Decision::Unknown {
+                    stack.push(succ);
                 }
             }
         }
     }
 
-    // Sort + dedup provides so the ld script is stable.
-    provide_globals.sort();
-    provide_globals.dedup_by(|a, b| a.0 == b.0);
-    provide_locals.sort();
-    provide_locals.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
-    // And closure for determinism.
     closure.sort();
-
-    Ok(Closure {
-        closure,
-        provide_globals,
-        provide_locals,
-    })
+    Ok(Closure { closure })
 }
 
-enum Classification {
-    Provided {
-        globals: Vec<(String, u64, u32)>,
-        locals: Vec<(String, [u8; 8], u64, u32)>,
-    },
-    Included,
-}
-
-/// Decide whether a section is Provided by base (any defined symbol in it
-/// matches base.symhash on trans_hash) or Included in overlay's link.
-fn classify(nid: NodeId, scan: &ScanResult, base: &BaseMetadata) -> Classification {
+/// Returns true iff this section can be satisfied by base — i.e. it has
+/// at least one defined symbol whose `trans_hash` matches base's symhash
+/// entry under the same name (and tu_id, for locals). Sections with no
+/// matchable symbol must be Included (no address to point a reloc at).
+fn classify_provided(nid: NodeId, scan: &ScanResult, base: &BaseMetadata) -> bool {
     let nm = &scan.graph.nodes[nid as usize];
     let obj = &scan.objects[nm.object as usize];
     let sec = &obj.sections[nm.section as usize];
     let th: TransHash = scan.trans_hash[nid as usize];
+    let dump_path = std::env::var("GRAFT_DEBUG_MISMATCH").ok();
 
-    // Collect defined symbols in this section.
-    let mut globals: Vec<(String, u64, u32)> = Vec::new();
-    let mut locals: Vec<(String, [u8; 8], u64, u32)> = Vec::new();
     let mut any_match = false;
     let mut any_defined_symbol = false;
-
-    let dump_path = std::env::var("GRAFT_DEBUG_MISMATCH").ok();
     for &sym_idx in &sec.defined_symbols {
         let sym = &obj.symbols[sym_idx];
         if sym.name.is_empty() {
             continue;
         }
         any_defined_symbol = true;
-        match sym.bind {
-            SymbolBind::Global | SymbolBind::Weak => {
-                if let Some(e) = base.symhash_by_name.get(&sym.name) {
-                    if e.trans_hash == th {
-                        any_match = true;
-                        globals.push((sym.name.clone(), e.address, e.size));
-                    } else if let Some(p) = dump_path.as_ref() {
-                        let bh: String = e.trans_hash[..8].iter().map(|b| format!("{b:02x}")).collect();
-                        let oh: String = th[..8].iter().map(|b| format!("{b:02x}")).collect();
-                        let _ = std::fs::OpenOptions::new()
-                            .create(true).append(true).open(p)
-                            .and_then(|mut f| std::io::Write::write_all(&mut f,
-                                format!("G {} base={bh} overlay={oh} sec={}\n",
-                                    sym.name, sec.name).as_bytes()));
-                    }
-                }
-            }
+        let entry = match sym.bind {
+            SymbolBind::Global | SymbolBind::Weak => base.symhash_by_name.get(&sym.name),
             SymbolBind::Local => {
-                if let Some(e) = base.symhash_by_local.get(&(sym.name.clone(), obj.tu_id)) {
-                    if e.trans_hash == th {
-                        any_match = true;
-                        locals.push((sym.name.clone(), obj.tu_id, e.address, e.size));
-                    } else if let Some(p) = dump_path.as_ref() {
-                        let bh: String = e.trans_hash[..8].iter().map(|b| format!("{b:02x}")).collect();
-                        let oh: String = th[..8].iter().map(|b| format!("{b:02x}")).collect();
-                        let _ = std::fs::OpenOptions::new()
-                            .create(true).append(true).open(p)
-                            .and_then(|mut f| std::io::Write::write_all(&mut f,
-                                format!("L {} base={bh} overlay={oh} sec={}\n",
-                                    sym.name, sec.name).as_bytes()));
-                    }
-                }
+                base.symhash_by_local.get(&(sym.name.clone(), obj.tu_id))
             }
+        };
+        let Some(e) = entry else { continue };
+        if e.trans_hash == th {
+            any_match = true;
+        } else if let Some(p) = dump_path.as_ref() {
+            let bh: String = e.trans_hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+            let oh: String = th[..8].iter().map(|b| format!("{b:02x}")).collect();
+            let tag = match sym.bind {
+                SymbolBind::Local => 'L',
+                _ => 'G',
+            };
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .and_then(|mut f| {
+                    std::io::Write::write_all(
+                        &mut f,
+                        format!(
+                            "{tag} {} base={bh} overlay={oh} sec={}\n",
+                            sym.name, sec.name
+                        )
+                        .as_bytes(),
+                    )
+                });
         }
     }
-
-    // A section with no defined symbols we can match can't be Provided —
-    // we have no address to point at. (Examples: `.eh_frame` fragments,
-    // `.rodata..Lanon.*` constants with no exported name.) Include it.
-    if !any_defined_symbol || !any_match {
-        return Classification::Included;
-    }
-    Classification::Provided { globals, locals }
+    any_defined_symbol && any_match
 }
 
 fn format_closure_dump(scan: &ScanResult, c: &Closure) -> Vec<u8> {
@@ -773,15 +875,6 @@ fn format_closure_dump(scan: &ScanResult, c: &Closure) -> Vec<u8> {
         let sec = &obj.sections[nm.section as usize];
         let label = scan.inputs[nm.object as usize].label();
         let _ = writeln!(s, "  [{nid}] {label} :: {} ({} bytes)", sec.name, sec.bytes.len());
-    }
-    let _ = writeln!(s, "provides globals ({}):", c.provide_globals.len());
-    for (n, addr, sz) in &c.provide_globals {
-        let _ = writeln!(s, "  {n} = {addr:#x} ({sz} bytes)");
-    }
-    let _ = writeln!(s, "provides locals ({}):", c.provide_locals.len());
-    for (n, tu, addr, sz) in &c.provide_locals {
-        let tu_hex: String = tu.iter().map(|b| format!("{b:02x}")).collect();
-        let _ = writeln!(s, "  {n}@{tu_hex} = {addr:#x} ({sz} bytes)");
     }
     s.into_bytes()
 }

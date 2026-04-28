@@ -13,6 +13,14 @@ pub struct LinkArgs {
     /// / `--undefined` (either directly or via `-Wl,`). ld treats these
     /// as gc-sections roots, so we do too.
     pub undefined: Vec<String>,
+    /// `-l<name>` flags rustc / gcc forwarded — each names an archive
+    /// (`lib<name>.a`) ld would search for and link. We resolve them
+    /// against `library_paths` so scan can walk them like any other
+    /// `.a` input.
+    pub libs: Vec<String>,
+    /// `-L<path>` library-search paths the link argv accumulates.
+    /// ld walks them in order to resolve `-l<name>` flags.
+    pub library_paths: Vec<PathBuf>,
 }
 
 pub fn parse(argv: &[String]) -> LinkArgs {
@@ -46,12 +54,98 @@ pub fn parse(argv: &[String]) -> LinkArgs {
             i += if sym.consumed_next { 2 } else { 1 };
             continue;
         }
+        // -l<name> / -l <name>: archive lookup. ld searches lib<name>.a
+        // (and lib<name>.so) in -L paths + sysroot defaults.
+        if a == "-l" {
+            if let Some(v) = argv.get(i + 1) {
+                out.libs.push(v.clone());
+                i += 2;
+                continue;
+            }
+        }
+        if let Some(v) = a.strip_prefix("-l")
+            && !v.is_empty()
+            && !v.starts_with('-')
+        {
+            out.libs.push(v.to_string());
+            i += 1;
+            continue;
+        }
+        // -L<path> / -L <path>: library search path.
+        if a == "-L" {
+            if let Some(v) = argv.get(i + 1) {
+                out.library_paths.push(PathBuf::from(v));
+                i += 2;
+                continue;
+            }
+        }
+        if let Some(v) = a.strip_prefix("-L")
+            && !v.is_empty()
+        {
+            out.library_paths.push(PathBuf::from(v));
+            i += 1;
+            continue;
+        }
         if is_input(a) {
             out.inputs.push(PathBuf::from(a));
         }
         i += 1;
     }
     out
+}
+
+/// Resolve a `-l<name>` flag to the archive path the linker would
+/// pick. Walks `library_paths` in order, returning the first
+/// `lib<name>.a` that exists. Falls back to the C compiler driver's
+/// `-print-file-name=lib<name>.a` for archives that live in gcc's
+/// own sysroot (libc, libm, libgcc, libstdc++ — not exposed via
+/// argv `-L` flags). Returns `None` if neither finds a match.
+pub fn resolve_lib(name: &str, library_paths: &[PathBuf]) -> Option<PathBuf> {
+    for dir in library_paths {
+        let candidate = dir.join(format!("lib{name}.a"));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Like `resolve_lib`, but for archives in the C compiler's own
+/// sysroot (libc / libgcc / libm / libstdc++). Falls through to
+/// `<driver> -print-file-name=lib<name>.a`. The returned path
+/// exists on disk; `None` means the driver couldn't resolve.
+pub fn resolve_lib_via_driver(name: &str, driver: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new(driver)
+        .arg(format!("-print-file-name=lib{name}.a"))
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let line = std::str::from_utf8(&out.stdout).ok()?.trim();
+    if line.is_empty() || line == format!("lib{name}.a") {
+        // gcc echoes the input back when it can't find it.
+        return None;
+    }
+    let p = PathBuf::from(line);
+    p.is_file().then_some(p)
+}
+
+/// Pull the real-linker path out of the argv. Today this is the
+/// `--ldproxy-linker <path>` arg ldproxy mode injects (esp-idf-sys
+/// build script wires it in); future driver wrappers can be added
+/// here. Falls back to `GRAFT_REAL_LD` env (default `cc`).
+pub fn driver_path(argv: &[String]) -> PathBuf {
+    let mut i = 0;
+    while i < argv.len() {
+        if argv[i] == "--ldproxy-linker"
+            && let Some(v) = argv.get(i + 1)
+        {
+            return PathBuf::from(v);
+        }
+        i += 1;
+    }
+    PathBuf::from(std::env::var("GRAFT_REAL_LD").unwrap_or_else(|_| "cc".into()))
 }
 
 struct Undefined<'a> {
@@ -110,25 +204,64 @@ pub fn is_input(s: &str) -> bool {
 
 /// Walk rustc-provided link argv, yielding everything overlay mode
 /// wants to forward verbatim to the real linker — that is, everything
-/// EXCEPT the inputs (replaced by the pruned objects) and the `-o`
-/// output flag (replaced by overlay's own output path).
+/// EXCEPT:
+///   - inputs (`is_input`): replaced by graft's pruned objects.
+///   - `-o <out>`: replaced by overlay's own output path.
+///   - `-l<name>` flags whose archive we've already expanded into the
+///     scan + emitted as a filtered `.a` (in `stripped_libs`). Leaving
+///     these in would cause ld to pull the original archive's full
+///     contents alongside our pruned filtered version — duplicate
+///     symbols, unresolved cross-archive references in code we
+///     intended to drop.
+///   - `-L<path>` library-search paths. With every `-l<name>` either
+///     expanded into the scan or a known stub passed through verbatim,
+///     ld no longer needs to search; we hand it concrete paths.
 ///
-/// Rationale: the overlay link should mirror base's link as closely
-/// as possible — same `-l libs`, same `-L` paths, same `-T` scripts,
-/// same `-Wl,...` linker options. Hand-curating the subset we need
-/// is fragile (e.g. `-l esp_rom_sys` whose stub library is itself a
-/// linker script that PROVIDES ROM addresses for `__udivdi3` etc.).
-/// Passthrough keeps overlay aligned with whatever flags base built
-/// with for free, and any divergence becomes a deliberate override
-/// rather than an oversight.
-pub fn forwarded_link_args(argv: &[String]) -> Vec<&str> {
+/// Stub `-l<name>` archives (linker scripts with `.a` extension, e.g.
+/// `libesp_rom_sys.a`) are NOT in `stripped_libs` and therefore stay
+/// forwarded — ld processes them as scripts, the same as a `-T` arg.
+pub fn forwarded_link_args<'a>(
+    argv: &'a [String],
+    stripped_libs: &std::collections::HashSet<String>,
+) -> Vec<&'a str> {
     let mut out = Vec::new();
     let mut i = if argv.is_empty() { 0 } else { 1 };
     while i < argv.len() {
         let a = &argv[i];
-        if is_input(a) { i += 1; continue; }
-        if a == "-o" { i += 2; continue; }
-        if a.starts_with("-o") && a.len() > 2 { i += 1; continue; }
+        if is_input(a) {
+            i += 1;
+            continue;
+        }
+        if a == "-o" {
+            i += 2;
+            continue;
+        }
+        if a.starts_with("-o") && a.len() > 2 {
+            i += 1;
+            continue;
+        }
+        // -l <name> / -l<name>
+        if a == "-l" {
+            if let Some(name) = argv.get(i + 1)
+                && stripped_libs.contains(name)
+            {
+                i += 2;
+                continue;
+            }
+        }
+        if let Some(name) = a.strip_prefix("-l")
+            && !name.is_empty()
+            && !name.starts_with('-')
+            && stripped_libs.contains(name)
+        {
+            i += 1;
+            continue;
+        }
+        // Keep `-L` forwarded: ld also uses these paths to resolve
+        // `-T <script>` linker-script names (e.g. esp-idf passes
+        // `-T esp32s3.peripherals.ld -L .../soc/esp32s3/ld`). With every
+        // walked `-l<name>` stripped above, archive search is moot;
+        // the `-L`s only matter for script and stub-`-l` resolution.
         out.push(a.as_str());
         i += 1;
     }

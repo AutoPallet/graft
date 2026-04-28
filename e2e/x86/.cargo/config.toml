@@ -21,3 +21,12 @@ rustflags = [
     "-C", "target-feature=+crt-static",
     "-C", "relocation-model=static",
 ]
+
+# The cc crate defaults to invoking `x86_64-linux-musl-gcc` for this
+# target, which the workspace doesn't have installed. Plain gcc
+# produces objects that link fine into a musl-static binary as long
+# as the C source has no libc references — our cshim is pure
+# arithmetic.
+[env]
+CC_x86_64_unknown_linux_musl = "gcc"
+AR_x86_64_unknown_linux_musl = "ar"
