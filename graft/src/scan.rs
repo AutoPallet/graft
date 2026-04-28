@@ -8,13 +8,13 @@
 //! parsed by a reachability loop seeded from the eagerly-loaded
 //! objects' UND symbols + any `--undefined=foo` link-argv flags.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use crate::archive::{self, DeferredArchive, ObjectInput};
-use crate::elf::{self, ParsedObject};
+use crate::elf::{self, ParsedObject, SymbolBind};
 use crate::graph::{self, Graph, SccResult};
 use crate::hash::{self, TransHash};
 
@@ -45,24 +45,21 @@ pub fn run<P: AsRef<Path>>(
     let mut inputs = collected.inputs;
     let mut walked_archives = collected.walked_archives;
 
-    // For each deferred archive, eagerly load every `.o` member.
-    //
-    // True lazy member discovery (only loading members the closure
-    // actually reaches) is the eventual win — but it requires careful
-    // attention to:
-    //   - hash determinism: both base and overlay must reach the same
-    //     loaded set so trans_hashes line up. A naive UND-driven walk
-    //     diverges because graph.rs's last-write-wins symbol resolution
-    //     depends on load order, and load order shifts with closure
-    //     content.
-    //   - linker-script demands: KEEP() patterns and CMakeLists-style
-    //     `--whole-archive` brackets pin members irrespective of
-    //     reachability from rust UNDs.
-    // Until those land, we walk every member up-front. Performance
-    // wise, archive walking is dominated by blake3 + SCC over the
-    // resulting graph, not by archive-open cost; deferred-vs-eager
-    // here is mostly an organizational distinction.
-    let _ = extra_roots; // reserved for the future lazy discovery loop
+    // Parse the eager objects.
+    let mut objects: Vec<ParsedObject> = inputs
+        .iter()
+        .map(|inp| {
+            elf::parse(&inp.bytes)
+                .map_err(|e| anyhow::anyhow!("{}: {e}", inp.label()))
+        })
+        .collect::<Result<_>>()?;
+
+    // Open each deferred archive once. Read its symbol-index into
+    // `symbol_index`: name → (archive_idx, member_offset). First
+    // archive in input order wins on duplicate names — matches ld's
+    // left-to-right archive search.
+    let mut deferred: Vec<DeferredArchive> = Vec::with_capacity(deferred_paths.len());
+    let mut symbol_index: HashMap<String, (usize, u64)> = HashMap::new();
     for p in deferred_paths {
         let p = p.as_ref();
         let Some(archive) = DeferredArchive::open(p)
@@ -70,35 +67,66 @@ pub fn run<P: AsRef<Path>>(
         else {
             continue; // stub linker script
         };
-        // Walk every member's offset by iterating the archive itself.
-        let archive_file = object::read::archive::ArchiveFile::parse(&*archive.bytes)
-            .map_err(|e| anyhow::anyhow!("re-parse archive {}: {e}", archive.path.display()))?;
-        for member in archive_file.members() {
-            let member = member.map_err(|e| anyhow::anyhow!("archive member: {e}"))?;
-            let name = String::from_utf8_lossy(member.name()).into_owned();
-            if !(name.ends_with(".o") || name.ends_with(".rcgu.o")) {
-                continue;
-            }
-            let data = member
-                .data(&*archive.bytes)
-                .map_err(|e| anyhow::anyhow!("member data: {e}"))?;
-            inputs.push(crate::archive::ObjectInput {
-                source_path: archive.path.clone(),
-                member_name: Some(name),
-                bytes: data.to_vec(),
-            });
-        }
+        // Mark walked at open time. Even if no member is demand-pulled,
+        // the archive was processed by graft and the corresponding
+        // `-l<name>` flag should be stripped from the link argv. ld
+        // would otherwise re-pull the unfiltered original.
         walked_archives.insert(archive.canon_path.clone());
+        let archive_idx = deferred.len();
+        for (name, &offset) in &archive.symbol_to_offset {
+            symbol_index
+                .entry(name.clone())
+                .or_insert((archive_idx, offset));
+        }
+        deferred.push(archive);
     }
 
-    // Parse every loaded object.
-    let objects: Vec<ParsedObject> = inputs
-        .iter()
-        .map(|inp| {
-            elf::parse(&inp.bytes)
-                .map_err(|e| anyhow::anyhow!("{}: {e}", inp.label()))
-        })
-        .collect::<Result<_>>()?;
+    // Demand-load loop: any UND symbol in any loaded object that
+    // resolves to a deferred-archive member triggers parsing of that
+    // member; rinse and repeat. Seeded with `extra_roots`
+    // (`-u <sym>` / `--undefined=<sym>` from the link argv) so members
+    // ld would force-load via those flags also get pulled.
+    let mut loaded_members: HashSet<(usize, u64)> = HashSet::new();
+    let mut pending: Vec<(usize, u64)> = Vec::new();
+    for sym_name in extra_roots {
+        if let Some(&(ai, off)) = symbol_index.get(sym_name)
+            && loaded_members.insert((ai, off))
+        {
+            pending.push((ai, off));
+        }
+    }
+    let mut next_obj_idx: usize = 0;
+    while next_obj_idx < objects.len() || !pending.is_empty() {
+        while let Some((ai, off)) = pending.pop() {
+            let archive = &deferred[ai];
+            let inp = archive
+                .parse_member(off)
+                .with_context(|| format!("parse member at {off:#x} in {}", archive.path.display()))?;
+            let parsed = elf::parse(&inp.bytes)
+                .map_err(|e| anyhow::anyhow!("{}: {e}", inp.label()))?;
+            inputs.push(inp);
+            objects.push(parsed);
+        }
+        while next_obj_idx < objects.len() {
+            for sym in &objects[next_obj_idx].symbols {
+                if sym.defining_section.is_some() {
+                    continue;
+                }
+                if !matches!(sym.bind, SymbolBind::Global | SymbolBind::Weak) {
+                    continue;
+                }
+                if sym.name.is_empty() {
+                    continue;
+                }
+                if let Some(&(ai, off)) = symbol_index.get(&sym.name)
+                    && loaded_members.insert((ai, off))
+                {
+                    pending.push((ai, off));
+                }
+            }
+            next_obj_idx += 1;
+        }
+    }
 
     let graph = graph::build(&objects);
     let scc = graph::tarjan_scc(&graph);
