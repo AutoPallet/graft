@@ -19,6 +19,7 @@ pub mod roots;
 pub mod scan;
 pub mod slack;
 pub mod subcommands;
+pub mod synthetic;
 pub mod telemetry;
 
 pub use metadata::{GRAFT_MAGIC, GraftManifest, SCHEMA_VERSION, SymHashEntry};
