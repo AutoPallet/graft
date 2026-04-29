@@ -107,7 +107,9 @@ fn foo_trans_hash(obj_bytes: &[u8]) -> [u8; 16] {
         .graph
         .nodes
         .iter()
-        .position(|nm| nm.object as usize == obj_idx && nm.section as usize == sec_idx)
+        .position(|nm| {
+            nm.segments.iter().any(|s| s.object as usize == obj_idx && s.section as usize == sec_idx)
+        })
         .expect("nodeid for .text.foo");
     r.trans_hash[nid]
 }

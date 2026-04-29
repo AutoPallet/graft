@@ -65,13 +65,12 @@ pub fn dump_graph(path: &Path, scan: &ScanResult) -> std::io::Result<()> {
         .nodes
         .iter()
         .enumerate()
-        .map(|(nid, nm)| {
-            if nm.object == u32::MAX {
-                let info = &g.synthetic[&(nid as u32)];
-                blake3::hash(format!("graft-synthetic\0{}", info.aggregator_id).as_bytes())
-            } else {
-                blake3::hash(&scan.objects[nm.object as usize].sections[nm.section as usize].bytes)
+        .map(|(_nid, nm)| {
+            let mut h = blake3::Hasher::new();
+            for seg in &nm.segments {
+                h.update(&scan.objects[seg.object as usize].sections[seg.section as usize].bytes);
             }
+            h.finalize()
         })
         .collect();
 
@@ -85,25 +84,18 @@ pub fn dump_graph(path: &Path, scan: &ScanResult) -> std::io::Result<()> {
     for (nid, nm) in g.nodes.iter().enumerate() {
         let mut h8 = [0u8; 8];
         h8.copy_from_slice(&bytes_hashes[nid].as_bytes()[..8]);
-        if nm.object == u32::MAX {
-            let info = &g.synthetic[&(nid as u32)];
-            for b in &info.bracket_symbols {
-                g_global.insert(b.name.clone(), h8);
-            }
-            continue;
+        for seg in &nm.segments {
+            let sec = &scan.objects[seg.object as usize].sections[seg.section as usize];
+            g_section.insert((seg.object, sec.name.clone()), h8);
         }
-        let obj = &scan.objects[nm.object as usize];
-        let sec = &obj.sections[nm.section as usize];
-        g_section.insert((nm.object, sec.name.clone()), h8);
-        for &si in &sec.defined_symbols {
-            let sym = &obj.symbols[si];
-            if sym.name.is_empty() { continue; }
+        for sym in &nm.defined_symbols {
             match sym.bind {
                 SymbolBind::Global | SymbolBind::Weak => {
                     g_global.insert(sym.name.clone(), h8);
                 }
                 SymbolBind::Local => {
-                    g_local.insert((sym.name.clone(), obj.tu_id), h8);
+                    let tu_id = sym.tu_id.expect("local symbol must carry tu_id");
+                    g_local.insert((sym.name.clone(), tu_id), h8);
                 }
             }
         }
@@ -125,14 +117,23 @@ pub fn dump_graph(path: &Path, scan: &ScanResult) -> std::io::Result<()> {
         .nodes
         .iter()
         .enumerate()
-        .map(|(nid, nm)| {
-            if nm.object == u32::MAX {
-                let info = &g.synthetic[&(nid as u32)];
-                format!("synthetic\0{}", info.aggregator_id)
+        .map(|(_nid, nm)| {
+            // Aggregator nodes get a stable cross-scan key from their
+            // aggregator_id (avoids depending on the contributor
+            // segment list, which can be large). Ordinary nodes use
+            // their segment list joined with `+`.
+            if let Some(agg_id) = nm.aggregator_id {
+                format!("aggregator\0{}", agg_id)
             } else {
-                let label = stripped_label(&scan.inputs[nm.object as usize].label());
-                let sec = &scan.objects[nm.object as usize].sections[nm.section as usize];
-                format!("{}\0{}", label, sec.name)
+                nm.segments
+                    .iter()
+                    .map(|seg| {
+                        let label = stripped_label(&scan.inputs[seg.object as usize].label());
+                        let sec = &scan.objects[seg.object as usize].sections[seg.section as usize];
+                        format!("{}\0{}", label, sec.name)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("+")
             }
         })
         .collect();
@@ -144,37 +145,6 @@ pub fn dump_graph(path: &Path, scan: &ScanResult) -> std::io::Result<()> {
     )?;
 
     for (nid, nm) in g.nodes.iter().enumerate() {
-        if nm.object == u32::MAX { continue; }
-        let obj = &scan.objects[nm.object as usize];
-        let sec = &obj.sections[nm.section as usize];
-
-        let stripped = stripped_label(&scan.inputs[nm.object as usize].label());
-        let tu_id_hex: String = obj.tu_id.iter().map(|b| format!("{b:02x}")).collect();
-        let bh: String = bytes_hashes[nid].as_bytes()[..8]
-            .iter().map(|b| format!("{b:02x}")).collect();
-
-        let canonical_relocs: Vec<u8> = {
-            let mut rebuilt = Vec::with_capacity(sec.relocs.len());
-            for r in &sec.relocs {
-                let target = canonicalize_target(&r.target, nm.object, obj.tu_id);
-                rebuilt.push(crate::elf::CanonicalReloc {
-                    offset: r.offset,
-                    target,
-                    r_type: r.r_type,
-                    addend: r.addend,
-                });
-            }
-            postcard::to_allocvec(&rebuilt).unwrap_or_default()
-        };
-        let enc_h: String = blake3::hash(&canonical_relocs).as_bytes()[..8]
-            .iter().map(|b| format!("{b:02x}")).collect();
-
-        let mut h = blake3::Hasher::new();
-        h.update(&sec.bytes);
-        h.update(&canonical_relocs);
-        let mih: String = h.finalize().as_bytes()[..8]
-            .iter().map(|b| format!("{b:02x}")).collect();
-
         let th: String = scan.trans_hash[nid].iter().map(|b| format!("{b:02x}")).collect();
         let edges_count = g.edges[nid].len();
         let ext = g.external_edge_counts[nid];
@@ -191,12 +161,10 @@ pub fn dump_graph(path: &Path, scan: &ScanResult) -> std::io::Result<()> {
             .collect::<Vec<_>>()
             .join(",");
 
-        // Successor SCC scc_hashes (the EXACT inputs to this SCC's
-        // trans_hash computation). Re-deriving them here from the
-        // graph + scc + trans_hash arrays.
+        // Successor SCC scc_hashes — the EXACT inputs to this SCC's
+        // trans_hash computation, re-derived for verification.
         let mut succ_scc_hashes: Vec<String> = Vec::new();
         let mut seen: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-        let mut succ_count: usize = 0;
         for &member_nid in &scc.members[sid as usize] {
             for &dst in &g.edges[member_nid as usize] {
                 let dst_sid = scc.scc_of_node[dst as usize];
@@ -205,23 +173,52 @@ pub fn dump_graph(path: &Path, scan: &ScanResult) -> std::io::Result<()> {
                     let dst_th: String = scan.trans_hash[dst as usize]
                         .iter().map(|b| format!("{b:02x}")).collect();
                     succ_scc_hashes.push(dst_th);
-                    succ_count += 1;
                 }
             }
         }
         succ_scc_hashes.sort();
-        let _ = succ_count;
         let succ_str = succ_scc_hashes.join(",");
 
-        // The SCC's trans_hash is the same as any of its members' (we
-        // index by node, all members share). Pick this node's.
-        let scc_th = th.clone();
+        // One row per segment. nid/trans_hash/scc are node-level and
+        // shared across segment rows; bytes/mih/enc_relocs are
+        // per-segment so divergence localizes naturally.
+        for seg in &nm.segments {
+            let obj = &scan.objects[seg.object as usize];
+            let sec = &obj.sections[seg.section as usize];
 
-        writeln!(
-            f,
-            "{stripped}\t{tu_id_hex}\t{}\t{bh}\t{mih}\t{enc_h}\t{th}\t{edges_count}\t{ext}\t{sid}\t{scc_th}\t{edges_str}\t{succ_str}",
-            sec.name,
-        )?;
+            let stripped = stripped_label(&scan.inputs[seg.object as usize].label());
+            let tu_id_hex: String = obj.tu_id.iter().map(|b| format!("{b:02x}")).collect();
+            let bh: String = blake3::hash(&sec.bytes).as_bytes()[..8]
+                .iter().map(|b| format!("{b:02x}")).collect();
+
+            let canonical_relocs: Vec<u8> = {
+                let mut rebuilt = Vec::with_capacity(sec.relocs.len());
+                for r in &sec.relocs {
+                    let target = canonicalize_target(&r.target, seg.object, obj.tu_id);
+                    rebuilt.push(crate::elf::CanonicalReloc {
+                        offset: r.offset,
+                        target,
+                        r_type: r.r_type,
+                        addend: r.addend,
+                    });
+                }
+                postcard::to_allocvec(&rebuilt).unwrap_or_default()
+            };
+            let enc_h: String = blake3::hash(&canonical_relocs).as_bytes()[..8]
+                .iter().map(|b| format!("{b:02x}")).collect();
+
+            let mut h = blake3::Hasher::new();
+            h.update(&sec.bytes);
+            h.update(&canonical_relocs);
+            let mih: String = h.finalize().as_bytes()[..8]
+                .iter().map(|b| format!("{b:02x}")).collect();
+
+            writeln!(
+                f,
+                "{stripped}\t{tu_id_hex}\t{}\t{bh}\t{mih}\t{enc_h}\t{th}\t{edges_count}\t{ext}\t{sid}\t{th}\t{edges_str}\t{succ_str}",
+                sec.name,
+            )?;
+        }
     }
 
     Ok(())

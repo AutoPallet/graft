@@ -166,28 +166,33 @@ pub fn scan_dump(args: &[String]) -> ExitCode {
     };
 
     for (nid, nm) in scan_result.graph.nodes.iter().enumerate() {
-        let obj = &scan_result.objects[nm.object as usize];
-        let sec = &obj.sections[nm.section as usize];
-        let obj_name = scan_result.inputs[nm.object as usize].label();
-
-        let bytes_hash = h8(blake3::hash(&sec.bytes).as_bytes());
-        let reloc_blob = postcard::to_allocvec(&sec.relocs).unwrap_or_default();
-        let relocs_hash = h8(blake3::hash(&reloc_blob).as_bytes());
         let trans_hash: String = scan_result.trans_hash[nid]
             .iter()
             .take(8)
             .map(|b| format!("{b:02x}"))
             .collect();
+        // One row per segment. Multi-segment nodes share a trans_hash;
+        // bytes/relocs hashes are still per-segment so reviewers can
+        // see the constituent inputs.
+        for seg in &nm.segments {
+            let obj = &scan_result.objects[seg.object as usize];
+            let sec = &obj.sections[seg.section as usize];
+            let obj_name = scan_result.inputs[seg.object as usize].label();
 
-        let _ = write!(
-            out,
-            "{obj_name}\t{}\tbytes={bytes_hash}\trelocs={relocs_hash}\ttrans={trans_hash}",
-            sec.name,
-        );
-        for r in &sec.relocs {
-            let _ = write!(out, "\t{}+{}", r.target, r.addend);
+            let bytes_hash = h8(blake3::hash(&sec.bytes).as_bytes());
+            let reloc_blob = postcard::to_allocvec(&sec.relocs).unwrap_or_default();
+            let relocs_hash = h8(blake3::hash(&reloc_blob).as_bytes());
+
+            let _ = write!(
+                out,
+                "{obj_name}\t{}\tbytes={bytes_hash}\trelocs={relocs_hash}\ttrans={trans_hash}",
+                sec.name,
+            );
+            for r in &sec.relocs {
+                let _ = write!(out, "\t{}+{}", r.target, r.addend);
+            }
+            let _ = writeln!(out);
         }
-        let _ = writeln!(out);
     }
     ExitCode::SUCCESS
 }

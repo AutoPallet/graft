@@ -32,9 +32,10 @@ pub struct Aggregator {
     pub contributor: Contributor,
     /// Real linker-script-defined bracket symbols. Their addresses
     /// live in base.elf's `.symtab`; refs from code resolve through
-    /// the normal symhash machinery once the phantom node is in the
-    /// graph.
-    pub bracket_symbols: &'static [BracketSymbol],
+    /// the normal symhash machinery once the aggregator node is in
+    /// the graph and these names are appended to its
+    /// `defined_symbols` list.
+    pub bracket_symbols: &'static [&'static str],
 }
 
 /// Predicate for "is this input section a contributor to that
@@ -58,43 +59,21 @@ impl Contributor {
     }
 }
 
-pub struct BracketSymbol {
-    pub name: &'static str,
-    pub end: BracketEnd,
-}
-
-#[derive(Clone, Copy)]
-pub enum BracketEnd {
-    /// Symbol's offset within the merged output is 0.
-    Start,
-    /// Symbol's offset within the merged output is `total_size`.
-    End,
-}
-
 pub const AGGREGATORS: &[Aggregator] = &[
     Aggregator {
         id: ".init_array",
         contributor: Contributor::ExactOrDot(".init_array"),
-        bracket_symbols: &[
-            BracketSymbol { name: "__init_array_start", end: BracketEnd::Start },
-            BracketSymbol { name: "__init_array_end",   end: BracketEnd::End },
-        ],
+        bracket_symbols: &["__init_array_start", "__init_array_end"],
     },
     Aggregator {
         id: ".fini_array",
         contributor: Contributor::ExactOrDot(".fini_array"),
-        bracket_symbols: &[
-            BracketSymbol { name: "__fini_array_start", end: BracketEnd::Start },
-            BracketSymbol { name: "__fini_array_end",   end: BracketEnd::End },
-        ],
+        bracket_symbols: &["__fini_array_start", "__fini_array_end"],
     },
     Aggregator {
         id: ".preinit_array",
         contributor: Contributor::ExactOrDot(".preinit_array"),
-        bracket_symbols: &[
-            BracketSymbol { name: "__preinit_array_start", end: BracketEnd::Start },
-            BracketSymbol { name: "__preinit_array_end",   end: BracketEnd::End },
-        ],
+        bracket_symbols: &["__preinit_array_start", "__preinit_array_end"],
     },
 ];
 

@@ -39,99 +39,266 @@ impl SymbolIndex {
 
 #[derive(Debug)]
 pub struct Graph {
-    /// One entry per node. Nodes are either real (one per allocated
-    /// input section, in walk order) or synthetic (appended after the
-    /// real ones, one per linker-aggregated output that scan-side
-    /// inputs contribute to). Synthetic nodes have `object == u32::MAX`
-    /// and corresponding metadata in `synthetic_meta`.
+    /// One entry per LogicalNode. Each node owns 1+ physical segments
+    /// passed to the linker if included; "aggregator" nodes additionally
+    /// carry an `aggregator_id` and `bracket_symbols` for linker-merged
+    /// outputs (`.init_array`, `.eh_frame`, …) whose contributor input
+    /// sections are folded into one node.
     pub nodes: Vec<NodeMeta>,
-    /// `edges[n]` = list of internal destinations from node `n`.
-    /// Real-node edges come from relocations; synthetic-node edges go
-    /// to the contributing input sections.
+    /// `edges[n]` = list of internal destinations from node `n`,
+    /// derived from each segment's outgoing relocs.
     pub edges: Vec<Vec<NodeId>>,
     /// Count of external (unresolved-in-our-inputs) targets for each
     /// node. The hash pass folds these in as `[0u8; 16]` sentinels.
     pub external_edge_counts: Vec<u32>,
     pub symbols: SymbolIndex,
-    /// Side table for synthetic nodes only. Indexed by NodeId; only
-    /// populated for the synthetic suffix range. Carries the
-    /// aggregator id and the synthetic+bracket symbol names defined
-    /// on the phantom.
-    pub synthetic: HashMap<NodeId, SyntheticInfo>,
 }
 
+/// A LogicalNode is the unit of inclusion: closure, hashing, and SCC
+/// formation all operate on LogicalNodes. Each owns one or more
+/// physical input sections (`segments`) that are passed verbatim to the
+/// linker if the node is included.
+///
+/// Aggregator nodes (e.g. the one node representing the linker-merged
+/// `.init_array` output) own all contributing input sections as
+/// segments and additionally define bracket symbols (`__init_array_start`,
+/// `__init_array_end`) whose addresses live in base.elf's symtab.
 #[derive(Debug, Clone)]
 pub struct NodeMeta {
-    /// `u32::MAX` for synthetic nodes (look up `synthetic[nid]`).
+    /// Physical input sections to ship to the linker if this node is
+    /// included. Always non-empty.
+    pub segments: Vec<SegmentRef>,
+    /// Stable identifier from `synthetic::Aggregator::id`, set for
+    /// aggregator nodes (matches the merged-output section name in
+    /// base.elf). `None` for ordinary nodes.
+    pub aggregator_id: Option<&'static str>,
+    /// Every symbol defined by this node — both symbols originating
+    /// in any of its `segments` and synthesized bracket symbols
+    /// (aggregator nodes only; e.g. `__init_array_start`).
+    pub defined_symbols: Vec<DefinedSymbol>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DefinedSymbol {
+    pub name: String,
+    pub bind: SymbolBind,
+    /// `Some(tu_id)` for symbols originating in a parsed input
+    /// section (carries the defining object's `tu_id` for STB_LOCAL
+    /// disambiguation). `None` for synthesized bracket symbols.
+    pub tu_id: Option<[u8; 8]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SegmentRef {
     pub object: u32,
     pub section: u32,
+    /// Sub-range within the section, used by per-string nodes from
+    /// SHF_MERGE | SHF_STRINGS pools. `None` means "whole section".
+    /// The linker still receives the entire physical section (we
+    /// can't ship a partial section), so this only affects hashing
+    /// and reloc-target canonicalization — *not* what's emitted.
+    pub range: Option<(u32, u32)>,
 }
 
-/// Metadata for a synthetic (linker-aggregated-output) graph node.
-/// Successors (the contributing input sections) live in `Graph::edges`
-/// the same as for real nodes.
-#[derive(Debug, Clone)]
-pub struct SyntheticInfo {
-    /// Stable identifier from `synthetic::Aggregator::id`. Matches
-    /// the merged-output section name in base.elf.
-    pub aggregator_id: &'static str,
-    /// Bracket symbols defined on this phantom (`__init_array_start`,
-    /// `__init_array_end`, …). Their addresses live in base.elf's
-    /// `.symtab`; refs from code resolve through the normal symhash
-    /// machinery once these are registered in `Graph::symbols`.
-    pub bracket_symbols: Vec<BracketSymbol>,
+impl SegmentRef {
+    pub fn whole(object: u32, section: u32) -> Self {
+        Self { object, section, range: None }
+    }
+    pub fn substring(object: u32, section: u32, offset: u32, len: u32) -> Self {
+        Self { object, section, range: Some((offset, len)) }
+    }
+    pub fn bytes_in<'a>(&self, sections: &'a [crate::elf::SectionInfo]) -> &'a [u8] {
+        let bytes = &sections[self.section as usize].bytes;
+        match self.range {
+            None => bytes,
+            Some((off, len)) => &bytes[off as usize..(off + len) as usize],
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
-pub struct BracketSymbol {
-    pub name: String,
-    pub end: BracketEnd,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum BracketEnd {
-    /// Offset 0 within the merged output.
-    Start,
-    /// Offset = merged-output size.
-    End,
+impl NodeMeta {
+    /// Convenience constructor for an ordinary single-segment node
+    /// (caller populates `defined_symbols`).
+    pub fn segment(object: u32, section: u32) -> Self {
+        Self {
+            segments: vec![SegmentRef::whole(object, section)],
+            aggregator_id: None,
+            defined_symbols: Vec::new(),
+        }
+    }
+    pub fn is_aggregator(&self) -> bool {
+        self.aggregator_id.is_some()
+    }
 }
 
 /// Build the forward-reloc graph across a set of parsed objects.
 pub fn build(objects: &[ParsedObject]) -> Graph {
-    // Flat section index: (obj, sec) -> NodeId.
-    let mut nodes: Vec<NodeMeta> = Vec::new();
-    let mut node_of: HashMap<(u32, u32), NodeId> = HashMap::new();
+    // First, classify each allocated input section into one of three
+    // shapes:
+    //   - Aggregator contributor (`.init_array.NN`, etc.): folded into
+    //     a single aggregator node.
+    //   - String pool (`SHF_MERGE | SHF_STRINGS`): split into one
+    //     LogicalNode per NUL-terminated string. Per-string nodes
+    //     give anon refs to a specific string a stable content
+    //     fingerprint independent of which CGU the string lives in
+    //     (cargo's CGU repartitioning shuffles strings between
+    //     `.rodata.str1.1` sections without changing their bytes).
+    //   - Ordinary: one LogicalNode per section.
+    let mut contributor_to_agg: HashMap<(u32, u32), &'static crate::synthetic::Aggregator> =
+        HashMap::new();
+    let mut string_pool_strings: HashMap<(u32, u32), Vec<(u32, u32)>> = HashMap::new();
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
-            // Skip non-allocated sections (`.note.GNU-stack`, `.comment`,
-            // debug info, etc.) — they don't reach runtime, so they can't
-            // be reached by the closure walk and shouldn't pollute it.
-            // Anything with `SHF_ALLOC` clear lives only in the object
-            // file; relocs targeting such a section (rare in practice)
-            // resolve to nothing and end up as external sentinels.
-            if sec.sh_flags & u64::from(SHF_ALLOC) == 0 {
+            if sec.sh_flags & u64::from(SHF_ALLOC) == 0 { continue; }
+            // Aggregator-contributor classification first (mutually
+            // exclusive with string-pool in practice).
+            let mut is_contributor = false;
+            for agg in crate::synthetic::AGGREGATORS {
+                if agg.contributor.matches(&sec.name) {
+                    contributor_to_agg.insert((oi as u32, si as u32), agg);
+                    is_contributor = true;
+                    break;
+                }
+            }
+            if is_contributor { continue; }
+            // String-pool classification: SHF_MERGE | SHF_STRINGS.
+            // Assume sh_entsize = 1 (NUL-terminated byte strings); this
+            // is universally true for rust-emitted `.rodata.str1.1`.
+            if sec.sh_flags & (SHF_MERGE | SHF_STRINGS) == (SHF_MERGE | SHF_STRINGS) {
+                let strings = split_nul_terminated(&sec.bytes);
+                if !strings.is_empty() {
+                    string_pool_strings.insert((oi as u32, si as u32), strings);
+                }
+            }
+        }
+    }
+
+    // Build LogicalNodes.
+    //   - Ordinary single-segment nodes for non-contributor,
+    //     non-pool sections (`node_of[(oi, si)] = nid`).
+    //   - Per-string nodes for string-pool sections
+    //     (`string_node_of[(oi, si, offset)] = nid`); we *also*
+    //     register the string-pool section in `node_of` to point at
+    //     the *first* string node, so that any code path that still
+    //     wants a section-level NodeId (e.g. a reloc with addend
+    //     mid-string falling back from the string-table lookup) gets
+    //     a valid answer.
+    //   - Aggregator nodes built last, owning their contributor
+    //     segments.
+    let mut nodes: Vec<NodeMeta> = Vec::new();
+    let mut node_of: HashMap<(u32, u32), NodeId> = HashMap::new();
+    let mut string_node_of: HashMap<(u32, u32, u32), NodeId> = HashMap::new();
+    for (oi, obj) in objects.iter().enumerate() {
+        for (si, sec) in obj.sections.iter().enumerate() {
+            if sec.sh_flags & u64::from(SHF_ALLOC) == 0 { continue; }
+            if contributor_to_agg.contains_key(&(oi as u32, si as u32)) { continue; }
+            if let Some(strings) = string_pool_strings.get(&(oi as u32, si as u32)) {
+                // One LogicalNode per string. All share the same
+                // underlying section but with distinct sub-ranges.
+                let mut first_nid: Option<NodeId> = None;
+                for &(off, len) in strings {
+                    let nid = nodes.len() as NodeId;
+                    nodes.push(NodeMeta {
+                        segments: vec![SegmentRef::substring(oi as u32, si as u32, off, len)],
+                        aggregator_id: None,
+                        defined_symbols: Vec::new(),
+                    });
+                    string_node_of.insert((oi as u32, si as u32, off), nid);
+                    first_nid.get_or_insert(nid);
+                }
+                if let Some(nid) = first_nid {
+                    node_of.insert((oi as u32, si as u32), nid);
+                }
                 continue;
             }
             let nid = nodes.len() as NodeId;
-            nodes.push(NodeMeta { object: oi as u32, section: si as u32 });
+            nodes.push(NodeMeta::segment(oi as u32, si as u32));
             node_of.insert((oi as u32, si as u32), nid);
+        }
+    }
+    for agg in crate::synthetic::AGGREGATORS {
+        // Gather contributor segments for this aggregator. Sort by
+        // (content_hash, object_idx, section_idx) so independently-
+        // built scans whose object iteration order differs (rlibs
+        // re-emit member ordering nondeterministically) still produce
+        // the same segment list.
+        let mut contributor_segs: Vec<(SegmentRef, [u8; 32])> = Vec::new();
+        for (&(oi, si), &owning_agg) in &contributor_to_agg {
+            if !std::ptr::eq(owning_agg, agg) { continue; }
+            let bytes = &objects[oi as usize].sections[si as usize].bytes;
+            let h = *blake3::hash(bytes).as_bytes();
+            contributor_segs.push((SegmentRef::whole(oi, si), h));
+        }
+        if contributor_segs.is_empty() { continue; }
+        contributor_segs.sort_by_key(|(seg, h)| (*h, seg.object, seg.section));
+
+        let agg_nid = nodes.len() as NodeId;
+        let segments: Vec<SegmentRef> = contributor_segs.iter().map(|(s, _)| *s).collect();
+        for seg in &segments {
+            node_of.insert((seg.object, seg.section), agg_nid);
+        }
+        // Bracket symbols enter as DefinedSymbols with no tu_id (not
+        // from any TU). Per-segment defined symbols are appended in
+        // the unified population pass below.
+        let bracket_defs: Vec<DefinedSymbol> = agg.bracket_symbols
+            .iter()
+            .map(|name| DefinedSymbol {
+                name: (*name).to_string(),
+                bind: SymbolBind::Global,
+                tu_id: None,
+            })
+            .collect();
+        nodes.push(NodeMeta {
+            segments,
+            aggregator_id: Some(agg.id),
+            defined_symbols: bracket_defs,
+        });
+    }
+
+    // Populate each node's `defined_symbols` from its segments.
+    // Walking objects.symbols and dispatching via node_of routes
+    // contributor-section symbols onto their aggregator node
+    // automatically. For string-pool sections, dispatch by st_value:
+    // each symbol attaches to the per-string node whose byte range
+    // contains its address.
+    for (oi, obj) in objects.iter().enumerate() {
+        for sym in &obj.symbols {
+            let Some(sec_idx) = sym.defining_section else { continue };
+            if sym.name.is_empty() { continue; }
+            let key = (oi as u32, sec_idx as u32);
+            let nid_opt = if let Some(strings) = string_pool_strings.get(&key) {
+                find_string_node(strings, &string_node_of, key, sym.value as u32)
+            } else {
+                node_of.get(&key).copied()
+            };
+            let Some(nid) = nid_opt else { continue };
+            nodes[nid as usize].defined_symbols.push(DefinedSymbol {
+                name: sym.name.clone(),
+                bind: sym.bind,
+                tu_id: Some(obj.tu_id),
+            });
         }
     }
 
     // Per-node bytes hash, computed once for use as a content-stable
     // tiebreaker across scans whose object-iteration order differs.
+    // Per-string nodes hash only their string's bytes (the segment's
+    // range), so two scans whose string sits in different CGUs'
+    // `.rodata.str1.1` produce the same fingerprint.
     let bytes_hash_of: Vec<[u8; 16]> = nodes
         .iter()
         .map(|nm| {
-            let sec = &objects[nm.object as usize].sections[nm.section as usize];
-            let h = blake3::hash(&sec.bytes);
+            let mut h = blake3::Hasher::new();
+            for seg in &nm.segments {
+                h.update(seg.bytes_in(&objects[seg.object as usize].sections));
+            }
             let mut out = [0u8; 16];
-            out.copy_from_slice(&h.as_bytes()[..16]);
+            out.copy_from_slice(&h.finalize().as_bytes()[..16]);
             out
         })
         .collect();
 
-    // Symbol index: map every defined symbol to its defining section's NodeId.
+    // Symbol index: map every defined symbol to its defining node.
     //
     // For multiply-defined globals (e.g. rust's per-crate `__rust_alloc`
     // shim that lives in many CGUs with byte-identical content), pick
@@ -149,12 +316,13 @@ pub fn build(objects: &[ParsedObject]) -> Graph {
     //
     // Tiebreaker: lowest bytes_hash among all definers for the same
     // name. Identical content → identical bytes_hash → both scans
-    // pick the same canonical.
+    // pick the same canonical. Bracket symbols (tu_id = None) are
+    // synthesized — only one definer per name, so the tiebreaker is
+    // a no-op for them.
     let mut symbols = SymbolIndex::default();
-    for (oi, obj) in objects.iter().enumerate() {
-        for sym in &obj.symbols {
-            let Some(sec_idx) = sym.defining_section else { continue };
-            let Some(&nid) = node_of.get(&(oi as u32, sec_idx as u32)) else { continue };
+    for (nid, nm) in nodes.iter().enumerate() {
+        let nid = nid as NodeId;
+        for sym in &nm.defined_symbols {
             match sym.bind {
                 SymbolBind::Global | SymbolBind::Weak => {
                     let new_h = bytes_hash_of[nid as usize];
@@ -172,49 +340,11 @@ pub fn build(objects: &[ParsedObject]) -> Graph {
                     }
                 }
                 SymbolBind::Local => {
-                    symbols.locals.insert((sym.name.clone(), obj.tu_id), nid);
+                    let tu_id = sym.tu_id.expect("local symbol must carry tu_id");
+                    symbols.locals.insert((sym.name.clone(), tu_id), nid);
                 }
             }
         }
-    }
-
-    // Synthesize phantom nodes for linker-aggregated outputs *before*
-    // resolving reloc edges, so refs from code to bracket symbols
-    // (`__init_array_start` etc.) land on the synthetic node instead
-    // of becoming external sentinels.
-    let mut synthetic: HashMap<NodeId, SyntheticInfo> = HashMap::new();
-    let real_node_count = nodes.len();
-    for agg in crate::synthetic::AGGREGATORS {
-        let mut contributors: Vec<NodeId> = (0..real_node_count as NodeId)
-            .filter(|&nid| {
-                let nm = &nodes[nid as usize];
-                let sec = &objects[nm.object as usize].sections[nm.section as usize];
-                agg.contributor.matches(&sec.name)
-            })
-            .collect();
-        if contributors.is_empty() { continue; }
-        contributors.sort();
-        contributors.dedup();
-
-        let synth_nid = nodes.len() as NodeId;
-        nodes.push(NodeMeta { object: u32::MAX, section: 0 });
-        let bracket_symbols: Vec<BracketSymbol> = agg.bracket_symbols
-            .iter()
-            .map(|b| BracketSymbol {
-                name: b.name.to_string(),
-                end: match b.end {
-                    crate::synthetic::BracketEnd::Start => BracketEnd::Start,
-                    crate::synthetic::BracketEnd::End => BracketEnd::End,
-                },
-            })
-            .collect();
-        for b in &bracket_symbols {
-            symbols.globals.entry(b.name.clone()).or_insert(synth_nid);
-        }
-        synthetic.insert(synth_nid, SyntheticInfo {
-            aggregator_id: agg.id,
-            bracket_symbols,
-        });
     }
 
     // Per-object section-name → local section index. Used to resolve
@@ -231,29 +361,12 @@ pub fn build(objects: &[ParsedObject]) -> Graph {
         })
         .collect();
 
-    // Edges + external counts. Allocated for every node (real +
-    // synthetic). Synthetic-node edges to contributors are filled in
-    // below; real-node edges come from reloc resolution.
+    // Edges + external counts. Outgoing edges come from each segment's
+    // relocs; aggregator nodes naturally accumulate edges from all
+    // contributor segments because their (obj, sec) → NodeId mappings
+    // all point at the aggregator.
     let mut edges: Vec<Vec<NodeId>> = vec![Vec::new(); nodes.len()];
     let mut external_counts: Vec<u32> = vec![0; nodes.len()];
-    for (&synth_nid, _info) in &synthetic {
-        // Recompute contributor list — same predicate as above. Cheap;
-        // keeps this localized rather than threading a side channel.
-        let agg = crate::synthetic::AGGREGATORS
-            .iter()
-            .find(|a| a.id == synthetic[&synth_nid].aggregator_id)
-            .expect("synthetic node references unknown aggregator");
-        let mut contribs: Vec<NodeId> = (0..real_node_count as NodeId)
-            .filter(|&nid| {
-                let nm = &nodes[nid as usize];
-                let sec = &objects[nm.object as usize].sections[nm.section as usize];
-                agg.contributor.matches(&sec.name)
-            })
-            .collect();
-        contribs.sort();
-        contribs.dedup();
-        edges[synth_nid as usize] = contribs;
-    }
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
             let Some(&nid) = node_of.get(&(oi as u32, si as u32)) else {
@@ -266,9 +379,16 @@ pub fn build(objects: &[ParsedObject]) -> Graph {
                 // through the flat symbol index. A target that resolves
                 // to a filtered section becomes an external sentinel.
                 let target = if let Some(sec_name) = strip_section_marker(&r.target) {
-                    section_by_name_per_obj[oi]
-                        .get(sec_name)
-                        .and_then(|&s_i| node_of.get(&(oi as u32, s_i)).copied())
+                    section_by_name_per_obj[oi].get(sec_name).and_then(|&s_i| {
+                        let key = (oi as u32, s_i);
+                        if let Some(strings) = string_pool_strings.get(&key) {
+                            // String-pool ref: pick the per-string
+                            // node whose range contains the addend.
+                            find_string_node(strings, &string_node_of, key, r.addend as u32)
+                        } else {
+                            node_of.get(&key).copied()
+                        }
+                    })
                 } else {
                     symbols
                         .resolve_global(&r.target)
@@ -295,8 +415,50 @@ pub fn build(objects: &[ParsedObject]) -> Graph {
         edges,
         external_edge_counts: external_counts,
         symbols,
-        synthetic,
     }
+}
+
+const SHF_MERGE: u64 = 0x10;
+const SHF_STRINGS: u64 = 0x20;
+
+/// Split a SHF_MERGE | SHF_STRINGS section's bytes into the
+/// (offset, length) of each NUL-terminated string. Each entry includes
+/// its trailing NUL byte (the linker dedupes on whole `<bytes>\0`
+/// units). Assumes sh_entsize = 1, which is universal for rust-emitted
+/// `.rodata.str1.1`.
+fn split_nul_terminated(bytes: &[u8]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut start = 0u32;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == 0 {
+            let end = i as u32 + 1;
+            out.push((start, end - start));
+            start = end;
+        }
+    }
+    // Trailing bytes without a terminating NUL are anomalous; skip.
+    out
+}
+
+/// Look up the per-string LogicalNode whose byte range contains
+/// `addend` within the (object, section) string pool. `strings` is the
+/// list of (offset, len) tuples emitted by `split_nul_terminated`,
+/// sorted by offset (which is the natural traversal order). Falls back
+/// to `None` if `addend` lies past the last string (shouldn't happen
+/// for well-formed input).
+fn find_string_node(
+    strings: &[(u32, u32)],
+    string_node_of: &HashMap<(u32, u32, u32), NodeId>,
+    key: (u32, u32),
+    addend: u32,
+) -> Option<NodeId> {
+    // Strings are emitted in offset-ascending order; binary-search by
+    // the largest offset ≤ addend.
+    let idx = strings.partition_point(|&(off, _)| off <= addend);
+    if idx == 0 { return None; }
+    let (off, len) = strings[idx - 1];
+    if addend >= off + len { return None; }
+    string_node_of.get(&(key.0, key.1, off)).copied()
 }
 
 /// Tarjan SCC. Returns `scc_of_node[n]` = scc id, `members[s]` = node
@@ -391,11 +553,12 @@ mod tests {
 
     fn graph_from(edges: Vec<Vec<NodeId>>) -> Graph {
         Graph {
-            nodes: (0..edges.len() as u32).map(|_| NodeMeta { object: 0, section: 0 }).collect(),
+            nodes: (0..edges.len() as u32)
+                .map(|_| NodeMeta::segment(0, 0))
+                .collect(),
             external_edge_counts: vec![0; edges.len()],
             edges,
             symbols: SymbolIndex::default(),
-            synthetic: HashMap::new(),
         }
     }
 

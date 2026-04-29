@@ -112,17 +112,16 @@ pub fn compute(
         .nodes
         .iter()
         .enumerate()
-        .map(|(nid, nm)| {
-            if nm.object == u32::MAX {
-                // Synthetic node — no bytes of its own. Use a stable
-                // nonce derived from the aggregator id so identically-
-                // shaped synthesized nodes produce the same content
-                // fingerprint across base/overlay scans.
-                let info = &graph.synthetic[&(nid as u32)];
-                blake3::hash(format!("graft-synthetic\0{}", info.aggregator_id).as_bytes())
-            } else {
-                blake3::hash(&objects[nm.object as usize].sections[nm.section as usize].bytes)
+        .map(|(_nid, nm)| {
+            // Concat segment bytes (each respecting its sub-range
+            // for per-string nodes) in segment order. Aggregator
+            // nodes own their contributors as segments, so this
+            // naturally captures the merged-output content.
+            let mut h = blake3::Hasher::new();
+            for seg in &nm.segments {
+                h.update(seg.bytes_in(&objects[seg.object as usize].sections));
             }
+            h.finalize()
         })
         .collect();
     let resolver = ContentResolver::build(objects, graph, &bytes_hashes);
@@ -131,21 +130,23 @@ pub fn compute(
         .nodes
         .iter()
         .enumerate()
-        .map(|(nid, nm)| {
-            if nm.object == u32::MAX {
-                // Synthetic: no bytes, no relocs of its own. The
-                // bytes_hash already encodes the aggregator identity;
-                // successor SCC roll-up captures contributor content.
-                bytes_hashes[nid]
-            } else {
-                let obj = &objects[nm.object as usize];
-                let sec = &obj.sections[nm.section as usize];
-                let mut h = blake3::Hasher::new();
-                h.update(&sec.bytes);
-                let encoded = encode_relocs(&sec.relocs, nm.object, obj.tu_id, &resolver);
-                h.update(&encoded);
-                h.finalize()
+        .map(|(_nid, nm)| {
+            let mut h = blake3::Hasher::new();
+            for seg in &nm.segments {
+                let obj = &objects[seg.object as usize];
+                let sec = &obj.sections[seg.section as usize];
+                h.update(seg.bytes_in(&obj.sections));
+                // Per-string segments (range = Some) have no relocs
+                // of their own — string bytes don't reference
+                // anything. Skip the section's relocs so each string
+                // node's input-hash is invariant to relocs that
+                // belong to other parts of the section.
+                if seg.range.is_none() {
+                    let encoded = encode_relocs(&sec.relocs, seg.object, obj.tu_id, &resolver);
+                    h.update(&encoded);
+                }
             }
+            h.finalize()
         })
         .collect();
 
@@ -210,11 +211,10 @@ fn encode_relocs(
     // drift, STT_SECTION-vs-symbol-target form changes).
     let canonical: Vec<CanonicalReloc> = relocs
         .iter()
-        .map(|r| CanonicalReloc {
-            offset: r.offset,
-            target: resolver.canonicalize_target(&r.target, obj_idx, tu_id),
-            r_type: r.r_type,
-            addend: r.addend,
+        .map(|r| {
+            let (target, addend) =
+                resolver.canonicalize_target_with_addend(&r.target, r.addend, obj_idx, tu_id);
+            CanonicalReloc { offset: r.offset, target, r_type: r.r_type, addend }
         })
         .collect();
     postcard::to_allocvec(&canonical).unwrap_or_default()
@@ -250,16 +250,22 @@ struct ContentResolver {
     /// (object_idx, section_name) → 8-byte content fingerprint.
     /// Used for `<section:NAME>` reloc-target resolution. Keyed
     /// per-object because multiple objects can have sections of the
-    /// same name (e.g., every CGU emits `.text`).
+    /// same name (e.g., every CGU emits `.text`). Pool sections (one
+    /// physical section, many per-string LogicalNodes) are NOT in
+    /// here — they live in `string_pool` instead.
     section: HashMap<(u32, String), [u8; 8]>,
-    /// Global symbol name → defining-section content fingerprint.
-    /// Same name across objects collapses to one entry — globals are
-    /// (by definition) unique by name, so identical content is
-    /// expected.
+    /// (object_idx, section_name) → sorted list of (offset, len,
+    /// fingerprint) for SHF_MERGE | SHF_STRINGS sections. Used to
+    /// canonicalize `<section:STR_POOL> + addend` refs to a specific
+    /// string's fingerprint, so that anon refs to a particular
+    /// string get a stable encoding regardless of which CGU's
+    /// `.rodata.str1.1` happens to host the string in this build.
+    string_pool: HashMap<(u32, String), Vec<(u32, u32, [u8; 8])>>,
+    /// Global symbol name → defining-node content fingerprint.
     global: HashMap<String, [u8; 8]>,
-    /// (local symbol name, defining tu_id) → defining-section
-    /// content fingerprint. Locals can repeat by name across TUs;
-    /// the tu_id disambiguates.
+    /// (local symbol name, defining tu_id) → defining-node content
+    /// fingerprint. Locals can repeat by name across TUs; the tu_id
+    /// disambiguates.
     local: HashMap<(String, [u8; 8]), [u8; 8]>,
 }
 
@@ -271,67 +277,85 @@ impl ContentResolver {
     ) -> Self {
         use crate::elf::SymbolBind;
         let mut section = HashMap::new();
+        let mut string_pool: HashMap<(u32, String), Vec<(u32, u32, [u8; 8])>> = HashMap::new();
         let mut global = HashMap::new();
         let mut local = HashMap::new();
         for (nid, nm) in graph.nodes.iter().enumerate() {
             let mut h = [0u8; 8];
             h.copy_from_slice(&bytes_hashes[nid].as_bytes()[..8]);
-            if nm.object == u32::MAX {
-                // Synthetic node: register the bracket symbols so
-                // canonicalize_target maps refs to `__init_array_start`
-                // etc. to this phantom's content fingerprint. No
-                // section-name registration (no real section).
-                let info = &graph.synthetic[&(nid as u32)];
-                for b in &info.bracket_symbols {
-                    global.insert(b.name.clone(), h);
+            for seg in &nm.segments {
+                let sec_name = &objects[seg.object as usize].sections[seg.section as usize].name;
+                match seg.range {
+                    None => {
+                        section.insert((seg.object, sec_name.clone()), h);
+                    }
+                    Some((off, len)) => {
+                        string_pool
+                            .entry((seg.object, sec_name.clone()))
+                            .or_default()
+                            .push((off, len, h));
+                    }
                 }
-                continue;
             }
-            let obj = &objects[nm.object as usize];
-            let sec = &obj.sections[nm.section as usize];
-            section.insert((nm.object, sec.name.clone()), h);
-            for &sym_idx in &sec.defined_symbols {
-                let sym = &obj.symbols[sym_idx];
-                if sym.name.is_empty() {
-                    continue;
-                }
+            for sym in &nm.defined_symbols {
                 match sym.bind {
                     SymbolBind::Global | SymbolBind::Weak => {
                         global.insert(sym.name.clone(), h);
                     }
                     SymbolBind::Local => {
-                        local.insert((sym.name.clone(), obj.tu_id), h);
+                        let tu_id = sym.tu_id.expect("local symbol must carry tu_id");
+                        local.insert((sym.name.clone(), tu_id), h);
                     }
                 }
             }
         }
-        Self { section, global, local }
+        for v in string_pool.values_mut() {
+            v.sort_by_key(|&(off, _, _)| off);
+        }
+        Self { section, string_pool, global, local }
     }
 
-    fn canonicalize_target(&self, name: &str, obj_idx: u32, tu_id: [u8; 8]) -> String {
-        // Section-targeted reloc.
-        if let Some(inner) = name.strip_prefix("<section:").and_then(|s| s.strip_suffix('>'))
-            && let Some(h) = self.section.get(&(obj_idx, inner.to_string()))
-        {
-            return format!("@{}", hex8(h));
+    fn canonicalize_target_with_addend(
+        &self,
+        name: &str,
+        addend: i64,
+        obj_idx: u32,
+        tu_id: [u8; 8],
+    ) -> (String, i64) {
+        // Section-targeted reloc. Try the per-string pool first
+        // (pool and ordinary section maps are mutually exclusive for
+        // any given (object, section_name)).
+        if let Some(inner) = name.strip_prefix("<section:").and_then(|s| s.strip_suffix('>')) {
+            if addend >= 0
+                && let Some(strings) = self.string_pool.get(&(obj_idx, inner.to_string()))
+            {
+                let a = addend as u32;
+                let idx = strings.partition_point(|&(off, _, _)| off <= a);
+                if idx > 0 {
+                    let (off, len, h) = strings[idx - 1];
+                    if a < off + len {
+                        return (format!("@{}", hex8(&h)), (a - off) as i64);
+                    }
+                }
+                // Out-of-bounds addend in a string pool: fall through
+                // to the section-level lookup (which won't have an
+                // entry — pool and section are mutually exclusive),
+                // then to the unmodified-name fallback.
+            }
+            if let Some(h) = self.section.get(&(obj_idx, inner.to_string())) {
+                return (format!("@{}", hex8(h)), addend);
+            }
         }
-        // Global symbol reloc. Look up by full name (with whatever
-        // `.llvm.<id>` suffix it carries — both base and overlay see
-        // the same suffix when the target is in-scope, since the
-        // suffix comes from the target's own CGU). Falls through if
-        // the symbol isn't in our inputs (e.g., resolved later via
-        // `-l<lib>` static archive that scan doesn't see, or libc).
         if let Some(h) = self.global.get(name) {
-            return format!("@{}", hex8(h));
+            return (format!("@{}", hex8(h)), addend);
         }
-        // Local symbol reloc.
         if let Some(h) = self.local.get(&(name.to_string(), tu_id)) {
-            return format!("@{}", hex8(h));
+            return (format!("@{}", hex8(h)), addend);
         }
         // Out-of-scope target: keep the original name. The SCC
         // walker counts these as externals (sentinel hash), so the
         // name itself is never compared between scans.
-        name.to_string()
+        (name.to_string(), addend)
     }
 }
 

@@ -248,15 +248,16 @@ fn build_symhash(scan: &ScanResult, elf_bytes: &[u8]) -> Result<Vec<SymHashEntry
     // Drop bind from the value type for the lookup-side use below.
     let mut sym_trans_hash: std::collections::HashMap<(String, Option<[u8; 8]>), [u8; 16]> =
         sym_trans_hash.into_iter().map(|(k, (th, _))| (k, th)).collect();
-    // Synthetic phantom nodes own bracket symbols (`__init_array_start`
+    // Aggregator nodes own bracket symbols (`__init_array_start`
     // etc.). Pass-2 walks base.elf's `.symtab` and finds these — they
     // exist there because the linker script defined them — so we need
     // an entry in `sym_trans_hash` keyed on the bracket name → the
-    // phantom's trans_hash.
-    for (&nid, info) in &scan.graph.synthetic {
-        let th = scan.trans_hash[nid as usize];
-        for b in &info.bracket_symbols {
-            sym_trans_hash.insert((b.name.clone(), None), th);
+    // aggregator's trans_hash.
+    for (nid, nm) in scan.graph.nodes.iter().enumerate() {
+        let th = scan.trans_hash[nid];
+        for sym in &nm.defined_symbols {
+            if sym.tu_id.is_some() { continue; } // not a bracket
+            sym_trans_hash.insert((sym.name.clone(), None), th);
         }
     }
 
@@ -325,7 +326,7 @@ pub(crate) fn node_id_of(graph: &crate::graph::Graph, object: u32, section: u32)
     // bottleneck, so linear scan is fine.
     let mut target: Option<u32> = None;
     for (nid, nm) in graph.nodes.iter().enumerate() {
-        if nm.object == object && nm.section == section {
+        if nm.segments.iter().any(|s| s.object == object && s.section == section) {
             target = Some(nid as u32);
             break;
         }

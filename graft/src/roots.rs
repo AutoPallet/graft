@@ -131,20 +131,20 @@ pub fn find_roots(
         }
     }
 
-    // (3) + (4): per-section checks (real input sections only —
-    // synthetic phantoms are reached via reloc edges from code that
-    // uses bracket symbols, not via root seeding).
+    // (3) + (4): per-segment retain / well-known-keep checks. Any
+    // segment with SHF_GNU_RETAIN or a well-known-keep name makes the
+    // whole node a root — segments of one node travel together, so
+    // retain-on-one is retain-on-all. (For aggregator nodes, this
+    // also handles cases like base linker scripts retaining
+    // `.init_array.*`.)
     for nid in 0..scan.graph.nodes.len() as NodeId {
         let nm = &scan.graph.nodes[nid as usize];
-        if nm.object == u32::MAX {
-            continue;
-        }
-        let sec = &scan.objects[nm.object as usize].sections[nm.section as usize];
-        let retain = sec.sh_flags & SHF_GNU_RETAIN != 0;
-        let keep_by_name = WELL_KNOWN_KEEP_PATTERNS
-            .iter()
-            .any(|p| p.matches(&sec.name));
-        if retain || keep_by_name {
+        let any_retain_or_keep = nm.segments.iter().any(|seg| {
+            let sec = &scan.objects[seg.object as usize].sections[seg.section as usize];
+            sec.sh_flags & SHF_GNU_RETAIN != 0
+                || WELL_KNOWN_KEEP_PATTERNS.iter().any(|p| p.matches(&sec.name))
+        });
+        if any_retain_or_keep {
             roots.insert(nid);
         }
     }

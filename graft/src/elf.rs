@@ -38,9 +38,6 @@ pub struct SectionInfo {
     /// `(offset, target_name, r_type, addend)` — stable regardless of
     /// the original `.o`'s internal symbol-index ordering.
     pub relocs: Vec<CanonicalReloc>,
-    /// Indexes into `ParsedObject::symbols` of symbols whose `st_shndx`
-    /// points at this section.
-    pub defined_symbols: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,9 +122,9 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedObject> {
         out
     };
 
-    // Now walk sections, collecting defined-symbol indexes and canonical relocs.
+    // Now walk sections, collecting canonical relocs.
     let mut sections: Vec<SectionInfo> = Vec::new();
-    for (i, sec) in obj.sections().enumerate() {
+    for sec in obj.sections() {
         let name = sec.name().unwrap_or("").to_string();
         let alloc = matches!(sec.kind(),
             ObjSectionKind::Text | ObjSectionKind::Data | ObjSectionKind::ReadOnlyData
@@ -194,13 +191,6 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedObject> {
         relocs.sort();
         relocs.dedup();
 
-        // Defined-symbol indexes: 1-based st_shndx in ELF, 0-based section idx here.
-        let defined_symbols: Vec<usize> = symbols
-            .iter()
-            .enumerate()
-            .filter_map(|(si, s)| (s.defining_section == Some(i)).then_some(si))
-            .collect();
-
         sections.push(SectionInfo {
             name,
             kind,
@@ -208,7 +198,6 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedObject> {
             sh_flags,
             bytes,
             relocs,
-            defined_symbols,
         });
     }
 

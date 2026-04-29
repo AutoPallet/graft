@@ -142,14 +142,16 @@ fn run(argv: Vec<String>) -> Result<()> {
             }
         }
     }
-    // Synthetic phantom nodes — register their bracket symbols too so
-    // refs to `__init_array_start` / etc. flow through the same
+    // Aggregator-node bracket symbols are global definitions too —
+    // include them in `overlay_symhash_globals` so refs to
+    // `__init_array_start` / etc. flow through the same
     // symhash-routed lookup as any other base-defined name.
-    for (&nid, info) in &scan.graph.synthetic {
-        let th = scan.trans_hash[nid as usize];
-        for b in &info.bracket_symbols {
-            let sh = crate::hash::symhash_of(crate::hash::stable_name_part(&b.name), &th);
-            overlay_symhash_globals.entry(b.name.clone()).or_insert(sh);
+    for (nid, nm) in scan.graph.nodes.iter().enumerate() {
+        let th = scan.trans_hash[nid];
+        for sym in &nm.defined_symbols {
+            if sym.tu_id.is_some() { continue; } // not a bracket
+            let sh = crate::hash::symhash_of(crate::hash::stable_name_part(&sym.name), &th);
+            overlay_symhash_globals.entry(sym.name.clone()).or_insert(sh);
         }
     }
     let closure_symhashes: HashSet<crate::hash::Symhash> = {
@@ -157,26 +159,8 @@ fn run(argv: Vec<String>) -> Result<()> {
         for &nid in &closure.closure {
             let nm = &scan.graph.nodes[nid as usize];
             let th = scan.trans_hash[nid as usize];
-            if nm.object == u32::MAX {
-                // Synthetic: bracket symbols are the "defined" set.
-                let info = &scan.graph.synthetic[&nid];
-                for b in &info.bracket_symbols {
-                    let sh = crate::hash::symhash_of(crate::hash::stable_name_part(&b.name), &th);
-                    s.insert(sh);
-                }
-                continue;
-            }
-            let obj = &scan.objects[nm.object as usize];
-            let sec = &obj.sections[nm.section as usize];
-            for &sym_idx in &sec.defined_symbols {
-                let sym = &obj.symbols[sym_idx];
-                if sym.name.is_empty() {
-                    continue;
-                }
-                let sh = crate::hash::symhash_of(
-                    crate::hash::stable_name_part(&sym.name),
-                    &th,
-                );
+            for sym in &nm.defined_symbols {
+                let sh = crate::hash::symhash_of(crate::hash::stable_name_part(&sym.name), &th);
                 s.insert(sh);
             }
         }
@@ -423,7 +407,9 @@ fn prune_all(
     let mut by_obj: HashMap<u32, HashSet<u32>> = HashMap::new();
     for &nid in &closure.closure {
         let nm = &scan.graph.nodes[nid as usize];
-        by_obj.entry(nm.object).or_default().insert(nm.section);
+        for seg in &nm.segments {
+            by_obj.entry(seg.object).or_default().insert(seg.section);
+        }
     }
 
     // First pass: prune each object whose sections appear in the
@@ -913,32 +899,9 @@ fn classify_provided(nid: NodeId, scan: &ScanResult, base: &BaseMetadata) -> boo
     let th: TransHash = scan.trans_hash[nid as usize];
     let dump_path = std::env::var("GRAFT_DEBUG_MISMATCH").ok();
 
-    if nm.object == u32::MAX {
-        // Synthetic phantom for a linker-aggregated output. Defined
-        // "symbols" are the bracket pair (`__init_array_start`/`end`).
-        // Either bracket's symhash matching base means the merged
-        // output's content is unchanged, so base's bracket addresses
-        // are still valid → Provided.
-        let info = &scan.graph.synthetic[&nid];
-        for b in &info.bracket_symbols {
-            let symhash = crate::hash::symhash_of(crate::hash::stable_name_part(&b.name), &th);
-            if base.by_symhash.contains_key(&symhash) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    let obj = &scan.objects[nm.object as usize];
-    let sec = &obj.sections[nm.section as usize];
-
     let mut any_match = false;
     let mut any_defined_symbol = false;
-    for &sym_idx in &sec.defined_symbols {
-        let sym = &obj.symbols[sym_idx];
-        if sym.name.is_empty() {
-            continue;
-        }
+    for sym in &nm.defined_symbols {
         any_defined_symbol = true;
         let symhash = crate::hash::symhash_of(crate::hash::stable_name_part(&sym.name), &th);
         if base.by_symhash.contains_key(&symhash) {
@@ -957,8 +920,8 @@ fn classify_provided(nid: NodeId, scan: &ScanResult, base: &BaseMetadata) -> boo
                     std::io::Write::write_all(
                         &mut f,
                         format!(
-                            "{tag} {} symhash={oh} sec={} (no base match)\n",
-                            sym.name, sec.name
+                            "{tag} {} symhash={oh} (no base match)\n",
+                            sym.name,
                         )
                         .as_bytes(),
                     )
@@ -974,10 +937,18 @@ fn format_closure_dump(scan: &ScanResult, c: &Closure) -> Vec<u8> {
     let _ = writeln!(s, "closure sections ({}):", c.closure.len());
     for &nid in &c.closure {
         let nm = &scan.graph.nodes[nid as usize];
-        let obj = &scan.objects[nm.object as usize];
-        let sec = &obj.sections[nm.section as usize];
-        let label = scan.inputs[nm.object as usize].label();
-        let _ = writeln!(s, "  [{nid}] {label} :: {} ({} bytes)", sec.name, sec.bytes.len());
+        let tag = nm.aggregator_id.unwrap_or("");
+        for seg in &nm.segments {
+            let obj = &scan.objects[seg.object as usize];
+            let sec = &obj.sections[seg.section as usize];
+            let label = scan.inputs[seg.object as usize].label();
+            let prefix = if tag.is_empty() { String::new() } else { format!("<agg:{tag}> ") };
+            let _ = writeln!(
+                s,
+                "  [{nid}] {prefix}{label} :: {} ({} bytes)",
+                sec.name, sec.bytes.len(),
+            );
+        }
     }
     s.into_bytes()
 }
