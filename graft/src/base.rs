@@ -283,14 +283,16 @@ fn build_symhash(scan: &ScanResult, elf_bytes: &[u8]) -> Result<Vec<SymHashEntry
             continue;
         }
         if s.is_undefined() { continue; }
-        if matches!(
-            s.kind(),
-            object::SymbolKind::Section | object::SymbolKind::Unknown
-        ) {
-            continue;
-        }
+        if matches!(s.kind(), object::SymbolKind::Section) { continue; }
         if name_raw.is_empty() { continue; }
 
+        // The `sym_trans_hash` lookup is the real filter — names not
+        // populated by Pass 1 are uninteresting noise (linker
+        // artifacts, build-id markers, etc.). Do the lookup *before*
+        // any kind-based skip so STT_NOTYPE bracket symbols
+        // (e.g. `__init_array_start = ABSOLUTE(.)` from linker
+        // scripts, mapped to `SymbolKind::Unknown` by the object
+        // crate) survive into `by_symhash`.
         let is_global = matches!(s.scope(), SymbolScope::Linkage | SymbolScope::Dynamic);
         let key_tu = if is_global { None } else { current_tu };
         let Some(&th) = sym_trans_hash.get(&(name_raw.to_string(), key_tu)) else { continue };

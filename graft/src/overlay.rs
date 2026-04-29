@@ -258,14 +258,41 @@ fn run(argv: Vec<String>) -> Result<()> {
 
     let overlay_elf = work_dir.join("overlay.elf");
     let t_link_start = std::time::Instant::now();
-    // Aggregate verify list across pruned objects. Same name should
-    // resolve to the same vaddr in every prune (resolution is
-    // deterministic per overlay run); collapse duplicates and bail
-    // if any disagree (would indicate inconsistent base.symtab /
-    // by_symhash data, never observed in practice).
+    // Aggregator bracket names (`__init_array_start/end` and friends):
+    // graft's scan demand-loads archive members by UND-reachability,
+    // and `.init_array.*` contributor sections live inside members
+    // that ld pulls in via `KEEP(*(.init_array .init_array.*))` not
+    // via UND chain — so neither base nor overlay scan see the
+    // aggregator node, brackets aren't in `by_symhash`, channel 2
+    // can't fire content-aware. Instead they fall to channel 3
+    // (base.symtab snapshot at base's bracket address). The anchor
+    // routes relocs to base's brackets, which is the right answer
+    // when overlay can't rebuild the aggregator (always the case
+    // today for archive-resident contributors). Overlay's same
+    // linker script independently re-derives `__init_array_start = .;`
+    // at overlay's own pruned merged section position — different
+    // value, but irrelevant because relocs go through the anchor,
+    // not through ld's resolution of the original name. Skip these
+    // in verify to avoid the false positive.
+    //
+    // Real fix for full content-aware bracket invalidation: extend
+    // scan to discover archive members reachable via linker-script
+    // KEEP rules (not just UND). Separate work; see follow-up tasks.
+    let aggregator_brackets: HashSet<&'static str> = crate::synthetic::AGGREGATORS
+        .iter()
+        .flat_map(|a| a.bracket_symbols.iter().copied())
+        .collect();
+    // Aggregate verify list across pruned objects. Channel-2 hits
+    // skip verify via verify_name=None at emit time; channel-3 hits
+    // (except aggregator brackets, exempted above) arrive here. Same
+    // name should resolve to the same vaddr in every prune; collapse
+    // duplicates and bail if any disagree.
     let mut assumed_names: HashMap<String, u64> = HashMap::new();
     for p in &pruned {
         for (name, addr) in &p.assumed_names {
+            if aggregator_brackets.contains(name.as_str()) {
+                continue;
+            }
             match assumed_names.entry(name.clone()) {
                 std::collections::hash_map::Entry::Vacant(v) => {
                     v.insert(*addr);

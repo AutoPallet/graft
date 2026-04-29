@@ -362,13 +362,22 @@ pub fn prune_object(
                             {
                                 // (2) Content-keyed match against base.
                                 // The symbol's symhash is identical to
-                                // base's, so base's address is the right
-                                // bridge target. Anchor key is the
-                                // symhash (stable across rebuilds).
+                                // base's, so base's address is the
+                                // right bridge target. Anchor key is
+                                // the symhash (stable across rebuilds).
+                                // No verify_name: content-match plus
+                                // closure gating already guarantees
+                                // overlay won't redefine the symbol's
+                                // bytes; the anchor pins refs at base's
+                                // address; ld's separate resolution of
+                                // the original name (which may be
+                                // layout-derived for aggregator
+                                // brackets) is irrelevant since the
+                                // anchor is the only thing relocs see.
                                 Outcome::Anchor {
                                     vaddr: entry.address as i64,
                                     key: sh,
-                                    verify_name: Some(lookup_name.clone()),
+                                    verify_name: None,
                                 }
                             } else if let Some(&addr) = base.base_symtab.get(&lookup_name) {
                                 // (3) Channel-of-last-resort: name was
