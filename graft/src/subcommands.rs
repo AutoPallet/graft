@@ -42,23 +42,16 @@ fn run_cache_info(path: &Path) -> anyhow::Result<()> {
     println!("  overlay_region   {:#x}..{:#x}", m.overlay_region.0, m.overlay_region.1);
     println!();
     println!("symhash: {} entries ({} bytes on disk)", entries.len(), symhash_bytes.len());
-    let globals = entries.iter().filter(|e| e.tu.is_none()).count();
-    let locals = entries.len() - globals;
-    println!("  {globals} globals, {locals} locals");
 
     if let Ok(pat) = std::env::var("GRAFT_GREP")
         && !pat.is_empty()
     {
         println!();
-        println!("entries matching {pat:?}:");
+        println!("entries with symhash prefix matching {pat:?}:");
         for e in &entries {
-            if e.name.contains(&pat) {
-                let scope = if e.tu.is_some() { "L" } else { "G" };
-                let hh: String = e.trans_hash[..6].iter().map(|b| format!("{b:02x}")).collect();
-                println!(
-                    "  {:#010x}  sz={:<6} {scope} {hh} {}",
-                    e.address, e.size, e.name
-                );
+            let hh: String = e.symhash.iter().map(|b| format!("{b:02x}")).collect();
+            if hh.contains(&pat) {
+                println!("  {:#010x}  sz={:<6} symhash={hh}", e.address, e.size);
             }
         }
     }

@@ -87,46 +87,85 @@ fn run(argv: Vec<String>) -> Result<()> {
     std::fs::create_dir_all(&work_dir)
         .with_context(|| format!("create {}", work_dir.display()))?;
 
-    // Build base symbol resolver: every defined symbol in base.elf's
-    // .symtab keyed by name (catches static-lib symbols rustc never
-    // saw), plus tu-id-discriminated locals from base's .graft.symhash
-    // (the elf scan can't disambiguate same-named locals across TUs;
-    // base scan recorded the tu_ids).
-    let base_resolver_globals = collect_base_globals(&base_path)?;
-    let base_resolver_locals: HashMap<(String, [u8; 8]), u64> = base
-        .symhash_by_local
-        .iter()
-        .map(|((n, t), e)| ((n.clone(), *t), e.address))
-        .collect();
-    let base_resolver_wrapped: HashSet<String> =
-        link_args.wrapped.iter().cloned().collect();
-    // Names of symbols defined in any closure-included section. These
-    // get re-emitted in overlay's pruned `.o`s, so cross-`.o` relocs
-    // targeting them must NOT be SHN_ABS-rewritten to base — ld needs
-    // to see the name reference so it can resolve to overlay's own
-    // copy. Without this, ld's --gc-sections drops the section in
-    // overlay (no callers visible) and cross-CGU calls silently route
-    // to base's old version.
-    let closure_symbol_names: HashSet<String> = {
-        let mut s: HashSet<String> = HashSet::new();
+    // Build the symhash-keyed resolver inputs.
+    //
+    // `overlay_symhash_by_name`: for every defined symbol in any
+    // section graft scanned, compute its overlay-side symhash from
+    // (stable_name_part, section's trans_hash). Prune uses this to
+    // translate reloc target names (which it sees in raw `.o` symtabs)
+    // into content-keyed lookups against base's `by_symhash`.
+    //
+    // `closure_symhashes`: the symhashes of every symbol defined in a
+    // closure-included section. Cross-`.o` relocs targeting these
+    // must NOT be SHN_ABS-rewritten to base (their content differs);
+    // ld must resolve them to overlay's own re-emitted copy.
+    //
+    // `base_addr_by_name`: name → address from base.elf's `.symtab`.
+    // Only consulted for the `__wrap_<sym>` lookup path — wrap names
+    // are stable, no symhash dance needed.
+    let mut overlay_symhash_by_name: HashMap<(String, [u8; 8]), crate::hash::Symhash> =
+        HashMap::new();
+    let mut overlay_symhash_globals: HashMap<String, crate::hash::Symhash> = HashMap::new();
+    // Fallback for cross-CGU references where the source `.o`'s tu_id
+    // doesn't match the target's defining `.o`. First-write-wins per
+    // name; safe because two locals with the same stable_name and
+    // identical content also share a symhash by construction.
+    let mut overlay_symhash_locals_any_tu: HashMap<String, crate::hash::Symhash> = HashMap::new();
+    for (oi, obj) in scan.objects.iter().enumerate() {
+        for sym in &obj.symbols {
+            if sym.name.is_empty() {
+                continue;
+            }
+            let Some(sec_idx) = sym.defining_section else { continue };
+            let nid_opt = crate::base::node_id_of(&scan.graph, oi as u32, sec_idx as u32);
+            let Some(nid) = nid_opt else { continue };
+            let th = scan.trans_hash[nid as usize];
+            let sh = crate::hash::symhash_of(crate::hash::stable_name_part(&sym.name), &th);
+            match sym.bind {
+                SymbolBind::Global | SymbolBind::Weak => {
+                    overlay_symhash_globals.entry(sym.name.clone()).or_insert(sh);
+                }
+                SymbolBind::Local => {
+                    overlay_symhash_by_name.insert((sym.name.clone(), obj.tu_id), sh);
+                    overlay_symhash_locals_any_tu
+                        .entry(sym.name.clone())
+                        .or_insert(sh);
+                }
+            }
+        }
+    }
+    let closure_symhashes: HashSet<crate::hash::Symhash> = {
+        let mut s = HashSet::new();
         for &nid in &closure.closure {
             let nm = &scan.graph.nodes[nid as usize];
             let obj = &scan.objects[nm.object as usize];
             let sec = &obj.sections[nm.section as usize];
+            let th = scan.trans_hash[nid as usize];
             for &sym_idx in &sec.defined_symbols {
                 let sym = &obj.symbols[sym_idx];
-                if !sym.name.is_empty() {
-                    s.insert(sym.name.clone());
+                if sym.name.is_empty() {
+                    continue;
                 }
+                let sh = crate::hash::symhash_of(
+                    crate::hash::stable_name_part(&sym.name),
+                    &th,
+                );
+                s.insert(sh);
             }
         }
         s
     };
+    let base_addr_by_name = collect_base_globals(&base_path)?;
+    let base_resolver_wrapped: HashSet<String> =
+        link_args.wrapped.iter().cloned().collect();
     let base_resolver = prune::BaseResolver {
-        globals: &base_resolver_globals,
-        locals: &base_resolver_locals,
+        by_symhash: &base.by_symhash,
+        wrap_addr_by_name: &base_addr_by_name,
         wrapped: &base_resolver_wrapped,
-        closure_symbols: &closure_symbol_names,
+        closure_symhashes: &closure_symhashes,
+        overlay_symhash_globals: &overlay_symhash_globals,
+        overlay_symhash_locals: &overlay_symhash_by_name,
+        overlay_symhash_locals_any_tu: &overlay_symhash_locals_any_tu,
     };
 
     // Prune each source object; collect the pruned-.o paths.
@@ -264,7 +303,7 @@ fn run(argv: Vec<String>) -> Result<()> {
          scan {:.1?} · closure {:.1?} · prune {:.1?} · link {:.1?} · combine {:.1?} · \
          total {:.1?}\n\
          overlay.elf: {}\n",
-        base.symhash_by_name.len(),
+        base.by_symhash.len(),
         scan.objects.len(),
         scan.graph.nodes.len(),
         closure.closure.len(),
@@ -739,10 +778,12 @@ fn run_real_linker(
 
 pub struct BaseMetadata {
     pub manifest: GraftManifest,
-    /// `name` → entry. One per globally-visible symbol live in base's .symtab.
-    pub symhash_by_name: HashMap<String, SymHashEntry>,
-    /// `(name, tu_id)` → entry. For STB_LOCAL entries.
-    pub symhash_by_local: HashMap<(String, [u8; 8]), SymHashEntry>,
+    /// Content-keyed lookup. Every entry in base's `.graft.symhash`
+    /// indexed by its 16-byte symhash (folds stable name + section
+    /// trans_hash). Identity is build-invariant: same symhash means
+    /// "base has interchangeable bytes for this content", regardless
+    /// of CGU re-partition or `.llvm.<id>` suffix drift.
+    pub by_symhash: HashMap<crate::hash::Symhash, SymHashEntry>,
 }
 
 fn load_base_metadata(path: &std::path::Path) -> Result<BaseMetadata> {
@@ -766,23 +807,12 @@ fn load_base_metadata(path: &std::path::Path) -> Result<BaseMetadata> {
     }
 
     let entries = metadata::decode_symhash(symhash_bytes)?;
-    let mut by_name: HashMap<String, SymHashEntry> = HashMap::with_capacity(entries.len());
-    let mut by_local: HashMap<(String, [u8; 8]), SymHashEntry> = HashMap::new();
+    let mut by_symhash: HashMap<crate::hash::Symhash, SymHashEntry> =
+        HashMap::with_capacity(entries.len());
     for e in entries {
-        match e.tu {
-            None => {
-                by_name.insert(e.name.clone(), e);
-            }
-            Some(tu) => {
-                by_local.insert((e.name.clone(), tu), e);
-            }
-        }
+        by_symhash.entry(e.symhash).or_insert(e);
     }
-    Ok(BaseMetadata {
-        manifest,
-        symhash_by_name: by_name,
-        symhash_by_local: by_local,
-    })
+    Ok(BaseMetadata { manifest, by_symhash })
 }
 
 pub(crate) struct Closure {
@@ -837,10 +867,10 @@ fn compute_closure(
     Ok(Closure { closure })
 }
 
-/// Returns true iff this section can be satisfied by base — i.e. it has
-/// at least one defined symbol whose `trans_hash` matches base's symhash
-/// entry under the same name (and tu_id, for locals). Sections with no
-/// matchable symbol must be Included (no address to point a reloc at).
+/// Returns true iff this section can be satisfied by base — at least
+/// one defined symbol's `symhash_of(stable_name, trans_hash)` matches
+/// an entry in `base.by_symhash`. Sections with no matchable symbol
+/// must be Included (no address to point a reloc at).
 fn classify_provided(nid: NodeId, scan: &ScanResult, base: &BaseMetadata) -> bool {
     let nm = &scan.graph.nodes[nid as usize];
     let obj = &scan.objects[nm.object as usize];
@@ -856,18 +886,11 @@ fn classify_provided(nid: NodeId, scan: &ScanResult, base: &BaseMetadata) -> boo
             continue;
         }
         any_defined_symbol = true;
-        let entry = match sym.bind {
-            SymbolBind::Global | SymbolBind::Weak => base.symhash_by_name.get(&sym.name),
-            SymbolBind::Local => {
-                base.symhash_by_local.get(&(sym.name.clone(), obj.tu_id))
-            }
-        };
-        let Some(e) = entry else { continue };
-        if e.trans_hash == th {
+        let symhash = crate::hash::symhash_of(crate::hash::stable_name_part(&sym.name), &th);
+        if base.by_symhash.contains_key(&symhash) {
             any_match = true;
         } else if let Some(p) = dump_path.as_ref() {
-            let bh: String = e.trans_hash[..8].iter().map(|b| format!("{b:02x}")).collect();
-            let oh: String = th[..8].iter().map(|b| format!("{b:02x}")).collect();
+            let oh: String = symhash[..8].iter().map(|b| format!("{b:02x}")).collect();
             let tag = match sym.bind {
                 SymbolBind::Local => 'L',
                 _ => 'G',
@@ -880,7 +903,7 @@ fn classify_provided(nid: NodeId, scan: &ScanResult, base: &BaseMetadata) -> boo
                     std::io::Write::write_all(
                         &mut f,
                         format!(
-                            "{tag} {} base={bh} overlay={oh} sec={}\n",
+                            "{tag} {} symhash={oh} sec={} (no base match)\n",
                             sym.name, sec.name
                         )
                         .as_bytes(),

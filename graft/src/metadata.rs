@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const GRAFT_MAGIC: [u8; 4] = *b"GRFT";
-pub const SCHEMA_VERSION: u16 = 1;
+pub const SCHEMA_VERSION: u16 = 2;
 
 pub const SECTION_MANIFEST: &str = ".graft.manifest";
 pub const SECTION_SYMHASH: &str = ".graft.symhash";
@@ -28,17 +28,24 @@ pub struct GraftManifest {
     pub overlay_region: (u64, u64),
 }
 
+/// Per-symbol "what does base have for this content?" record. Stored
+/// in `.graft.symhash` and consulted by overlay's classify + prune
+/// passes to decide whether a section is Provided (base's copy
+/// matches, overlay can resolve to base's address) or Included
+/// (overlay must re-emit).
+///
+/// `symhash` is the **only** identifier — no name, no tu_id. It folds
+/// the symbol's content + (for non-anon symbols) its stable name into
+/// a single 16-byte fingerprint via `hash::symhash_of`. Lookups are
+/// therefore content-keyed and immune to compiler-internal renaming
+/// (CGU re-partition shifting `.llvm.<id>` suffixes, anon
+/// fingerprint drift, STT_SECTION ↔ symbol form changes). Two builds
+/// of the same source produce identical symhashes; two genuinely
+/// different symbols don't collide because the stable name (when
+/// the symbol has one) disambiguates.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SymHashEntry {
-    pub name: String,
-    /// `None` for STB_GLOBAL. `Some(tu_id)` for STB_LOCAL, where
-    /// `tu_id = blake3(STT_FILE symbol name of defining .o)[:8]`.
-    pub tu: Option<[u8; 8]>,
-    /// Truncated blake3 of (bytes || canonical relocs || SCC-successor
-    /// transitive hashes). Sections in the same SCC share one hash.
-    /// All-zeros for externally-sourced symbols (prebuilt libs,
-    /// linker-provided).
-    pub trans_hash: [u8; 16],
+    pub symhash: [u8; 16],
     /// `st_value` from base's final `.symtab`.
     pub address: u64,
     /// `st_size` from base's final `.symtab`.
@@ -83,20 +90,8 @@ mod tests {
     #[test]
     fn symhash_roundtrip() {
         let entries = vec![
-            SymHashEntry {
-                name: "main".into(),
-                tu: None,
-                trans_hash: [1; 16],
-                address: 0x400000,
-                size: 42,
-            },
-            SymHashEntry {
-                name: "_ZN4core3fmt9Formatter...".into(),
-                tu: Some([2; 8]),
-                trans_hash: [3; 16],
-                address: 0x401000,
-                size: 128,
-            },
+            SymHashEntry { symhash: [1; 16], address: 0x400000, size: 42 },
+            SymHashEntry { symhash: [3; 16], address: 0x401000, size: 128 },
         ];
         let bytes = encode_symhash(&entries).unwrap();
         let decoded = decode_symhash(&bytes).unwrap();

@@ -53,9 +53,14 @@ impl Fixture {
         // base and overlay mode with unchanged sources wouldn't trigger
         // a relink. Clean `app` specifically (leaving `base`'s rlib
         // cached — it's not mode-sensitive) so cargo re-invokes graft.
+        // The fixture's `.cargo/config.toml` pins target=musl, so we
+        // must pass `--target` to clean — `cargo clean -p app` alone
+        // only touches the host target dir, leaving stale binaries
+        // (notably prior overlay-mode combined ELFs) under the musl
+        // target dir and cargo treating the build as fresh.
         let clean = Command::new("cargo")
             .current_dir(&self.dir)
-            .args(["clean", "-p", "app"])
+            .args(["clean", "-p", "app", "--target", "x86_64-unknown-linux-musl"])
             .output()
             .expect("spawn cargo clean");
         assert!(clean.status.success(), "cargo clean -p app failed");
@@ -171,6 +176,7 @@ fn make_executable(p: &Path) {
 
 fn run_combined(path: &Path) -> String {
     let out = Command::new(path).output().expect("exec combined");
+    eprintln!("run_combined({}): status={:?} stdout-len={} stderr-len={}", path.display(), out.status, out.stdout.len(), out.stderr.len());
     assert!(
         out.status.success(),
         "combined exited {:?}\nstdout:\n{}\nstderr:\n{}",

@@ -29,8 +29,70 @@ use crate::graph::{Graph, SccResult};
 use crate::elf::{CanonicalReloc, ParsedObject};
 
 pub type TransHash = [u8; 16];
+pub type Symhash = [u8; 16];
 
 pub const EXTERNAL_SENTINEL: TransHash = [0u8; 16];
+
+/// Per-symbol fingerprint stored in `.graft.symhash`.
+///
+/// `symhash_of(stable_name, trans_hash) = blake3(stable_name? ‖ NUL ‖ trans_hash)`
+///
+/// `stable_name` is `Some(s)` for symbols whose name is invariant
+/// across builds of the same source (most rust-mangled symbols, C
+/// globals). It's `None` for symbols whose name embeds a
+/// build-specific fingerprint that drifts on every cargo
+/// incremental re-emit:
+///   - `anon.<cgu_fp>.<n>(.llvm.<id>)?` — rustc anonymous data.
+///   - Same shape used by some allocator/format internals.
+///
+/// Folding the stable name in disambiguates two distinct symbols that
+/// happen to compile to byte-identical sections. Folding the
+/// trans_hash in catches content + dependency changes — anon symbols
+/// rely on this exclusively. Two builds of the same source produce
+/// the same symhash regardless of CGU re-partitioning,
+/// `.llvm.<digits>` suffix drift, or STT_SECTION ↔ symbol reloc form.
+pub fn symhash_of(stable_name: Option<&str>, trans_hash: &TransHash) -> Symhash {
+    let mut h = blake3::Hasher::new();
+    if let Some(n) = stable_name {
+        h.update(n.as_bytes());
+    }
+    h.update(b"\0");
+    h.update(trans_hash);
+    let digest = *h.finalize().as_bytes();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
+}
+
+/// Extract the stable part of a symbol name, or `None` if the name is
+/// build-noise. The classifier mirrors what `M1.q.2`'s
+/// `ContentResolver::canonicalize_target` already strips for
+/// trans_hash inputs:
+///
+///   - `anon.<hex>.<n>` (with optional `.llvm.<id>` suffix) → drop
+///     entirely; identity is purely content-based.
+///   - `<name>.llvm.<digits>` → strip the `.llvm.<digits>` suffix
+///     (rustc internal-linkage symbols whose suffix shifts when CGU
+///     content shifts). The pre-suffix part already includes rustc's
+///     content-derived hash, so it's stable.
+///   - Empty names → `None`.
+///   - Otherwise → return as-is.
+pub fn stable_name_part(name: &str) -> Option<&str> {
+    if name.is_empty() {
+        return None;
+    }
+    if name.starts_with("anon.") {
+        return None;
+    }
+    // Strip a trailing `.llvm.<digits>` suffix if present.
+    if let Some(idx) = name.rfind(".llvm.") {
+        let suffix = &name[idx + ".llvm.".len()..];
+        if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
+            return Some(&name[..idx]);
+        }
+    }
+    Some(name)
+}
 
 /// Compute a `TransHash` for every node. All nodes in the same SCC
 /// receive the same hash.

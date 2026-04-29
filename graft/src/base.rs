@@ -176,67 +176,54 @@ fn exec_real_linker(argv: &[String]) -> Result<std::process::ExitStatus> {
 }
 
 /// Join scan output (symbol → defining section → trans_hash) with the
-/// output ELF's `.symtab` (symbol → address, size, bind). Only symbols
-/// present in both are emitted.
+/// output ELF's `.symtab` (symbol → address, size, bind). Each entry
+/// stores `(symhash, address, size)` — the symhash folds the symbol's
+/// stable name (where it has one) into the section's trans_hash, so
+/// identity is content-keyed and immune to compiler-internal renaming.
+/// See `hash::symhash_of`.
 fn build_symhash(scan: &ScanResult, elf_bytes: &[u8]) -> Result<Vec<SymHashEntry>> {
     let elf = object::File::parse(elf_bytes).context("parse output ELF")?;
 
-    // Build: section-node-id → (tu_id, trans_hash) for every defined symbol
-    // in our scan. Keyed by symbol name; globals ignore tu_id.
-    // We walk the scan's parsed objects to find each symbol's defining
-    // section's NodeId (which we can look up via the symbol index).
-    let mut global_hash: std::collections::HashMap<String, [u8; 16]> = Default::default();
-    let mut local_hash: std::collections::HashMap<(String, [u8; 8]), [u8; 16]> = Default::default();
-
+    // (symbol_name, tu_id_or_none) → trans_hash of the defining section.
+    // tu_id distinguishes same-named locals across TUs.
+    let mut sym_trans_hash: std::collections::HashMap<(String, Option<[u8; 8]>), [u8; 16]> =
+        Default::default();
     for (obj_idx, obj) in scan.objects.iter().enumerate() {
         for sym in &obj.symbols {
             let Some(sec_idx) = sym.defining_section else { continue };
-            // Find this section's NodeId by scanning graph.nodes. In the
-            // ScanResult the flat NodeId layout is in the order we
-            // pushed them, so we can reconstruct it arithmetically.
-            let nid = node_id_of(&scan.graph, obj_idx as u32, sec_idx as u32);
-            let Some(nid) = nid else { continue };
+            let Some(nid) = node_id_of(&scan.graph, obj_idx as u32, sec_idx as u32) else {
+                continue;
+            };
             let th = scan.trans_hash[nid as usize];
-            match sym.bind {
-                SymbolBind::Global | SymbolBind::Weak => {
-                    global_hash.insert(sym.name.clone(), th);
-                }
-                SymbolBind::Local => {
-                    local_hash.insert((sym.name.clone(), obj.tu_id), th);
-                }
-            }
+            let key_tu = match sym.bind {
+                SymbolBind::Global | SymbolBind::Weak => None,
+                SymbolBind::Local => Some(obj.tu_id),
+            };
+            sym_trans_hash.insert((sym.name.clone(), key_tu), th);
         }
     }
 
-    // Now walk the output ELF's symtab, emitting an entry for each symbol
-    // we can resolve back to a trans_hash. STT_FILE markers partition
-    // STB_LOCAL ranges by source TU — we track the current TU's tu_id
-    // (computed identically to scan-side via blake3(stt_file_name)[:8])
-    // and use it to disambiguate same-named locals across TUs in the
-    // local_hash lookup.
+    // Walk output ELF's symtab; for each defined symbol we can pair
+    // back to a trans_hash, emit (symhash, address, size). STT_FILE
+    // markers partition STB_LOCAL ranges by source TU — track the
+    // current TU's tu_id (blake3(stt_file_name)[:8]) to disambiguate
+    // same-named locals.
     //
-    // Critical: locals MUST round-trip through symhash. With LTO/fat,
-    // every static (e.g. esp_println::LOCK) is a STB_LOCAL — if we
-    // skip them, overlay's closure walk classifies them as Included,
-    // which makes overlay re-allocate them at fresh addresses while
-    // base is still using its own copy. The two halves of the program
-    // end up with different views of every shared static.
+    // Critical: locals must round-trip through symhash. With LTO/fat,
+    // every static (e.g. esp_println::LOCK) is STB_LOCAL — skipping
+    // them makes overlay's classify see them as Included, overlay
+    // re-allocates them at fresh addresses, base keeps using its own
+    // copy, and the two halves of the program end up with different
+    // views of every shared static.
     let mut entries: Vec<SymHashEntry> = Vec::new();
     let mut current_tu: Option<[u8; 8]> = None;
+    let mut seen: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
     for s in elf.symbols() {
         let name_raw = s.name().unwrap_or("");
         if matches!(s.kind(), object::SymbolKind::File) {
             current_tu = Some(tu_id_from_file_name(name_raw));
             continue;
         }
-        // `is_definition()` in `object` 0.36 requires a real section
-        // index, which excludes SHN_ABS — i.e. linker-script direct
-        // assignments like `__udivdi3 = 0x40002544`. We still want
-        // those: overlay's `compute_closure` needs to see ROM symbols
-        // (esp32s3.rom.libgcc.ld) so calls into them resolve straight
-        // to base's address rather than dragging compiler_builtins'
-        // weak fallback into the closure. So accept anything that's
-        // not undef and not a marker (FILE/SECTION/UNKNOWN).
         if s.is_undefined() { continue; }
         if matches!(
             s.kind(),
@@ -245,32 +232,23 @@ fn build_symhash(scan: &ScanResult, elf_bytes: &[u8]) -> Result<Vec<SymHashEntry
             continue;
         }
         if name_raw.is_empty() { continue; }
-        let name = name_raw.to_string();
 
         let is_global = matches!(s.scope(), SymbolScope::Linkage | SymbolScope::Dynamic);
-        if is_global {
-            let Some(&th) = global_hash.get(&name) else { continue };
-            entries.push(SymHashEntry {
-                name,
-                tu: None,
-                trans_hash: th,
-                address: s.address(),
-                size: s.size() as u32,
-            });
-        } else {
-            let Some(tu) = current_tu else { continue };
-            let Some(&th) = local_hash.get(&(name.clone(), tu)) else { continue };
-            entries.push(SymHashEntry {
-                name,
-                tu: Some(tu),
-                trans_hash: th,
-                address: s.address(),
-                size: s.size() as u32,
-            });
-        }
+        let key_tu = if is_global { None } else { current_tu };
+        let Some(&th) = sym_trans_hash.get(&(name_raw.to_string(), key_tu)) else { continue };
+        let symhash = crate::hash::symhash_of(crate::hash::stable_name_part(name_raw), &th);
+        // Dedup: multiple symbols can collapse to the same symhash
+        // (e.g. all anons with identical content). Keep the first;
+        // every collapsed pair points at semantically interchangeable
+        // bytes, so any of their addresses works.
+        if !seen.insert(symhash) { continue; }
+        entries.push(SymHashEntry {
+            symhash,
+            address: s.address(),
+            size: s.size() as u32,
+        });
     }
-    entries.sort_by(|a, b| (a.name.as_str(), a.tu).cmp(&(b.name.as_str(), b.tu)));
-    entries.dedup_by(|a, b| a.name == b.name && a.tu == b.tu);
+    entries.sort_by(|a, b| a.symhash.cmp(&b.symhash));
     Ok(entries)
 }
 
@@ -282,7 +260,7 @@ fn tu_id_from_file_name(name: &str) -> [u8; 8] {
     out
 }
 
-fn node_id_of(graph: &crate::graph::Graph, object: u32, section: u32) -> Option<u32> {
+pub(crate) fn node_id_of(graph: &crate::graph::Graph, object: u32, section: u32) -> Option<u32> {
     // graph.nodes was built by a nested loop over (obj, sec), pushing
     // NodeId sequentially — so for every object we can compute the base
     // NodeId as the sum of section counts in prior objects.

@@ -6,10 +6,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use graft::prune;
-
-fn empty_resolver() -> (HashMap<String, u64>, HashMap<(String, [u8; 8]), u64>) {
-    (HashMap::new(), HashMap::new())
-}
+use graft::hash::Symhash;
+use graft::metadata::SymHashEntry;
 
 fn fixture_deps() -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -47,10 +45,22 @@ fn prune_keep_all_preserves_shape() {
         keep.insert(idx0);
     }
 
-    let (g, l) = empty_resolver();
+    let by_sh: HashMap<Symhash, SymHashEntry> = HashMap::new();
+    let osh_g: HashMap<String, Symhash> = HashMap::new();
+    let osh_l: HashMap<(String, [u8; 8]), Symhash> = HashMap::new();
+    let osh_lat: HashMap<String, Symhash> = HashMap::new();
     let w: HashSet<String> = HashSet::new();
-    let cs: HashSet<String> = HashSet::new();
-    let resolver = prune::BaseResolver { globals: &g, locals: &l, wrapped: &w, closure_symbols: &cs };
+    let wrap_addr: HashMap<String, u64> = HashMap::new();
+    let cs: HashSet<Symhash> = HashSet::new();
+    let resolver = prune::BaseResolver {
+        by_symhash: &by_sh,
+        overlay_symhash_globals: &osh_g,
+        overlay_symhash_locals: &osh_l,
+        overlay_symhash_locals_any_tu: &osh_lat,
+        wrapped: &w,
+        wrap_addr_by_name: &wrap_addr,
+        closure_symhashes: &cs,
+    };
     let result = prune::prune_object(&bytes, [0; 8], &keep, &resolver)
         .unwrap_or_else(|e| panic!("prune {}: {e:#}", path.display()));
     // Re-parse.
@@ -73,10 +83,22 @@ fn prune_keep_none_still_parses() {
 
     // Drop every section.
     let keep: HashSet<u32> = HashSet::new();
-    let (g, l) = empty_resolver();
+    let by_sh: HashMap<Symhash, SymHashEntry> = HashMap::new();
+    let osh_g: HashMap<String, Symhash> = HashMap::new();
+    let osh_l: HashMap<(String, [u8; 8]), Symhash> = HashMap::new();
+    let osh_lat: HashMap<String, Symhash> = HashMap::new();
     let w: HashSet<String> = HashSet::new();
-    let cs: HashSet<String> = HashSet::new();
-    let resolver = prune::BaseResolver { globals: &g, locals: &l, wrapped: &w, closure_symbols: &cs };
+    let wrap_addr: HashMap<String, u64> = HashMap::new();
+    let cs: HashSet<Symhash> = HashSet::new();
+    let resolver = prune::BaseResolver {
+        by_symhash: &by_sh,
+        overlay_symhash_globals: &osh_g,
+        overlay_symhash_locals: &osh_l,
+        overlay_symhash_locals_any_tu: &osh_lat,
+        wrapped: &w,
+        wrap_addr_by_name: &wrap_addr,
+        closure_symhashes: &cs,
+    };
     let result = prune::prune_object(&bytes, [0xAB; 8], &keep, &resolver).unwrap_or_else(|e| {
         // If there are relocs into sections we dropped, we expect an error.
         // That's OK — just make sure we fail cleanly, not panic.
