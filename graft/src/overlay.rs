@@ -98,9 +98,12 @@ fn run(argv: Vec<String>) -> Result<()> {
         .iter()
         .map(|((n, t), e)| ((n.clone(), *t), e.address))
         .collect();
+    let base_resolver_wrapped: HashSet<String> =
+        link_args.wrapped.iter().cloned().collect();
     let base_resolver = prune::BaseResolver {
         globals: &base_resolver_globals,
         locals: &base_resolver_locals,
+        wrapped: &base_resolver_wrapped,
     };
 
     // Prune each source object; collect the pruned-.o paths.

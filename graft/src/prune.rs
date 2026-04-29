@@ -37,6 +37,13 @@ use object::{
 pub struct BaseResolver<'a> {
     pub globals: &'a HashMap<String, u64>,
     pub locals: &'a HashMap<(String, [u8; 8]), u64>,
+    /// Names that ld will redirect via `--wrap=<sym>` at link time.
+    /// Relocs targeting these names must NOT be SHN_ABS-rewritten —
+    /// ld would have pointed the reference at `__wrap_<sym>`, which
+    /// lives wherever ld decides (overlay or base), not at base's
+    /// address of `<sym>`. Leaving these as UND lets ld's wrap path
+    /// resolve them via the forwarded `--wrap` flag.
+    pub wrapped: &'a HashSet<String>,
 }
 
 impl<'a> BaseResolver<'a> {
@@ -156,6 +163,10 @@ pub fn prune_object(
     // Cache: target_sec_idx -> base vaddr of section start (i.e. the
     // surrogate's base vaddr minus its offset within the section).
     let mut section_base_vaddr: HashMap<SectionIndex, i64> = HashMap::new();
+    // Cache: wrap-targeted symbol name -> UND SymbolId in output.
+    // Lazily emitted so we don't add UND entries for wrap names
+    // that don't appear in any reloc.
+    let mut wrap_sym_map: HashMap<String, SymbolId> = HashMap::new();
     let mut abs_rewrites: usize = 0;
 
     // Pass 3: relocations from kept sections.
@@ -206,17 +217,41 @@ pub fn prune_object(
                                     "reloc in {from_section}: target symbol has no name and no defining section"
                                 );
                             }
-                            let was_local = matches!(
-                                src_sym.scope(),
-                                SymbolScope::Compilation | SymbolScope::Unknown
-                            );
-                            let vaddr = base.resolve(name, was_local, source_tu_id).ok_or_else(
-                                || anyhow!(
-                                    "reloc in {from_section}: can't resolve {name} \
-                                     (local={was_local}) against base"
-                                ),
-                            )?;
-                            Outcome::Base { vaddr: vaddr as i64 }
+                            // ld's `--wrap=<name>` redirects references
+                            // away from base's address — emit a UND
+                            // symbol and let ld handle resolution.
+                            if base.wrapped.contains(name) {
+                                let wsym_id = match wrap_sym_map.get(name) {
+                                    Some(&id) => id,
+                                    None => {
+                                        let id = out.add_symbol(WSymbol {
+                                            name: name.as_bytes().to_vec(),
+                                            value: 0,
+                                            size: 0,
+                                            kind: SymbolKind::Unknown,
+                                            scope: write::SymbolScope::Dynamic,
+                                            weak: false,
+                                            section: WSymbolSection::Undefined,
+                                            flags: write::SymbolFlags::None,
+                                        });
+                                        wrap_sym_map.insert(name.to_string(), id);
+                                        id
+                                    }
+                                };
+                                Outcome::Internal { sym_id: wsym_id, addend_extra: 0 }
+                            } else {
+                                let was_local = matches!(
+                                    src_sym.scope(),
+                                    SymbolScope::Compilation | SymbolScope::Unknown
+                                );
+                                let vaddr = base.resolve(name, was_local, source_tu_id).ok_or_else(
+                                    || anyhow!(
+                                        "reloc in {from_section}: can't resolve {name} \
+                                         (local={was_local}) against base"
+                                    ),
+                                )?;
+                                Outcome::Base { vaddr: vaddr as i64 }
+                            }
                         }
                     }
                 }

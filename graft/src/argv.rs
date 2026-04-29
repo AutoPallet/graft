@@ -21,6 +21,14 @@ pub struct LinkArgs {
     /// `-L<path>` library-search paths the link argv accumulates.
     /// ld walks them in order to resolve `-l<name>` flags.
     pub library_paths: Vec<PathBuf>,
+    /// `--wrap=<sym>` flags. ld redirects references to `<sym>` to
+    /// `__wrap_<sym>` and renames the original definition to
+    /// `__real_<sym>`. Prune *cannot* SHN_ABS-rewrite a reloc to a
+    /// wrapped name because the post-wrap target is `__wrap_<sym>`,
+    /// not the address of `<sym>` in base. We leave wrap-targeted
+    /// relocs as UND symbol references and let ld handle them via
+    /// the forwarded `--wrap` flag.
+    pub wrapped: Vec<String>,
 }
 
 pub fn parse(argv: &[String]) -> LinkArgs {
@@ -84,6 +92,12 @@ pub fn parse(argv: &[String]) -> LinkArgs {
         {
             out.library_paths.push(PathBuf::from(v));
             i += 1;
+            continue;
+        }
+        // --wrap=<sym> / -Wl,--wrap=<sym> / -Wl,--wrap,<sym>
+        if let Some(name) = extract_wrap(a, argv.get(i + 1).map(|s| s.as_str())) {
+            out.wrapped.push(name.rhs.into_owned());
+            i += if name.consumed_next { 2 } else { 1 };
             continue;
         }
         if is_input(a) {
@@ -151,6 +165,30 @@ pub fn driver_path(argv: &[String]) -> PathBuf {
 struct Undefined<'a> {
     rhs: std::borrow::Cow<'a, str>,
     consumed_next: bool,
+}
+
+fn extract_wrap<'a>(cur: &'a str, _next: Option<&'a str>) -> Option<Undefined<'a>> {
+    if let Some(s) = cur.strip_prefix("--wrap=") {
+        return Some(Undefined { rhs: s.into(), consumed_next: false });
+    }
+    if let Some(rest) = cur.strip_prefix("-Wl,") {
+        for tok in rest.split(',') {
+            if let Some(s) = tok.strip_prefix("--wrap=") {
+                return Some(Undefined { rhs: s.to_string().into(), consumed_next: false });
+            }
+        }
+        // -Wl,--wrap,SYM
+        let parts: Vec<&str> = rest.split(',').collect();
+        let mut it = parts.iter().copied();
+        while let Some(tok) = it.next() {
+            if tok == "--wrap"
+                && let Some(s) = it.next()
+            {
+                return Some(Undefined { rhs: s.to_string().into(), consumed_next: false });
+            }
+        }
+    }
+    None
 }
 
 fn extract_undefined<'a>(cur: &'a str, next: Option<&'a str>) -> Option<Undefined<'a>> {
