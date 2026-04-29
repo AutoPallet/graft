@@ -44,6 +44,13 @@ pub struct BaseResolver<'a> {
     /// address of `<sym>`. Leaving these as UND lets ld's wrap path
     /// resolve them via the forwarded `--wrap` flag.
     pub wrapped: &'a HashSet<String>,
+    /// Names of symbols defined in any closure section. Cross-`.o`
+    /// relocs to these must stay as UND symbol references so ld
+    /// resolves them to overlay's own copies (in another filtered
+    /// archive / loose `.o`), not to base's stale address. Without
+    /// this, --gc-sections drops the closure-included section in
+    /// overlay and the cross-CGU call routes silently into base.
+    pub closure_symbols: &'a HashSet<String>,
 }
 
 impl<'a> BaseResolver<'a> {
@@ -217,10 +224,26 @@ pub fn prune_object(
                                     "reloc in {from_section}: target symbol has no name and no defining section"
                                 );
                             }
-                            // ld's `--wrap=<name>` redirects references
-                            // away from base's address — emit a UND
-                            // symbol and let ld handle resolution.
-                            if base.wrapped.contains(name) {
+                            // Two cases must NOT SHN_ABS-rewrite to
+                            // base's address:
+                            //   (a) `--wrap=<name>`: ld redirects to
+                            //       `__wrap_<name>`, not base's `<name>`.
+                            //   (b) name is defined by a closure-included
+                            //       section: that section's trans_hash
+                            //       differs from base, so base's address
+                            //       points at a stale version of the
+                            //       symbol. ld must see the name ref so
+                            //       it resolves to overlay's own copy
+                            //       in another filtered archive / loose
+                            //       `.o`. Without this, --gc-sections
+                            //       drops overlay's copy (no callers
+                            //       visible) and the cross-CGU call
+                            //       silently routes into base's old code.
+                            // Both cases: emit a UND symbol with the
+                            // original name and let ld resolve.
+                            if base.wrapped.contains(name)
+                                || base.closure_symbols.contains(name)
+                            {
                                 let wsym_id = match wrap_sym_map.get(name) {
                                     Some(&id) => id,
                                     None => {

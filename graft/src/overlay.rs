@@ -100,10 +100,33 @@ fn run(argv: Vec<String>) -> Result<()> {
         .collect();
     let base_resolver_wrapped: HashSet<String> =
         link_args.wrapped.iter().cloned().collect();
+    // Names of symbols defined in any closure-included section. These
+    // get re-emitted in overlay's pruned `.o`s, so cross-`.o` relocs
+    // targeting them must NOT be SHN_ABS-rewritten to base — ld needs
+    // to see the name reference so it can resolve to overlay's own
+    // copy. Without this, ld's --gc-sections drops the section in
+    // overlay (no callers visible) and cross-CGU calls silently route
+    // to base's old version.
+    let closure_symbol_names: HashSet<String> = {
+        let mut s: HashSet<String> = HashSet::new();
+        for &nid in &closure.closure {
+            let nm = &scan.graph.nodes[nid as usize];
+            let obj = &scan.objects[nm.object as usize];
+            let sec = &obj.sections[nm.section as usize];
+            for &sym_idx in &sec.defined_symbols {
+                let sym = &obj.symbols[sym_idx];
+                if !sym.name.is_empty() {
+                    s.insert(sym.name.clone());
+                }
+            }
+        }
+        s
+    };
     let base_resolver = prune::BaseResolver {
         globals: &base_resolver_globals,
         locals: &base_resolver_locals,
         wrapped: &base_resolver_wrapped,
+        closure_symbols: &closure_symbol_names,
     };
 
     // Prune each source object; collect the pruned-.o paths.

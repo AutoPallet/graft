@@ -49,7 +49,8 @@ fn prune_keep_all_preserves_shape() {
 
     let (g, l) = empty_resolver();
     let w: HashSet<String> = HashSet::new();
-    let resolver = prune::BaseResolver { globals: &g, locals: &l, wrapped: &w };
+    let cs: HashSet<String> = HashSet::new();
+    let resolver = prune::BaseResolver { globals: &g, locals: &l, wrapped: &w, closure_symbols: &cs };
     let result = prune::prune_object(&bytes, [0; 8], &keep, &resolver)
         .unwrap_or_else(|e| panic!("prune {}: {e:#}", path.display()));
     // Re-parse.
@@ -74,7 +75,8 @@ fn prune_keep_none_still_parses() {
     let keep: HashSet<u32> = HashSet::new();
     let (g, l) = empty_resolver();
     let w: HashSet<String> = HashSet::new();
-    let resolver = prune::BaseResolver { globals: &g, locals: &l, wrapped: &w };
+    let cs: HashSet<String> = HashSet::new();
+    let resolver = prune::BaseResolver { globals: &g, locals: &l, wrapped: &w, closure_symbols: &cs };
     let result = prune::prune_object(&bytes, [0xAB; 8], &keep, &resolver).unwrap_or_else(|e| {
         // If there are relocs into sections we dropped, we expect an error.
         // That's OK — just make sure we fail cleanly, not panic.
