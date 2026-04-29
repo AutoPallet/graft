@@ -118,7 +118,38 @@ pub fn build(objects: &[ParsedObject]) -> Graph {
         }
     }
 
+    // Per-node bytes hash, computed once for use as a content-stable
+    // tiebreaker across scans whose object-iteration order differs.
+    let bytes_hash_of: Vec<[u8; 16]> = nodes
+        .iter()
+        .map(|nm| {
+            let sec = &objects[nm.object as usize].sections[nm.section as usize];
+            let h = blake3::hash(&sec.bytes);
+            let mut out = [0u8; 16];
+            out.copy_from_slice(&h.as_bytes()[..16]);
+            out
+        })
+        .collect();
+
     // Symbol index: map every defined symbol to its defining section's NodeId.
+    //
+    // For multiply-defined globals (e.g. rust's per-crate `__rust_alloc`
+    // shim that lives in many CGUs with byte-identical content), pick
+    // the canonical NodeId by *content-derived tiebreaker* rather than
+    // by scan iteration order. base and overlay scans of logically-
+    // equivalent input sets can differ in object iteration order
+    // (cargo regenerates rlibs whose internal member order varies on
+    // each rebuild even when the encoded source set is the same), and
+    // first-write-wins would then pick different canonicals between
+    // scans. Different canonicals → different graph topology → SCC
+    // structures that look isomorphic but route ~half the graph's
+    // trans_hashes through subtly different node identities, blowing
+    // up overlay closures with sections whose bytes match base
+    // verbatim.
+    //
+    // Tiebreaker: lowest bytes_hash among all definers for the same
+    // name. Identical content → identical bytes_hash → both scans
+    // pick the same canonical.
     let mut symbols = SymbolIndex::default();
     for (oi, obj) in objects.iter().enumerate() {
         for sym in &obj.symbols {
@@ -126,13 +157,19 @@ pub fn build(objects: &[ParsedObject]) -> Graph {
             let Some(&nid) = node_of.get(&(oi as u32, sec_idx as u32)) else { continue };
             match sym.bind {
                 SymbolBind::Global | SymbolBind::Weak => {
-                    // First-write-wins on duplicate globals — mirrors
-                    // ld's archive-resolution semantics (left-to-right
-                    // argv search, first defining archive binds). Order-
-                    // independent across base/overlay scans, which load
-                    // archives in different sequences once lazy
-                    // discovery lands.
-                    symbols.globals.entry(sym.name.clone()).or_insert(nid);
+                    let new_h = bytes_hash_of[nid as usize];
+                    match symbols.globals.entry(sym.name.clone()) {
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert(nid);
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut o) => {
+                            let existing = *o.get();
+                            let existing_h = bytes_hash_of[existing as usize];
+                            if new_h < existing_h {
+                                o.insert(nid);
+                            }
+                        }
+                    }
                 }
                 SymbolBind::Local => {
                     symbols.locals.insert((sym.name.clone(), obj.tu_id), nid);
