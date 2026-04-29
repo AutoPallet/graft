@@ -82,13 +82,30 @@ pub fn run<P: AsRef<Path>>(
     }
 
     // Demand-load loop: any UND symbol in any loaded object that
-    // resolves to a deferred-archive member triggers parsing of that
-    // member; rinse and repeat. Seeded with `extra_roots`
-    // (`-u <sym>` / `--undefined=<sym>` from the link argv) so members
-    // ld would force-load via those flags also get pulled.
+    // resolves to a deferred-archive member AND isn't already defined
+    // by a previously-loaded object triggers parsing of that member;
+    // rinse and repeat. Mirrors ld's lazy archive resolution: ld
+    // doesn't pull `libmain.a`'s app_main if Rust's eager
+    // libesp_idf_sys.rlib already defines it. Without the
+    // already-defined check, we'd over-pull and end up with multiple
+    // Global definitions of the same name in scan.objects — which
+    // base::build_symhash treats as a hard error per ld semantics.
+    //
+    // Seeded with `extra_roots` (`-u <sym>` / `--undefined=<sym>`)
+    // so members ld would force-load via those flags also get pulled.
     let mut loaded_members: HashSet<(usize, u64)> = HashSet::new();
     let mut pending: Vec<(usize, u64)> = Vec::new();
+    let mut defined_globals: HashSet<String> = HashSet::new();
+    for obj in &objects {
+        for sym in &obj.symbols {
+            if sym.defining_section.is_none() { continue; }
+            if !matches!(sym.bind, SymbolBind::Global | SymbolBind::Weak) { continue; }
+            if sym.name.is_empty() { continue; }
+            defined_globals.insert(sym.name.clone());
+        }
+    }
     for sym_name in extra_roots {
+        if defined_globals.contains(sym_name) { continue; }
         if let Some(&(ai, off)) = symbol_index.get(sym_name)
             && loaded_members.insert((ai, off))
         {
@@ -104,6 +121,15 @@ pub fn run<P: AsRef<Path>>(
                 .with_context(|| format!("parse member at {off:#x} in {}", archive.path.display()))?;
             let parsed = elf::parse(&inp.bytes)
                 .map_err(|e| anyhow::anyhow!("{}: {e}", inp.label()))?;
+            // Track this newly-loaded member's defined globals so
+            // subsequent pulls don't re-pull the same name from a
+            // different archive.
+            for sym in &parsed.symbols {
+                if sym.defining_section.is_none() { continue; }
+                if !matches!(sym.bind, SymbolBind::Global | SymbolBind::Weak) { continue; }
+                if sym.name.is_empty() { continue; }
+                defined_globals.insert(sym.name.clone());
+            }
             inputs.push(inp);
             objects.push(parsed);
         }
@@ -116,6 +142,9 @@ pub fn run<P: AsRef<Path>>(
                     continue;
                 }
                 if sym.name.is_empty() {
+                    continue;
+                }
+                if defined_globals.contains(&sym.name) {
                     continue;
                 }
                 if let Some(&(ai, off)) = symbol_index.get(&sym.name)

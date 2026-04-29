@@ -184,10 +184,14 @@ fn exec_real_linker(argv: &[String]) -> Result<std::process::ExitStatus> {
 fn build_symhash(scan: &ScanResult, elf_bytes: &[u8]) -> Result<Vec<SymHashEntry>> {
     let elf = object::File::parse(elf_bytes).context("parse output ELF")?;
 
-    // (symbol_name, tu_id_or_none) → trans_hash of the defining section.
-    // tu_id distinguishes same-named locals across TUs.
-    let mut sym_trans_hash: std::collections::HashMap<(String, Option<[u8; 8]>), [u8; 16]> =
-        Default::default();
+    // (symbol_name, tu_id_or_none) → (trans_hash, bind) of the defining
+    // section. `bind` is tracked so we can match ld's resolution rule:
+    // Global > Weak regardless of scan order. tu_id distinguishes
+    // same-named locals across TUs.
+    let mut sym_trans_hash: std::collections::HashMap<
+        (String, Option<[u8; 8]>),
+        ([u8; 16], SymbolBind),
+    > = Default::default();
     for (obj_idx, obj) in scan.objects.iter().enumerate() {
         for sym in &obj.symbols {
             let Some(sec_idx) = sym.defining_section else { continue };
@@ -199,9 +203,43 @@ fn build_symhash(scan: &ScanResult, elf_bytes: &[u8]) -> Result<Vec<SymHashEntry
                 SymbolBind::Global | SymbolBind::Weak => None,
                 SymbolBind::Local => Some(obj.tu_id),
             };
-            sym_trans_hash.insert((sym.name.clone(), key_tu), th);
+            // ld's resolution rules:
+            //   - Two Global defs of the same name → "multiple
+            //     definition" link error. Mirror loudly.
+            //   - Global > Weak: a later Global upgrades over an
+            //     earlier Weak (and vice-versa: Weak doesn't downgrade
+            //     a Global).
+            //   - Multiple Weaks: first encountered wins (matches ld's
+            //     left-to-right archive search).
+            use std::collections::hash_map::Entry;
+            match sym_trans_hash.entry((sym.name.clone(), key_tu)) {
+                Entry::Vacant(v) => {
+                    v.insert((th, sym.bind));
+                }
+                Entry::Occupied(mut o) => {
+                    let (existing_th, existing_bind) = *o.get();
+                    match (existing_bind, sym.bind) {
+                        (SymbolBind::Global, SymbolBind::Global)
+                            if existing_th != th =>
+                        {
+                            bail!(
+                                "graft base: multiple Global definitions of {:?} with \
+                                 differing trans_hashes — base.elf would not link cleanly",
+                                sym.name,
+                            );
+                        }
+                        (SymbolBind::Weak, SymbolBind::Global) => {
+                            o.insert((th, sym.bind));
+                        }
+                        _ => {} // keep existing
+                    }
+                }
+            }
         }
     }
+    // Drop bind from the value type for the lookup-side use below.
+    let mut sym_trans_hash: std::collections::HashMap<(String, Option<[u8; 8]>), [u8; 16]> =
+        sym_trans_hash.into_iter().map(|(k, (th, _))| (k, th)).collect();
     // Synthetic phantom nodes own bracket symbols (`__init_array_start`
     // etc.). Pass-2 walks base.elf's `.symtab` and finds these — they
     // exist there because the linker script defined them — so we need
