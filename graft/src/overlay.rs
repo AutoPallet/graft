@@ -72,6 +72,14 @@ fn run(argv: Vec<String>) -> Result<()> {
         .context("overlay pre-scan")?;
     let t_scan = t_scan_start.elapsed();
 
+    if let Ok(p) = std::env::var("GRAFT_DEBUG_DUMP_GRAPH")
+        && !p.is_empty()
+    {
+        if let Err(e) = crate::debug_dump::dump_graph(std::path::Path::new(&p), &scan) {
+            eprintln!("graft overlay: GRAFT_DEBUG_DUMP_GRAPH write {p} failed: {e}");
+        }
+    }
+
     let t_closure_start = std::time::Instant::now();
     let roots = roots::find_roots(&scan, &base, &link_args)?;
     let closure = compute_closure(&scan, &base, &roots)?;

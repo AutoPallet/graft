@@ -94,6 +94,13 @@ fn run(argv: Vec<String>) -> Result<()> {
 
     let t_post = std::time::Instant::now();
     let elf_bytes = std::fs::read(&output).with_context(|| format!("read {}", output.display()))?;
+    if let Ok(p) = std::env::var("GRAFT_DEBUG_DUMP_GRAPH")
+        && !p.is_empty()
+    {
+        if let Err(e) = crate::debug_dump::dump_graph(std::path::Path::new(&p), &scan_result) {
+            eprintln!("graft base: GRAFT_DEBUG_DUMP_GRAPH write {p} failed: {e}");
+        }
+    }
     let entries = build_symhash(&scan_result, &elf_bytes)?;
 
     let manifest = GraftManifest {

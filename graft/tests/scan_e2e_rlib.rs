@@ -30,7 +30,7 @@ fn scan_base_rlib() {
         return;
     };
 
-    let r = graft::scan::run::<PathBuf>(&[rlib.clone()], &[], &[]).expect("scan");
+    let r = graft::scan::run::<PathBuf>(&[rlib.clone()], &[], &[], &[]).expect("scan");
     assert!(!r.inputs.is_empty(), "expected at least one .o in the rlib");
     assert_eq!(r.inputs.len(), r.objects.len());
     assert_eq!(r.graph.nodes.len(), r.graph.edges.len());
@@ -43,7 +43,7 @@ fn scan_base_rlib() {
     }
 
     // Determinism: re-run scan on the same input, expect identical hashes.
-    let r2 = graft::scan::run::<PathBuf>(&[rlib.clone()], &[], &[]).expect("scan 2");
+    let r2 = graft::scan::run::<PathBuf>(&[rlib.clone()], &[], &[], &[]).expect("scan 2");
     assert_eq!(r.trans_hash, r2.trans_hash, "trans_hash not deterministic across re-scan");
 
     // Non-empty alloc sections should produce non-zero hashes (sentinel

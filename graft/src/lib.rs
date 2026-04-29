@@ -8,6 +8,7 @@ pub mod archive;
 pub mod argv;
 pub mod base;
 pub mod combine;
+pub mod debug_dump;
 pub mod elf;
 pub mod elf_attach;
 pub mod graph;
