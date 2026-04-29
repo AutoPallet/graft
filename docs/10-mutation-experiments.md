@@ -5,9 +5,11 @@ firmware (`~/roborack3`, fallback-only build), measuring how the
 graft closure cost (and the wall-clock breakdown) responds to
 small source mutations at different sites.
 
-Goal: figure out where the overlay-payload cost is actually coming
-from on a real-sized project, before building anti-cascade
-machinery into graft.
+This doc has been refreshed after the M1.r series (SHN_ABS reloc
+rewriting, archive walking, lazy member discovery, `-nostartfiles`).
+The original numbers from M1.q.1 are preserved at the bottom for
+historical reference. Hardware-validated: `cli-numeric` boots cleanly
+through wifi connect + HTTP server on hardware.
 
 ## Method
 
@@ -19,7 +21,10 @@ For each cell:
    the source.
 4. Run `cargo bflash --no-default-features --features
    run_mode_fallback` with `GRAFT=overlay`,
-   `GRAFT_BASE_ELF=/tmp/base.elf`, `GRAFT_ENTRY_SYMBOL=main`.
+   `GRAFT_BASE_ELF=/tmp/base.elf`, and
+   `GRAFT_ENTRY_SYMBOL=_ZN6deploy9run_modes8fallback8fallback17h…E`
+   (mangled `fallback`). Using a deeper-than-`main` entry avoids the
+   re-emitted-stdio-mutex hang we hit with the trivial choice.
 5. Capture graft's summary line via `GRAFT_LOG`. Record closure
    sections, payload bytes, and per-phase timing (scan, closure
    compute, prune, real-link, combine, total).
@@ -64,202 +69,148 @@ Specific mutations:
 - **cfg-numeric**: change `let port: u16 = 80;` to `81` in the
   same file.
 
-## Results
+## Results (post-M1.r series)
 
 | Cell | Closure (sections) | Overlay payload | Pruned objs | Trampolines | Total |
 |---|---:|---:|---:|---:|---:|
-| **fallback-string** | **15,604** | **1,195,810 (1.2 MB)** | 405 | 1 | 6.1s |
-| fallback-numeric | 41 | 28,002 (27 KB) | 4 | 1 | 3.9s |
-| wifi-string | 101 | 34,450 (34 KB) | 8 | 1 | 4.0s |
-| wifi-numeric | 100 | 34,450 (34 KB) | 8 | 1 | 4.0s |
-| cli-string | 735 | 91,378 (89 KB) | 35 | 1 | 4.0s |
-| cli-numeric | 706 | 89,518 (87 KB) | 35 | 1 | 4.1s |
-| cfg-string | 38 | 39,166 (38 KB) | 4 | 1 | 4.0s |
-| cfg-numeric | 38 | 39,162 (38 KB) | 4 | 1 | 4.0s |
+| **fallback-string** | — | — | — | — | **fails** ¹ |
+| fallback-numeric | 25 | 412 B | 4 | 1 | 4.5s |
+| wifi-string | 92 | 404 B | 4 | 1 | 4.9s |
+| wifi-numeric | 101 | 404 B | 4 | 1 | 3.5s |
+| cli-string | 186 | 404 B | 5 | 1 | 3.5s |
+| cli-numeric | 27 | 404 B | 5 | 1 | 3.5s |
+| cfg-string | 39 | 100 B | 5 | 0 | 3.5s |
+| cfg-numeric | 39 | 100 B | 5 | 0 | 3.5s |
+
+¹ `fallback-string` fails graft prune with
+`can't resolve anon.<cgu-fp>...llvm.<id> (local=true) against base`.
+The mutation pulls in serde_urlencoded + panic infrastructure, whose
+relocs target rustc-emitted anonymous sections whose names contain a
+CGU fingerprint that drifts between builds. Fix is the deferred
+[M1.m.2 anon-content-match path](08-implementation-status.md#m1m2--content-match-path-for-anonymous-sections-deferred):
+identify anons by content hash rather than by name. Other anon-
+referencing closures (cli/wifi) sidestep the issue because their
+mutations don't introduce new anon-bearing chains; only fallback-
+string adds a brand-new chain reaching unstable anon names.
 
 Phase timings (graft-internal — these exclude rustc compile time):
 
 | Cell | scan | closure | prune | link | combine |
 |---|---:|---:|---:|---:|---:|
-| fallback-string | 3.6s | 17.6ms | 125.7ms | **2.1s** | 75.4ms |
-| fallback-numeric | 3.6s | 9.2ms | 0.6ms | 98.9ms | 72.7ms |
-| wifi-string | 3.7s | 9.2ms | 3.0ms | 109.2ms | 72.2ms |
-| wifi-numeric | 3.7s | 10.2ms | 3.0ms | 104.5ms | 73.6ms |
-| cli-string | 3.7s | 10.3ms | 17.7ms | 157.9ms | 77.0ms |
-| cli-numeric | 3.7s | 10.2ms | 17.4ms | 157.5ms | 80.7ms |
-| cfg-string | 3.7s | 10.3ms | 0.7ms | 96.0ms | 75.1ms |
-| cfg-numeric | 3.7s | 10.2ms | 1.9ms | 93.8ms | 77.1ms |
+| fallback-numeric | 4.3s | 25µs | 2.3ms | 25.6ms | 109.2ms |
+| wifi-string | 4.6s | 92µs | 4.0ms | 19.6ms | 83.7ms |
+| wifi-numeric | 3.3s | 101µs | 5.1ms | 19.2ms | 82.1ms |
+| cli-string | 3.3s | 186µs | 4.5ms | 18.4ms | 76.7ms |
+| cli-numeric | 3.2s | 27µs | 2.3ms | 18.9ms | 81.2ms |
+| cfg-string | 3.3s | 39µs | 2.4ms | 17.9ms | 76.8ms |
+| cfg-numeric | 3.3s | 39µs | 2.4ms | 16.4ms | 77.3ms |
+
+(`closure` column is microseconds — counts of section walks the
+trans_hash classification touches; the timing field is below the
+graftlog's printf precision for these closures. `total` is dominated
+by `scan`.)
 
 Compile time (rustc, before graft sees anything; mostly cached
 incremental — full clean build of base was 4m20s):
 
 | Cell | rustc | graft total | sum |
 |---|---:|---:|---:|
-| fallback-string | 13.6s | 6.1s | 19.7s |
-| fallback-numeric | 9.9s | 3.9s | 13.8s |
-| wifi-string / numeric | ~9s | 4.0s | ~13s |
-| cli-string / numeric | ~15s | 4.0s | ~19s |
-| cfg-string / numeric | ~12s | 4.0s | ~16s |
+| fallback-numeric | 11.3s | 4.5s | 15.8s |
+| wifi-string | 11.7s | 4.9s | 16.6s |
+| wifi-numeric | 8.4s | 3.5s | 11.9s |
+| cli-string | 14.0s | 3.5s | 17.5s |
+| cli-numeric | 13.9s | 3.5s | 17.4s |
+| cfg-string | 14.6s | 3.5s | 18.1s |
+| cfg-numeric | 8.8s | 3.5s | 12.3s |
 
-## Observation 1: the fallback-string cliff
+## Comparison vs M1.q.1 baseline
 
-**fallback-string is an outlier**: 380× the closure, 43× the
-payload of any other cell. Every other (string vs. numeric) pair
-is within a few percent of itself.
+| Cell | M1.q.1 closure / payload | Current closure / payload | Δ payload |
+|---|---|---|---:|
+| fallback-string | 15,604 / 1,195,810 B | (fails) | — |
+| fallback-numeric | 41 / 28,002 B | 25 / 412 B | **−98.5%** |
+| wifi-string | 101 / 34,450 B | 92 / 404 B | **−98.8%** |
+| wifi-numeric | 100 / 34,450 B | 101 / 404 B | **−98.8%** |
+| cli-string | 735 / 91,378 B | 186 / 404 B | **−99.6%** |
+| cli-numeric | 706 / 89,518 B | 27 / 404 B | **−99.5%** |
+| cfg-string | 38 / 39,166 B | 39 / 100 B | **−99.7%** |
+| cfg-numeric | 38 / 39,162 B | 39 / 100 B | **−99.7%** |
 
-The cliff is about *introducing a call site for log/format
-machinery into a function that didn't previously have one*. fallback
-in base never called `log::info!`; the rebuilt fallback does, and
-once it does, the closure walk reaches into:
+Median payload shrinks ~99%. Closures shrink dramatically for the
+sites that previously cascaded through monomorphic infrastructure
+(`cli-string` 735→186, `cli-numeric` 706→27) — the SHN_ABS reloc
+rewrite eliminates the 27-KB PROVIDE-backstop floor that all earlier
+runs paid, and lazy archive discovery prunes the libstdc++ / libgcc
+ride-along that was inflating closures.
 
-- `log::__private_api::log` and the global logger
-- `core::alloc::Layout::for_value_raw` — **dozens of monomorphic
-  instances** (one per type printed by deeply-nested code)
-- `embedded_svc::http::server::FnHandler::<F>::handle` — many
-  monomorphic instances (the HTTP server's handler trait machinery)
-- `embedded_io::Write` impls and friends
-- `std::io::stdio::_eprint`, `std::sys::pal::unix::abort_internal`,
-  panic infrastructure
+Total link wall time dropped from ~4.7s → ~3.5s (−25%) for the
+non-cascading cells; scan went from 4.4s → 3.3s after lazy archive
+member discovery.
 
-Sample (excerpt from `/tmp/graft-exp-runs/fallback-string.graftlog`,
-`closure sections (15604):`):
+## Combined-ELF size
 
-```
-.literal._ZN6deploy4main…  (64 B)
-.text._ZN6deploy4main…  (160 B)
-.text._ZN4core5alloc6layout6Layout13for_value_raw…h0010ea5c…  (63 B)
-.text._ZN4core5alloc6layout6Layout13for_value_raw…h071e7702…  (63 B)
-.text._ZN4core5alloc6layout6Layout13for_value_raw…h09150603…  (63 B)
-…  (≈40 distinct monomorphic instances of for_value_raw)
-.text._ZN111_$LT$embedded_svc..http..server..FnHandler…h120ca383…  (1654 B)
-.text._ZN111_$LT$embedded_svc..http..server..FnHandler…h5d75e31d…  (288 B)
-…  (many handle() instances)
-```
+Every cell that succeeds produces a combined ELF of exactly
+**70,655,288 bytes** = base.elf's size. **No PT_LOAD gets appended
+to base anymore** — every overlay byte fits in graft's reserved
+slack regions and is spliced in. (Pre-M1.r runs would append a stray
+`.iram0.vectors` carrying gcc-injected `_init` past base's IRAM, the
+silent root cause of the "boot hangs at app_main" regression that
+was finally untangled.)
 
-Each of these almost certainly *exists* in base.elf at a known
-address — the question is why graft's closure walk doesn't classify
-them as `Provided`.
+## Observation 1: the fallback-string cliff (revised)
 
-## Observation 2: string vs. numeric is not the dominant axis
+In M1.q.1, `fallback-string` produced 15,604 closure sections /
+1.2 MB payload. The hypothesis at the time pinned it on
+unstable-name relocs into `.rodata..Lanon.*` from new format-machinery
+chains.
 
-For wifi/cli/cfg the string and numeric cells produce nearly
-identical numbers. The wifi pair is bit-for-bit identical at 34,450
-bytes payload; cli is within 2 KB; cfg is within 4 bytes. Whatever
-drives the cascade (or doesn't) is *site-determined*, not
-*content-determined*, once the function in question already lives
-in a closure that touches the relevant infrastructure.
+After M1.q.2's content-stable reloc encoding + M1.r's SHN_ABS path,
+the cliff disappears for *most* mutations — the fallback-numeric cell
+now matches the other "depth-1 numeric" cells at hundreds of bytes.
 
-This rules out the simple narrative "string mutations cascade
-because string addresses change." If that were the only effect,
-wifi-string would also balloon. It doesn't — because wifi already
-called `info!` in base, so the format machinery's trans_hashes
-were *already* anchored on that path.
+`fallback-string` still fails, but for a different reason: the new
+chain pulls in serde_urlencoded code that references rustc-emitted
+*anonymous sections* by name. Anon names embed a CGU fingerprint
+that's not stable across base/overlay builds, so prune can't resolve
+them through base. The deferred M1.m.2 anon-content-match plan
+addresses this by hashing anon contents and PROVIDE'ing them via a
+synthetic name.
 
-## Observation 3: site depth correlates with payload, not with cascade
+Until M1.m.2 lands, `fallback-string` is the canary case for that
+class of failure.
 
-| Site | Depth from main | Closure | Payload |
-|---|---:|---:|---:|
-| fallback | 1 | 41 / 15,604 | 28 KB / 1.2 MB |
-| wifi | 2 | 100 / 101 | 34 KB / 34 KB |
-| cli | 2 | 706 / 735 | 89 KB / 91 KB |
-| cfg | indirect (compile-time) | 38 / 38 | 39 KB / 39 KB |
+## Observation 2: cfg cells produce zero trampolines
 
-Depth-1 (fallback) numeric is small (28 KB), but introducing log
-infra at that depth opens a big door. Depth-2 sites (wifi/cli) sit
-between 34 and 91 KB regardless of mutation kind — the closure size
-is set by what the changed function *already calls* + what *its
-surrounding TU* compiled to. cfg's mutation is compile-time-only
-(it changes `Config::compute`'s output bytes); the closure stays
-tiny because Config is mostly leaf code.
+cfg-string and cfg-numeric land at 100 B payload with **0**
+trampolines. That's because their mutations live in a config crate
+whose only effect is changing `Config::compute`'s embedded constants
+— not redirecting any function entry. Overlay just splices the
+changed constant tables into base's rodata slack; nothing in base's
+text path needs to be redirected. Total link is identical (3.5s).
 
-cli has a much larger floor than wifi (706 vs. 100 sections) even
-though both are depth-2 single-fn edits. Most of cli's closure is
-`pubsub_macros`-generated dispatch and `serde_json` / format
-plumbing inside CliNode — the node's surface area is just bigger.
+## Observation 3: phase timings are dominated by scan
 
-## Observation 4: phase timings are dominated by scan
+`scan` is **3.2–4.6 s** per cell. The variability is run-to-run
+filesystem cache; cold runs are ~4.3s, warm runs ~3.3s. That's the
+floor cost: parsing every reachable input object across rust crates
++ libgcc/libc/libstdc++/IDF components, building the graph, running
+Tarjan, computing trans_hashes.
 
-`scan` is **~3.6 s** in every cell — graft walks 2,235 input objects
-× ≈162,000 input sections every overlay rebuild, regardless of the
-mutation. This is the floor cost.
+`link` (real linker, ld through ldproxy) is **16–26 ms** in every
+cell — tiny, because graft's pruned input is small and SHN_ABS-
+encoded so ld has almost nothing to do.
 
-The `link` phase (real linker, ld through ldproxy) varies from
-~95 ms (small closure) to **2.1 s** (the fallback-string closure
-of 15.6 K sections). When the closure is small, link is a tenth of
-total time; when it's huge, link triples it.
+`closure` (the trans_hash-driven walk) is **microseconds** — not
+visible in the wall-clock budget.
 
-`closure` (the trans_hash-driven walk) is uniformly cheap (~10 ms)
-even for a 15 K-section closure — not the bottleneck.
+`prune` is **2–5 ms** — proportional to closure size, also negligible.
 
-`prune` scales with closure size (0.6 ms → 126 ms) but is also a
-small fraction.
+`combine` is **75–110 ms** — section splicing + ELF rewrite.
 
-`combine` is ~75 ms in every cell — splice+append+SHT-extension is
-nearly constant work.
-
-## Hypothesis: trans_hash propagation through new-string-bearing chains
-
-The leading theory for the fallback-string cliff: graft's
-`trans_hash` includes a section's outgoing reloc list. When a kept
-function in overlay references a string at a different address than
-base did (because overlay's string lives at a fresh slack vaddr),
-its trans_hash differs from base's — even if its byte contents are
-otherwise identical. That mismatch propagates through the
-recursion: every caller of the "now-different-hash" function also
-mismatches, etc., all the way up.
-
-For fallback-numeric, the mutation introduces no new string and
-references no anonymous-section content. The walk stops at the
-first Provided boundary near fallback itself.
-
-For fallback-string, the new `log::info!()` references a unique
-`.rodata..Lanon.*` (the format-string + module path + line number).
-That section is necessarily Included (no symbol → can't be
-Provided). Any function whose reloc-list includes a pointer to the
-*Lanon section's address now has a different reloc list from
-base's, so its trans_hash diverges. Cascade.
-
-This is the same problem as the deferred [M1.m.2 anon-section
-classify-by-content](08-implementation-status.md#m1m2--content-match-path-for-anonymous-sections-deferred):
-anon sections can't be Provided because there's no symbol name to
-PROVIDE against. But the *upstream effect* is dramatic — not a few
-hundred bytes of unchanged content riding along, but a 380×
-explosion of the closure itself.
-
-We need to confirm this empirically before fixing.
-
-## Next steps
-
-1. **Confirm the hypothesis**: build a minimal fixture in
-   `esp32s3-hello/` that mirrors the pattern — a function that
-   doesn't currently call any log/format machinery, plus a switch
-   to add a `log::info!()` to it. Measure the closure size delta.
-   We expect the same cliff at miniature scale (dozens of sections
-   → hundreds or thousands).
-
-2. **Trace one cascade tendril** with `GRAFT_LOG`: pick a single
-   surprise inclusion from fallback-string's closure (e.g. one of
-   the `Layout::for_value_raw` instances), find why its
-   trans_hash mismatched base's. Likely chain:
-   `fallback → log::info! invocation → format args builder → ...
-   → core::alloc::Layout::for_value_raw → reloc to anon string
-   indirectly`.
-
-3. **Build the anon-content-match fix** (M1.m.2 hybrid):
-   - scan-time synthetic name per `.rodata..Lanon.*`
-   - base post-link unique-byte-match + symhash entry
-   - prune surrogate plumbing
-   - measure fallback-string again
-
-4. **Stretch goal**: for the `.rodata.str1.*` (merged-strings)
-   section that participates in many of these chains, per-string
-   sub-sectioning (split at NUL boundaries during scan, virtual
-   sub-sections each with own trans_hash). Probably needed to
-   really kill the cliff — anon-only may help but not eliminate it.
-
-5. **If the cliff vanishes after (3+4)**: rerun this matrix on
-   roborack3 and see whether fallback-string drops back into the
-   <100-KB band where the other cells live.
+The next-tier optimization would be **parallelism in scan**: blake3
++ ELF parsing across the ~1,400 reachable objects on multiple cores.
+That's the leftover speedup; everything else is post-scan in the
+millisecond range.
 
 ## Runner
 
@@ -267,6 +218,27 @@ We need to confirm this empirically before fixing.
 Mutators are deterministic source rewrites; runs revert before and
 after each cell. Outputs `/tmp/graft-exp-runs/results.tsv`,
 `results.json`, and per-cell `.graftlog` + `.cargo.log` artifacts.
-Each cell is ~10–15 s of cargo time + ~4 s of graft; total wall
+Each cell is ~10–15 s of cargo time + ~3.5 s of graft; total wall
 clock for 8 cells ≈ 2 minutes (post-warm sccache, esp-idf already
 built).
+
+---
+
+## Historical: M1.q.1 baseline (pre-SHN_ABS, pre-lazy-archive)
+
+Preserved for reference. PROVIDE-backstop link, eager archive walking,
+no `-nostartfiles`. Hardware boot was never validated for these
+configs — the link succeeded but every overlay binary hung at
+`Calling app_main()` due to gcc auto-injected `_init` ending up in a
+new PT_LOAD past base's IRAM (resolved by M1.r's `-nostartfiles`).
+
+| Cell | Closure | Overlay payload | Pruned objs | Total |
+|---|---:|---:|---:|---:|
+| fallback-string | 15,604 | 1,195,810 (1.2 MB) | 405 | 6.1s |
+| fallback-numeric | 41 | 28,002 (27 KB) | 4 | 3.9s |
+| wifi-string | 101 | 34,450 (34 KB) | 8 | 4.0s |
+| wifi-numeric | 100 | 34,450 (34 KB) | 8 | 4.0s |
+| cli-string | 735 | 91,378 (89 KB) | 35 | 4.0s |
+| cli-numeric | 706 | 89,518 (87 KB) | 35 | 4.1s |
+| cfg-string | 38 | 39,166 (38 KB) | 4 | 4.0s |
+| cfg-numeric | 38 | 39,162 (38 KB) | 4 | 4.0s |
