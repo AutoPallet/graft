@@ -202,6 +202,17 @@ fn build_symhash(scan: &ScanResult, elf_bytes: &[u8]) -> Result<Vec<SymHashEntry
             sym_trans_hash.insert((sym.name.clone(), key_tu), th);
         }
     }
+    // Synthetic phantom nodes own bracket symbols (`__init_array_start`
+    // etc.). Pass-2 walks base.elf's `.symtab` and finds these — they
+    // exist there because the linker script defined them — so we need
+    // an entry in `sym_trans_hash` keyed on the bracket name → the
+    // phantom's trans_hash.
+    for (&nid, info) in &scan.graph.synthetic {
+        let th = scan.trans_hash[nid as usize];
+        for b in &info.bracket_symbols {
+            sym_trans_hash.insert((b.name.clone(), None), th);
+        }
+    }
 
     // Walk output ELF's symtab; for each defined symbol we can pair
     // back to a trans_hash, emit (symhash, address, size). STT_FILE

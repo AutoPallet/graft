@@ -57,23 +57,40 @@ const SHF_GNU_RETAIN: u64 = 0x00200000;
 /// The patterns that matter for rustc output are a subset — e.g.,
 /// `.jcr` and SunOS handoffs never appear — but we keep them for
 /// fidelity with what ld would have done on the same inputs.
+///
+/// **Aggregated outputs we model as synthetic phantoms** (`.init_array`,
+/// `.fini_array`, `.preinit_array`) are *not* listed here: their
+/// contributors get reached via the synthetic node's edges, and the
+/// synthetic node is reached from code via reloc to bracket symbols
+/// (`__init_array_start` etc.). See `synthetic.rs`.
+///
+/// **Aggregated outputs without bracket symbols** (`.note.*`,
+/// `.eh_frame*`, plain `.ctors`/`.dtors`, `.init`/`.fini` function-
+/// body slivers from gcc startup files) are also not listed here:
+/// they're consumed at runtime via segment headers (PT_NOTE,
+/// PT_GNU_EH_FRAME) or via real symbols that point at the merged
+/// output (`_init`, `_fini` — defined in crti.o, classified
+/// normally). Individual contributor slivers without their own
+/// defined symbols would never classify as Provided and would
+/// always Include into the closure for no payoff. No code reloc
+/// reaches them, so without rooting they fall out of the closure
+/// entirely; ld at overlay link time won't see contributors in
+/// the pruned input set, and the combined ELF runs on base's
+/// copies.
 const WELL_KNOWN_KEEP_PATTERNS: &[KeepPattern] = &[
-    KeepPattern::Exact(".init"),
-    KeepPattern::Exact(".fini"),
-    KeepPattern::ExactOrDot(".init_array"),
-    KeepPattern::ExactOrDot(".fini_array"),
-    KeepPattern::ExactOrDot(".preinit_array"),
     KeepPattern::Exact(".jcr"),
-    KeepPattern::ExactOrDot(".note"),
-    KeepPattern::ExactOrDot(".ctors"),
-    KeepPattern::ExactOrDot(".dtors"),
 ];
 
 enum KeepPattern {
     /// Exact match, e.g. `.init`.
     Exact(&'static str),
     /// Exact match OR `<name>.<anything>` — covers ld's
-    /// `KEEP(*(.init_array .init_array.*))` idiom.
+    /// `KEEP(*(.init_array .init_array.*))` idiom. Currently unused
+    /// in `WELL_KNOWN_KEEP_PATTERNS` (the prefix-style aggregations
+    /// migrated to `synthetic.rs` for `.init_array`-class outputs,
+    /// or dropped from rooting entirely for `.note.*`-class). Kept
+    /// available for re-introducing patterns when new ones surface.
+    #[allow(dead_code)]
     ExactOrDot(&'static str),
 }
 
@@ -114,9 +131,14 @@ pub fn find_roots(
         }
     }
 
-    // (3) + (4): per-section checks.
+    // (3) + (4): per-section checks (real input sections only —
+    // synthetic phantoms are reached via reloc edges from code that
+    // uses bracket symbols, not via root seeding).
     for nid in 0..scan.graph.nodes.len() as NodeId {
         let nm = &scan.graph.nodes[nid as usize];
+        if nm.object == u32::MAX {
+            continue;
+        }
         let sec = &scan.objects[nm.object as usize].sections[nm.section as usize];
         let retain = sec.sh_flags & SHF_GNU_RETAIN != 0;
         let keep_by_name = WELL_KNOWN_KEEP_PATTERNS

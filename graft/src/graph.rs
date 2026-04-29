@@ -39,20 +39,61 @@ impl SymbolIndex {
 
 #[derive(Debug)]
 pub struct Graph {
-    /// One entry per section across all parsed objects.
+    /// One entry per node. Nodes are either real (one per allocated
+    /// input section, in walk order) or synthetic (appended after the
+    /// real ones, one per linker-aggregated output that scan-side
+    /// inputs contribute to). Synthetic nodes have `object == u32::MAX`
+    /// and corresponding metadata in `synthetic_meta`.
     pub nodes: Vec<NodeMeta>,
     /// `edges[n]` = list of internal destinations from node `n`.
+    /// Real-node edges come from relocations; synthetic-node edges go
+    /// to the contributing input sections.
     pub edges: Vec<Vec<NodeId>>,
     /// Count of external (unresolved-in-our-inputs) targets for each
     /// node. The hash pass folds these in as `[0u8; 16]` sentinels.
     pub external_edge_counts: Vec<u32>,
     pub symbols: SymbolIndex,
+    /// Side table for synthetic nodes only. Indexed by NodeId; only
+    /// populated for the synthetic suffix range. Carries the
+    /// aggregator id and the synthetic+bracket symbol names defined
+    /// on the phantom.
+    pub synthetic: HashMap<NodeId, SyntheticInfo>,
 }
 
 #[derive(Debug, Clone)]
 pub struct NodeMeta {
+    /// `u32::MAX` for synthetic nodes (look up `synthetic[nid]`).
     pub object: u32,
     pub section: u32,
+}
+
+/// Metadata for a synthetic (linker-aggregated-output) graph node.
+/// Successors (the contributing input sections) live in `Graph::edges`
+/// the same as for real nodes.
+#[derive(Debug, Clone)]
+pub struct SyntheticInfo {
+    /// Stable identifier from `synthetic::Aggregator::id`. Matches
+    /// the merged-output section name in base.elf.
+    pub aggregator_id: &'static str,
+    /// Bracket symbols defined on this phantom (`__init_array_start`,
+    /// `__init_array_end`, …). Their addresses live in base.elf's
+    /// `.symtab`; refs from code resolve through the normal symhash
+    /// machinery once these are registered in `Graph::symbols`.
+    pub bracket_symbols: Vec<BracketSymbol>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BracketSymbol {
+    pub name: String,
+    pub end: BracketEnd,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BracketEnd {
+    /// Offset 0 within the merged output.
+    Start,
+    /// Offset = merged-output size.
+    End,
 }
 
 /// Build the forward-reloc graph across a set of parsed objects.
@@ -100,6 +141,45 @@ pub fn build(objects: &[ParsedObject]) -> Graph {
         }
     }
 
+    // Synthesize phantom nodes for linker-aggregated outputs *before*
+    // resolving reloc edges, so refs from code to bracket symbols
+    // (`__init_array_start` etc.) land on the synthetic node instead
+    // of becoming external sentinels.
+    let mut synthetic: HashMap<NodeId, SyntheticInfo> = HashMap::new();
+    let real_node_count = nodes.len();
+    for agg in crate::synthetic::AGGREGATORS {
+        let mut contributors: Vec<NodeId> = (0..real_node_count as NodeId)
+            .filter(|&nid| {
+                let nm = &nodes[nid as usize];
+                let sec = &objects[nm.object as usize].sections[nm.section as usize];
+                agg.contributor.matches(&sec.name)
+            })
+            .collect();
+        if contributors.is_empty() { continue; }
+        contributors.sort();
+        contributors.dedup();
+
+        let synth_nid = nodes.len() as NodeId;
+        nodes.push(NodeMeta { object: u32::MAX, section: 0 });
+        let bracket_symbols: Vec<BracketSymbol> = agg.bracket_symbols
+            .iter()
+            .map(|b| BracketSymbol {
+                name: b.name.to_string(),
+                end: match b.end {
+                    crate::synthetic::BracketEnd::Start => BracketEnd::Start,
+                    crate::synthetic::BracketEnd::End => BracketEnd::End,
+                },
+            })
+            .collect();
+        for b in &bracket_symbols {
+            symbols.globals.entry(b.name.clone()).or_insert(synth_nid);
+        }
+        synthetic.insert(synth_nid, SyntheticInfo {
+            aggregator_id: agg.id,
+            bracket_symbols,
+        });
+    }
+
     // Per-object section-name → local section index. Used to resolve
     // `<section:...>` reloc targets (STT_SECTION / RelocationTarget::
     // Section) to the right NodeId within the same .o.
@@ -114,9 +194,29 @@ pub fn build(objects: &[ParsedObject]) -> Graph {
         })
         .collect();
 
-    // Edges: walk each section's relocs, resolve targets.
+    // Edges + external counts. Allocated for every node (real +
+    // synthetic). Synthetic-node edges to contributors are filled in
+    // below; real-node edges come from reloc resolution.
     let mut edges: Vec<Vec<NodeId>> = vec![Vec::new(); nodes.len()];
     let mut external_counts: Vec<u32> = vec![0; nodes.len()];
+    for (&synth_nid, _info) in &synthetic {
+        // Recompute contributor list — same predicate as above. Cheap;
+        // keeps this localized rather than threading a side channel.
+        let agg = crate::synthetic::AGGREGATORS
+            .iter()
+            .find(|a| a.id == synthetic[&synth_nid].aggregator_id)
+            .expect("synthetic node references unknown aggregator");
+        let mut contribs: Vec<NodeId> = (0..real_node_count as NodeId)
+            .filter(|&nid| {
+                let nm = &nodes[nid as usize];
+                let sec = &objects[nm.object as usize].sections[nm.section as usize];
+                agg.contributor.matches(&sec.name)
+            })
+            .collect();
+        contribs.sort();
+        contribs.dedup();
+        edges[synth_nid as usize] = contribs;
+    }
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
             let Some(&nid) = node_of.get(&(oi as u32, si as u32)) else {
@@ -158,6 +258,7 @@ pub fn build(objects: &[ParsedObject]) -> Graph {
         edges,
         external_edge_counts: external_counts,
         symbols,
+        synthetic,
     }
 }
 
@@ -257,6 +358,7 @@ mod tests {
             external_edge_counts: vec![0; edges.len()],
             edges,
             symbols: SymbolIndex::default(),
+            synthetic: HashMap::new(),
         }
     }
 

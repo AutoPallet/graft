@@ -111,8 +111,18 @@ pub fn compute(
     let bytes_hashes: Vec<blake3::Hash> = graph
         .nodes
         .iter()
-        .map(|nm| {
-            blake3::hash(&objects[nm.object as usize].sections[nm.section as usize].bytes)
+        .enumerate()
+        .map(|(nid, nm)| {
+            if nm.object == u32::MAX {
+                // Synthetic node — no bytes of its own. Use a stable
+                // nonce derived from the aggregator id so identically-
+                // shaped synthesized nodes produce the same content
+                // fingerprint across base/overlay scans.
+                let info = &graph.synthetic[&(nid as u32)];
+                blake3::hash(format!("graft-synthetic\0{}", info.aggregator_id).as_bytes())
+            } else {
+                blake3::hash(&objects[nm.object as usize].sections[nm.section as usize].bytes)
+            }
         })
         .collect();
     let resolver = ContentResolver::build(objects, graph, &bytes_hashes);
@@ -120,14 +130,22 @@ pub fn compute(
     let member_input_hash: Vec<blake3::Hash> = graph
         .nodes
         .iter()
-        .map(|nm| {
-            let obj = &objects[nm.object as usize];
-            let sec = &obj.sections[nm.section as usize];
-            let mut h = blake3::Hasher::new();
-            h.update(&sec.bytes);
-            let encoded = encode_relocs(&sec.relocs, nm.object, obj.tu_id, &resolver);
-            h.update(&encoded);
-            h.finalize()
+        .enumerate()
+        .map(|(nid, nm)| {
+            if nm.object == u32::MAX {
+                // Synthetic: no bytes, no relocs of its own. The
+                // bytes_hash already encodes the aggregator identity;
+                // successor SCC roll-up captures contributor content.
+                bytes_hashes[nid]
+            } else {
+                let obj = &objects[nm.object as usize];
+                let sec = &obj.sections[nm.section as usize];
+                let mut h = blake3::Hasher::new();
+                h.update(&sec.bytes);
+                let encoded = encode_relocs(&sec.relocs, nm.object, obj.tu_id, &resolver);
+                h.update(&encoded);
+                h.finalize()
+            }
         })
         .collect();
 
@@ -258,6 +276,17 @@ impl ContentResolver {
         for (nid, nm) in graph.nodes.iter().enumerate() {
             let mut h = [0u8; 8];
             h.copy_from_slice(&bytes_hashes[nid].as_bytes()[..8]);
+            if nm.object == u32::MAX {
+                // Synthetic node: register the bracket symbols so
+                // canonicalize_target maps refs to `__init_array_start`
+                // etc. to this phantom's content fingerprint. No
+                // section-name registration (no real section).
+                let info = &graph.synthetic[&(nid as u32)];
+                for b in &info.bracket_symbols {
+                    global.insert(b.name.clone(), h);
+                }
+                continue;
+            }
             let obj = &objects[nm.object as usize];
             let sec = &obj.sections[nm.section as usize];
             section.insert((nm.object, sec.name.clone()), h);

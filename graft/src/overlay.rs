@@ -134,13 +134,32 @@ fn run(argv: Vec<String>) -> Result<()> {
             }
         }
     }
+    // Synthetic phantom nodes — register their bracket symbols too so
+    // refs to `__init_array_start` / etc. flow through the same
+    // symhash-routed lookup as any other base-defined name.
+    for (&nid, info) in &scan.graph.synthetic {
+        let th = scan.trans_hash[nid as usize];
+        for b in &info.bracket_symbols {
+            let sh = crate::hash::symhash_of(crate::hash::stable_name_part(&b.name), &th);
+            overlay_symhash_globals.entry(b.name.clone()).or_insert(sh);
+        }
+    }
     let closure_symhashes: HashSet<crate::hash::Symhash> = {
         let mut s = HashSet::new();
         for &nid in &closure.closure {
             let nm = &scan.graph.nodes[nid as usize];
+            let th = scan.trans_hash[nid as usize];
+            if nm.object == u32::MAX {
+                // Synthetic: bracket symbols are the "defined" set.
+                let info = &scan.graph.synthetic[&nid];
+                for b in &info.bracket_symbols {
+                    let sh = crate::hash::symhash_of(crate::hash::stable_name_part(&b.name), &th);
+                    s.insert(sh);
+                }
+                continue;
+            }
             let obj = &scan.objects[nm.object as usize];
             let sec = &obj.sections[nm.section as usize];
-            let th = scan.trans_hash[nid as usize];
             for &sym_idx in &sec.defined_symbols {
                 let sym = &obj.symbols[sym_idx];
                 if sym.name.is_empty() {
@@ -883,10 +902,27 @@ fn compute_closure(
 /// must be Included (no address to point a reloc at).
 fn classify_provided(nid: NodeId, scan: &ScanResult, base: &BaseMetadata) -> bool {
     let nm = &scan.graph.nodes[nid as usize];
-    let obj = &scan.objects[nm.object as usize];
-    let sec = &obj.sections[nm.section as usize];
     let th: TransHash = scan.trans_hash[nid as usize];
     let dump_path = std::env::var("GRAFT_DEBUG_MISMATCH").ok();
+
+    if nm.object == u32::MAX {
+        // Synthetic phantom for a linker-aggregated output. Defined
+        // "symbols" are the bracket pair (`__init_array_start`/`end`).
+        // Either bracket's symhash matching base means the merged
+        // output's content is unchanged, so base's bracket addresses
+        // are still valid → Provided.
+        let info = &scan.graph.synthetic[&nid];
+        for b in &info.bracket_symbols {
+            let symhash = crate::hash::symhash_of(crate::hash::stable_name_part(&b.name), &th);
+            if base.by_symhash.contains_key(&symhash) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    let obj = &scan.objects[nm.object as usize];
+    let sec = &obj.sections[nm.section as usize];
 
     let mut any_match = false;
     let mut any_defined_symbol = false;

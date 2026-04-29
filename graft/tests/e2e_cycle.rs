@@ -203,7 +203,13 @@ fn full_cycle() {
     assert!(base_out.contains("mixed = 14280"), "baseline: {base_out}");
 
     let base_env = base_elf.to_string_lossy().into_owned();
-    let overlay_env = [("GRAFT", "overlay"), ("GRAFT_BASE_ELF", base_env.as_str())];
+    let log_path = fx.graft_log_path();
+    let log_env_owned = log_path.to_string_lossy().into_owned();
+    let overlay_env = [
+        ("GRAFT", "overlay"),
+        ("GRAFT_BASE_ELF", base_env.as_str()),
+        ("GRAFT_LOG", log_env_owned.as_str()),
+    ];
 
     // A. Leaf: edit compute. Cascades up to mix, app::main, main. Every
     //    nonempty-closure rebuild yields exactly 1 trampoline — at base's
@@ -235,8 +241,12 @@ fn full_cycle() {
     assert!(out.contains("hello, world!"), "C: {out}");
     fx.edit("app/src/main.rs", r#"greet("world")"#, r#"greet("graft")"#);
 
-    // D. No-op: sources match base. 0 trampolines, combined ≡ base.
+    // D. No-op: sources match base. Closure must be empty (the
+    // invariant: same scan inputs produce identical trans_hashes →
+    // every reachable section classifies as Provided), 0 trampolines,
+    // combined ≡ base.
     fx.cargo_build(&overlay_env);
+    assert_eq!(fx.closure_sections(), 0, "D: closure must be empty for no-op");
     assert_eq!(fx.combine_stats().trampolines, 0, "D: trampoline count");
     assert_eq!(
         std::fs::read(&base_elf).unwrap(),
