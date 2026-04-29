@@ -57,9 +57,10 @@ fn run(argv: Vec<String>) -> Result<()> {
     let (eager_inputs, deferred_inputs) =
         crate::overlay::resolve_scan_inputs(&link_args, &driver);
     let extra_roots = link_args.undefined.clone();
+    let wrapped = link_args.wrapped.clone();
     let scan_handle = std::thread::spawn(move || {
         let t = std::time::Instant::now();
-        let r = scan::run(&eager_inputs, &deferred_inputs, &extra_roots);
+        let r = scan::run(&eager_inputs, &deferred_inputs, &extra_roots, &wrapped);
         (r, t.elapsed())
     });
 

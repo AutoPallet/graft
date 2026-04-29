@@ -69,41 +69,68 @@ Specific mutations:
 - **cfg-numeric**: change `let port: u16 = 80;` to `81` in the
   same file.
 
-## Results (post-M1.r series)
+## Results (post-M1.w)
+
+All eight cells link cleanly and produce overlays whose combined
+size equals base.elf — fully spliced into base's reserved slack
+regions, no extra LOAD segments. Hardware-validated end-to-end on
+two cells (`wifi-string` and `fallback-string`); both reach serial
+output at the mutated code path.
 
 | Cell | Closure (sections) | Overlay payload | Pruned objs | Trampolines | Total |
 |---|---:|---:|---:|---:|---:|
-| **fallback-string** | — | — | — | — | **fails** ¹ |
-| fallback-numeric | 25 | 1,500 B | 4 | 1 | 3.5s |
-| wifi-string | 92 | 7,616 B | 4 | 1 | 3.5s |
-| wifi-numeric | 101 | 8,412 B | 4 | 1 | 3.5s |
-| cli-string | 186 | 15,136 B | 5 | 1 | 3.5s |
-| cli-numeric | 27 | 1,536 B | 5 | 1 | 3.4s |
-| cfg-string | 39 | 12,972 B | 5 | 0 | 3.4s |
-| cfg-numeric | 39 | 12,968 B | 5 | 0 | 3.5s |
+| fallback-string | 15,517 | 1,186,103 B | 51 | 1 | 7.4s |
+| fallback-numeric | 24 | 1,496 B | 3 | 1 | 5.4s |
+| wifi-string | 88 | 7,120 B | 3 | 1 | 5.4s |
+| wifi-numeric | 97 | 7,932 B | 3 | 1 | 5.4s |
+| cli-string | 184 | 14,876 B | 4 | 1 | 5.4s |
+| cli-numeric | 26 | 1,532 B | 4 | 1 | 5.4s |
+| cfg-string | 38 | 12,968 B | 4 | 0 | 5.4s |
+| cfg-numeric | 38 | 12,964 B | 4 | 0 | 5.4s |
 
-¹ `fallback-string` fails graft prune with
-`can't resolve anon.<cgu-fp>...llvm.<id> (local=true) against base`.
-The mutation pulls in serde_urlencoded + panic infrastructure, whose
-relocs target rustc-emitted anonymous sections whose names contain a
-CGU fingerprint that drifts between builds. Fix is the deferred
-[M1.m.2 anon-content-match path](08-implementation-status.md#m1m2--content-match-path-for-anonymous-sections-deferred):
-identify anons by content hash rather than by name. Other anon-
-referencing closures (cli/wifi) sidestep the issue because their
-mutations don't introduce new anon-bearing chains; only fallback-
-string adds a brand-new chain reaching unstable anon names.
+Notes:
+
+- `fallback-string` is the heaviest cell because adding `log::info!`
+  to a function that previously logged nothing pulls in the entire
+  log + format + panic-infrastructure cascade. The 1.16 MB payload
+  fits in the slack reservations; combined size still equals base.
+- `cfg-*` have 0 trampolines because the change is in `cfg`'s HTTP
+  surface — touched only when the dev HTTP server runs, which the
+  fallback profile doesn't. The closure stops above the entry
+  symbol's reachability.
+- `t_total` is dominated by `t_scan` (~3.8s) for small cells.
+  fallback-string's 7.4s is mostly graft's real-link step (1.8s)
+  plus prune (233ms) — both proportional to the much larger
+  closure / pruned-input volume.
+
+The `fallback-string` regression in earlier writeups (anon-name
+drift, then mutex-init panic at boot) is now resolved by the
+M1.s through M1.w changes:
+
+- M1.s: content-keyed symhash table, names folded into identity.
+- M1.t: per-target SHN_ABS anchors (`__graft_sym_<symhash>`) instead
+  of single `__graft_const + addend`, fixing GOTPCREL through prune.
+- M1.u: classify_bind treats UND as Global so demand-load actually
+  pulls archive members satisfying UND refs.
+- M1.v: synthetic phantom nodes for `.init_array`-class outputs;
+  drops `.note.*` / `.eh_frame*` / `.ctors`-class roots that the
+  runtime consumes via segment header.
+- M1.w: pass-1 prefers Global > Weak (matches ld); scan respects
+  already-defined names + applies `--wrap=` rename to demand-load
+  lookups so wrap functions get pulled.
 
 Phase timings (graft-internal — these exclude rustc compile time):
 
 | Cell | scan | prune | link | combine |
 |---|---:|---:|---:|---:|
-| fallback-numeric | 3.2s | 2.9ms | 18.3ms | 79.6ms |
-| wifi-string | 3.3s | 3.8ms | 19.9ms | 78.7ms |
-| wifi-numeric | 3.2s | 3.8ms | 19.3ms | 81.9ms |
-| cli-string | 3.2s | 4.5ms | 24.5ms | 71.8ms |
-| cli-numeric | 3.2s | 2.3ms | 16.1ms | 73.6ms |
-| cfg-string | 3.2s | 2.4ms | 19.1ms | 79.4ms |
-| cfg-numeric | 3.3s | 2.3ms | 18.1ms | 76.8ms |
+| fallback-string | 3.8s | 233.2ms | 1.8s | 75.2ms |
+| fallback-numeric | 3.9s | 1.6ms | 17.3ms | 80.3ms |
+| wifi-string | 3.8s | 4.5ms | 18.9ms | 76.2ms |
+| wifi-numeric | 3.8s | 4.2ms | 19.2ms | 92.2ms |
+| cli-string | 3.8s | 4.5ms | 20.7ms | 83.7ms |
+| cli-numeric | 3.8s | 2.1ms | 18.7ms | 73.8ms |
+| cfg-string | 3.9s | 2.3ms | 17.6ms | 76.1ms |
+| cfg-numeric | 3.9s | 2.2ms | 17.1ms | 79.9ms |
 
 (`closure` walk is microseconds across all cells — below printf precision.)
 

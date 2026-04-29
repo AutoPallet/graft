@@ -68,7 +68,7 @@ fn run(argv: Vec<String>) -> Result<()> {
     let driver = crate::argv::driver_path(&argv);
     let (eager_inputs, deferred_inputs) = resolve_scan_inputs(&link_args, &driver);
     let t_scan_start = std::time::Instant::now();
-    let scan = scan::run(&eager_inputs, &deferred_inputs, &link_args.undefined)
+    let scan = scan::run(&eager_inputs, &deferred_inputs, &link_args.undefined, &link_args.wrapped)
         .context("overlay pre-scan")?;
     let t_scan = t_scan_start.elapsed();
 

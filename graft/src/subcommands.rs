@@ -149,7 +149,7 @@ pub fn scan_dump(args: &[String]) -> ExitCode {
     let (eager, deferred): (Vec<_>, Vec<_>) = inputs.into_iter().partition(|p| {
         p.extension().and_then(|e| e.to_str()) != Some("a")
     });
-    let scan_result = match scan::run(&eager, &deferred, &[]) {
+    let scan_result = match scan::run(&eager, &deferred, &[], &[]) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("graft scan-dump: {e:#}");

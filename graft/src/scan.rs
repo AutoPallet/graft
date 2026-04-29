@@ -36,10 +36,19 @@ pub struct ScanResult {
 /// link argv asked for via `-u <sym>` / `--undefined=<sym>` — those
 /// force-load their defining archive members regardless of whether
 /// any other parsed object has an UND for them.
+///
+/// `wrapped` is the set of `--wrap=<sym>` names. ld redirects every
+/// UND ref to `<sym>` into a UND ref to `__wrap_<sym>` for archive
+/// demand-load purposes (and at relocation time). Mirroring that
+/// here ensures the wrap function's defining `.o` gets pulled
+/// (otherwise base.elf's `__wrap_<sym>` would be missing from our
+/// scan/symhash machinery and prune would fail to resolve refs to
+/// wrap targets).
 pub fn run<P: AsRef<Path>>(
     eager_paths: &[P],
     deferred_paths: &[P],
     extra_roots: &[String],
+    wrapped: &[String],
 ) -> Result<ScanResult> {
     let collected = archive::collect_eager(eager_paths)?;
     let mut inputs = collected.inputs;
@@ -104,9 +113,18 @@ pub fn run<P: AsRef<Path>>(
             defined_globals.insert(sym.name.clone());
         }
     }
+    let wrap_set: HashSet<&str> = wrapped.iter().map(|s| s.as_str()).collect();
+    let demand_name = |raw: &str| -> String {
+        if wrap_set.contains(raw) {
+            format!("__wrap_{raw}")
+        } else {
+            raw.to_string()
+        }
+    };
     for sym_name in extra_roots {
-        if defined_globals.contains(sym_name) { continue; }
-        if let Some(&(ai, off)) = symbol_index.get(sym_name)
+        let lookup = demand_name(sym_name);
+        if defined_globals.contains(&lookup) { continue; }
+        if let Some(&(ai, off)) = symbol_index.get(&lookup)
             && loaded_members.insert((ai, off))
         {
             pending.push((ai, off));
@@ -144,10 +162,11 @@ pub fn run<P: AsRef<Path>>(
                 if sym.name.is_empty() {
                     continue;
                 }
-                if defined_globals.contains(&sym.name) {
+                let lookup = demand_name(&sym.name);
+                if defined_globals.contains(&lookup) {
                     continue;
                 }
-                if let Some(&(ai, off)) = symbol_index.get(&sym.name)
+                if let Some(&(ai, off)) = symbol_index.get(&lookup)
                     && loaded_members.insert((ai, off))
                 {
                     pending.push((ai, off));
