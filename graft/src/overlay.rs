@@ -166,12 +166,11 @@ fn run(argv: Vec<String>) -> Result<()> {
         }
         s
     };
-    let script_absolute_names = collect_script_absolutes(&base_path)?;
     let base_resolver_wrapped: HashSet<String> =
         link_args.wrapped.iter().cloned().collect();
     let base_resolver = prune::BaseResolver {
         by_symhash: &base.by_symhash,
-        script_absolute_names: &script_absolute_names,
+        base_symtab: &base.by_name,
         wrapped: &base_resolver_wrapped,
         closure_symhashes: &closure_symhashes,
         overlay_symhash_globals: &overlay_symhash_globals,
@@ -259,6 +258,30 @@ fn run(argv: Vec<String>) -> Result<()> {
 
     let overlay_elf = work_dir.join("overlay.elf");
     let t_link_start = std::time::Instant::now();
+    // Aggregate verify list across pruned objects. Same name should
+    // resolve to the same vaddr in every prune (resolution is
+    // deterministic per overlay run); collapse duplicates and bail
+    // if any disagree (would indicate inconsistent base.symtab /
+    // by_symhash data, never observed in practice).
+    let mut assumed_names: HashMap<String, u64> = HashMap::new();
+    for p in &pruned {
+        for (name, addr) in &p.assumed_names {
+            match assumed_names.entry(name.clone()) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(*addr);
+                }
+                std::collections::hash_map::Entry::Occupied(o) => {
+                    if *o.get() != *addr {
+                        bail!(
+                            "graft prune: {name} resolved to two distinct addresses \
+                             ({:#x} and {addr:#x}) across pruned `.o`s",
+                            o.get(),
+                        );
+                    }
+                }
+            }
+        }
+    }
     if pruned.is_empty() {
         write_empty_relocatable_for(&overlay_elf, e_machine)?;
     } else {
@@ -270,6 +293,7 @@ fn run(argv: Vec<String>) -> Result<()> {
             &argv,
             &stripped_libs,
             base.manifest.entry_symbol.as_str(),
+            &assumed_names,
         )?;
         if !ld_status.success() {
             bail!(
@@ -277,6 +301,7 @@ fn run(argv: Vec<String>) -> Result<()> {
                 work_dir.display()
             );
         }
+        verify_assumed_names(&overlay_elf, &assumed_names)?;
     }
     let t_link = t_link_start.elapsed();
 
@@ -387,6 +412,10 @@ struct PrunedEntry {
     path: PathBuf,
     kept_sections: usize,
     abs_rewrites: usize,
+    /// (name, assumed_address) for every reloc this prune resolved
+    /// through `base_symtab` (the channel-of-last-resort). Aggregated
+    /// across all entries and used for post-link verify.
+    assumed_names: Vec<(String, u64)>,
     /// If true, this entry is a filtered archive (`.a` file) graft
     /// emitted from pruned members. Wrap with
     /// `-Wl,--whole-archive .. -Wl,--no-whole-archive` when invoking
@@ -421,6 +450,7 @@ fn prune_all(
         path: PathBuf,
         kept_sections: usize,
         abs_rewrites: usize,
+        assumed_names: Vec<(String, u64)>,
         is_archive: bool,
     }
     struct ArchiveMember {
@@ -428,6 +458,7 @@ fn prune_all(
         bytes: Vec<u8>,
         kept_sections: usize,
         abs_rewrites: usize,
+        assumed_names: Vec<(String, u64)>,
     }
     let mut loose: Vec<LooseEntry> = Vec::new();
     let mut archives: HashMap<PathBuf, Vec<ArchiveMember>> = HashMap::new();
@@ -453,6 +484,7 @@ fn prune_all(
                     path,
                     kept_sections: p.kept_sections,
                     abs_rewrites: p.abs_rewrites,
+                    assumed_names: p.assumed_names,
                     is_archive: false,
                 });
             }
@@ -466,6 +498,7 @@ fn prune_all(
                         bytes: p.bytes,
                         kept_sections: p.kept_sections,
                         abs_rewrites: p.abs_rewrites,
+                        assumed_names: p.assumed_names,
                     });
             }
         }
@@ -485,6 +518,7 @@ fn prune_all(
             path: entry.path,
             kept_sections: entry.kept_sections,
             abs_rewrites: entry.abs_rewrites,
+            assumed_names: entry.assumed_names,
             is_archive: entry.is_archive,
         });
     }
@@ -496,6 +530,10 @@ fn prune_all(
         let path = work_dir.join(basename);
         let kept_sections: usize = members.iter().map(|m| m.kept_sections).sum();
         let abs_rewrites: usize = members.iter().map(|m| m.abs_rewrites).sum();
+        let assumed_names: Vec<(String, u64)> = members
+            .iter()
+            .flat_map(|m| m.assumed_names.iter().cloned())
+            .collect();
         let payload: Vec<(&str, &[u8])> = members
             .iter()
             .map(|m| (m.member_name.as_str(), m.bytes.as_slice()))
@@ -506,6 +544,7 @@ fn prune_all(
             path,
             kept_sections,
             abs_rewrites,
+            assumed_names,
             is_archive: true,
         });
     }
@@ -682,33 +721,72 @@ fn write_overlay_layout_ld(path: &Path, base_addr: u64) -> Result<()> {
 /// First-seen-wins on duplicate names — base occasionally has
 /// same-named locals across TUs, but for global-name resolution any
 /// of their addresses suffices (ld would have picked one).
-/// Names of every `SHN_ABS` symbol in base.elf — i.e. linker-script
-/// absolute assignments like `__udivdi3 = 0x40002544` (rom stubs) or
-/// peripheral-register PROVIDEs. These are defined by linker scripts
-/// that overlay's link *also* consumes (same `--T` flags), so a UND
-/// reference in a pruned `.o` resolves identically in overlay's
-/// link without graft's SHN_ABS bridge. Used by prune to decide
-/// "leave UND, ld'll handle it" vs. "must rewrite to base address".
-fn collect_script_absolutes(base_path: &Path) -> Result<HashSet<String>> {
+/// After overlay link, verify every `assumed_names` entry: walk
+/// overlay's output `.symtab`, find each name, and confirm the linker
+/// placed it at the address graft assumed. A mismatch means a symbol
+/// graft thought was layout-stable actually shifted (e.g., a
+/// linker-script `_*_end = .;` whose value depends on overlay's
+/// distinct layout). Bail loudly — the rewritten relocs would be
+/// pointing at the wrong address.
+fn verify_assumed_names(overlay_elf: &Path, assumed: &HashMap<String, u64>) -> Result<()> {
     use object::{Object, ObjectSymbol};
-    let bytes = std::fs::read(base_path)
-        .with_context(|| format!("read {}", base_path.display()))?;
-    let elf = object::File::parse(&*bytes).context("parse base ELF")?;
-    let mut names: HashSet<String> = HashSet::new();
+    if assumed.is_empty() {
+        return Ok(());
+    }
+    let bytes = std::fs::read(overlay_elf)
+        .with_context(|| format!("read overlay {}", overlay_elf.display()))?;
+    let elf = object::File::parse(&*bytes).context("parse overlay ELF for verify")?;
+    let mut overlay_addrs: HashMap<String, u64> = HashMap::new();
     for sym in elf.symbols() {
         if sym.is_undefined() {
             continue;
         }
-        if !matches!(sym.section(), object::SymbolSection::Absolute) {
+        let Ok(name) = sym.name() else { continue };
+        if name.is_empty() {
             continue;
         }
-        let name = match sym.name() {
-            Ok(n) if !n.is_empty() => n,
-            _ => continue,
-        };
-        names.insert(name.to_string());
+        // First-write-wins: overlay symtab can repeat names across
+        // SHN_ABS anchors and real defs; the real def comes from the
+        // ELF's own symtab walk and is what we want to compare.
+        overlay_addrs.entry(name.to_string()).or_insert(sym.address());
     }
-    Ok(names)
+    let mut mismatches: Vec<(String, u64, Option<u64>)> = Vec::new();
+    for (name, &assumed_addr) in assumed {
+        match overlay_addrs.get(name) {
+            // Skip anchors graft itself wrote (`__graft_assumed_*`).
+            // They're at our assumed address by construction.
+            _ if name.starts_with("__graft_assumed_") => {}
+            Some(&overlay_addr) if overlay_addr == assumed_addr => {}
+            Some(&overlay_addr) => {
+                mismatches.push((name.clone(), assumed_addr, Some(overlay_addr)));
+            }
+            None => {
+                // Symbol not in overlay's symtab. Common: the name is
+                // SHN_ABS-defined by overlay's linker script and ld
+                // resolves UND refs to it but doesn't put a separate
+                // entry in `.symtab`. This is the same case base.symtab
+                // is meant to bridge, and there's no way to verify
+                // independently; trust the snapshot.
+            }
+        }
+    }
+    if !mismatches.is_empty() {
+        let mut msg = String::from(
+            "graft overlay verify: assumed-stable names shifted between base and overlay link:\n",
+        );
+        for (name, assumed_addr, overlay_addr) in &mismatches {
+            use std::fmt::Write;
+            let _ = match overlay_addr {
+                Some(a) => writeln!(
+                    &mut msg,
+                    "  {name}: assumed {assumed_addr:#x}, overlay placed at {a:#x}",
+                ),
+                None => writeln!(&mut msg, "  {name}: assumed {assumed_addr:#x}, missing"),
+            };
+        }
+        bail!("{msg}");
+    }
+    Ok(())
 }
 
 
@@ -720,6 +798,7 @@ fn run_real_linker(
     rustc_argv: &[String],
     stripped_libs: &HashSet<String>,
     entry_symbol: &str,
+    assumed_names: &HashMap<String, u64>,
 ) -> Result<std::process::ExitStatus> {
     // Invoke the gcc-style driver rustc gave us (gcc handles `-Wl,…`,
     // `-l<lib>`, default-library suppression, etc. for both
@@ -741,6 +820,16 @@ fn run_real_linker(
     // Without this, --gc-sections sees no roots and nukes the
     // entire pruned input.
     cmd.arg(format!("-Wl,-u,{entry_symbol}"));
+
+    // Force every assumed-stable name into overlay's symtab so the
+    // post-link verify can find it. Without `--undefined=<name>`,
+    // ld may resolve UND refs via SHN_ABS in script + omit a
+    // separate symtab entry, which makes verify silently fall back
+    // to "trust the snapshot" rather than catching layout-dependent
+    // drift.
+    for name in assumed_names.keys() {
+        cmd.arg(format!("-Wl,--undefined={name}"));
+    }
 
     // Suppress gcc's implicit startup-file injection (`crti.o`,
     // `crtbegin.o`, `crtend.o`, `crtn.o`). Those carry `_init`/`_fini`
@@ -807,9 +896,16 @@ pub struct BaseMetadata {
     /// "base has interchangeable bytes for this content", regardless
     /// of CGU re-partition or `.llvm.<id>` suffix drift.
     pub by_symhash: HashMap<crate::hash::Symhash, SymHashEntry>,
+    /// Snapshot of base's post-link `.symtab`: name → final address.
+    /// Channel-of-last-resort for reloc resolution — used when a
+    /// name isn't matched by overlay's scan or by `by_symhash`.
+    /// Resolution rewrites relocs to a per-name `__graft_assumed_<hex>`
+    /// SHN_ABS anchor at this address, post-link-verified.
+    pub by_name: HashMap<String, u64>,
 }
 
 fn load_base_metadata(path: &std::path::Path) -> Result<BaseMetadata> {
+    use object::{Object, ObjectSymbol};
     let bytes = std::fs::read(path).with_context(|| format!("read base {}", path.display()))?;
     let manifest_bytes = elf_attach::read_section(&bytes, SECTION_MANIFEST)?
         .ok_or_else(|| anyhow!("{}: no {}", path.display(), SECTION_MANIFEST))?;
@@ -835,7 +931,31 @@ fn load_base_metadata(path: &std::path::Path) -> Result<BaseMetadata> {
     for e in entries {
         by_symhash.entry(e.symhash).or_insert(e);
     }
-    Ok(BaseMetadata { manifest, by_symhash })
+
+    // Walk base.elf's `.symtab` for the channel-of-last-resort
+    // (`name → address`) lookup. Done lazily here from the file we've
+    // already read — no separate sidecar needed. Captures every
+    // defined named symbol the linker resolved: SHN_ABS script
+    // absolutes, PROVIDE-defaulted symbols, weak fallbacks,
+    // layout-derived `_*_start/_*_end` brackets, anything else base
+    // ended up with at link time.
+    let elf = object::File::parse(&*bytes)
+        .with_context(|| format!("parse {} for symtab snapshot", path.display()))?;
+    let mut by_name: HashMap<String, u64> = HashMap::new();
+    for sym in elf.symbols() {
+        if sym.is_undefined() { continue; }
+        let Ok(name) = sym.name() else { continue };
+        if name.is_empty() { continue; }
+        if matches!(
+            sym.kind(),
+            object::SymbolKind::File | object::SymbolKind::Section,
+        ) {
+            continue;
+        }
+        by_name.entry(name.to_string()).or_insert(sym.address());
+    }
+
+    Ok(BaseMetadata { manifest, by_symhash, by_name })
 }
 
 pub(crate) struct Closure {
