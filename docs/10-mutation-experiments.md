@@ -74,13 +74,13 @@ Specific mutations:
 | Cell | Closure (sections) | Overlay payload | Pruned objs | Trampolines | Total |
 |---|---:|---:|---:|---:|---:|
 | **fallback-string** | — | — | — | — | **fails** ¹ |
-| fallback-numeric | 25 | 412 B | 4 | 1 | 4.5s |
-| wifi-string | 92 | 404 B | 4 | 1 | 4.9s |
-| wifi-numeric | 101 | 404 B | 4 | 1 | 3.5s |
-| cli-string | 186 | 404 B | 5 | 1 | 3.5s |
-| cli-numeric | 27 | 404 B | 5 | 1 | 3.5s |
-| cfg-string | 39 | 100 B | 5 | 0 | 3.5s |
-| cfg-numeric | 39 | 100 B | 5 | 0 | 3.5s |
+| fallback-numeric | 25 | 1,500 B | 4 | 1 | 3.5s |
+| wifi-string | 92 | 7,616 B | 4 | 1 | 3.5s |
+| wifi-numeric | 101 | 8,412 B | 4 | 1 | 3.5s |
+| cli-string | 186 | 15,136 B | 5 | 1 | 3.5s |
+| cli-numeric | 27 | 1,536 B | 5 | 1 | 3.4s |
+| cfg-string | 39 | 12,972 B | 5 | 0 | 3.4s |
+| cfg-numeric | 39 | 12,968 B | 5 | 0 | 3.5s |
 
 ¹ `fallback-string` fails graft prune with
 `can't resolve anon.<cgu-fp>...llvm.<id> (local=true) against base`.
@@ -95,15 +95,17 @@ string adds a brand-new chain reaching unstable anon names.
 
 Phase timings (graft-internal — these exclude rustc compile time):
 
-| Cell | scan | closure | prune | link | combine |
-|---|---:|---:|---:|---:|---:|
-| fallback-numeric | 4.3s | 25µs | 2.3ms | 25.6ms | 109.2ms |
-| wifi-string | 4.6s | 92µs | 4.0ms | 19.6ms | 83.7ms |
-| wifi-numeric | 3.3s | 101µs | 5.1ms | 19.2ms | 82.1ms |
-| cli-string | 3.3s | 186µs | 4.5ms | 18.4ms | 76.7ms |
-| cli-numeric | 3.2s | 27µs | 2.3ms | 18.9ms | 81.2ms |
-| cfg-string | 3.3s | 39µs | 2.4ms | 17.9ms | 76.8ms |
-| cfg-numeric | 3.3s | 39µs | 2.4ms | 16.4ms | 77.3ms |
+| Cell | scan | prune | link | combine |
+|---|---:|---:|---:|---:|
+| fallback-numeric | 3.2s | 2.9ms | 18.3ms | 79.6ms |
+| wifi-string | 3.3s | 3.8ms | 19.9ms | 78.7ms |
+| wifi-numeric | 3.2s | 3.8ms | 19.3ms | 81.9ms |
+| cli-string | 3.2s | 4.5ms | 24.5ms | 71.8ms |
+| cli-numeric | 3.2s | 2.3ms | 16.1ms | 73.6ms |
+| cfg-string | 3.2s | 2.4ms | 19.1ms | 79.4ms |
+| cfg-numeric | 3.3s | 2.3ms | 18.1ms | 76.8ms |
+
+(`closure` walk is microseconds across all cells — below printf precision.)
 
 (`closure` column is microseconds — counts of section walks the
 trans_hash classification touches; the timing field is below the
@@ -128,24 +130,34 @@ incremental — full clean build of base was 4m20s):
 | Cell | M1.q.1 closure / payload | Current closure / payload | Δ payload |
 |---|---|---|---:|
 | fallback-string | 15,604 / 1,195,810 B | (fails) | — |
-| fallback-numeric | 41 / 28,002 B | 25 / 412 B | **−98.5%** |
-| wifi-string | 101 / 34,450 B | 92 / 404 B | **−98.8%** |
-| wifi-numeric | 100 / 34,450 B | 101 / 404 B | **−98.8%** |
-| cli-string | 735 / 91,378 B | 186 / 404 B | **−99.6%** |
-| cli-numeric | 706 / 89,518 B | 27 / 404 B | **−99.5%** |
-| cfg-string | 38 / 39,166 B | 39 / 100 B | **−99.7%** |
-| cfg-numeric | 38 / 39,162 B | 39 / 100 B | **−99.7%** |
+| fallback-numeric | 41 / 28,002 B | 25 / 1,500 B | **−94.6%** |
+| wifi-string | 101 / 34,450 B | 92 / 7,616 B | **−77.9%** |
+| wifi-numeric | 100 / 34,450 B | 101 / 8,412 B | **−75.6%** |
+| cli-string | 735 / 91,378 B | 186 / 15,136 B | **−83.4%** |
+| cli-numeric | 706 / 89,518 B | 27 / 1,536 B | **−98.3%** |
+| cfg-string | 38 / 39,166 B | 39 / 12,972 B | **−66.9%** |
+| cfg-numeric | 38 / 39,162 B | 39 / 12,968 B | **−66.9%** |
 
-Median payload shrinks ~99%. Closures shrink dramatically for the
-sites that previously cascaded through monomorphic infrastructure
-(`cli-string` 735→186, `cli-numeric` 706→27) — the SHN_ABS reloc
-rewrite eliminates the 27-KB PROVIDE-backstop floor that all earlier
-runs paid, and lazy archive discovery prunes the libstdc++ / libgcc
-ride-along that was inflating closures.
+Closures shrink 4–25× for the sites that previously cascaded through
+monomorphic infrastructure (`cli-string` 735→186, `cli-numeric`
+706→27). Payloads shrink 67–98% — the M1.q.1 numbers carried a
+~27 KB PROVIDE-backstop floor (every overlay shipped a copy of the
+linker-script-wrap'd unwind/runtime helpers regardless of the actual
+edit) plus extensive ride-along from libstdc++ statics that lazy
+archive discovery now skips.
 
-Total link wall time dropped from ~4.7s → ~3.5s (−25%) for the
-non-cascading cells; scan went from 4.4s → 3.3s after lazy archive
-member discovery.
+(An *earlier* version of this doc reported sub-500-byte payloads for
+several cells. That was a graft correctness bug: cross-CGU references
+within the closure were being SHN_ABS-rewritten to base's stale
+addresses, ld's --gc-sections then dropped the closure-included
+sections from overlay because they appeared unreachable, and the
+mutation silently ran base's old code at runtime. Fixed in M1.r.3 —
+see commit log. Hardware verification with the wifi-string mutation
+now produces the expected new log line at runtime.)
+
+Total link wall time dropped from ~4.7s → ~3.5s (−25%) across the
+matrix; scan went from 4.4s → 3.2s after lazy archive member
+discovery.
 
 ## Combined-ELF size
 
