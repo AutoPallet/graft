@@ -55,6 +55,18 @@ fn run_cache_info(path: &Path) -> anyhow::Result<()> {
             }
         }
     }
+    if let Ok(addr_str) = std::env::var("GRAFT_ADDR")
+        && let Ok(want) = u64::from_str_radix(addr_str.trim_start_matches("0x"), 16)
+    {
+        println!();
+        println!("entries at address {want:#x}:");
+        for e in &entries {
+            if e.address == want {
+                let hh: String = e.symhash.iter().map(|b| format!("{b:02x}")).collect();
+                println!("  {:#010x}  sz={:<6} symhash={hh}", e.address, e.size);
+            }
+        }
+    }
     Ok(())
 }
 
