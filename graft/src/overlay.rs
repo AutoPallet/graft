@@ -943,10 +943,15 @@ fn format_closure_dump(scan: &ScanResult, c: &Closure) -> Vec<u8> {
             let sec = &obj.sections[seg.section as usize];
             let label = scan.inputs[seg.object as usize].label();
             let prefix = if tag.is_empty() { String::new() } else { format!("<agg:{tag}> ") };
+            let len = seg.bytes_in(&obj.sections).len();
+            let range_tag = match seg.range {
+                Some((off, _)) => format!("@+{off}"),
+                None => String::new(),
+            };
             let _ = writeln!(
                 s,
-                "  [{nid}] {prefix}{label} :: {} ({} bytes)",
-                sec.name, sec.bytes.len(),
+                "  [{nid}] {prefix}{label} :: {}{range_tag} ({len} bytes)",
+                sec.name,
             );
         }
     }
