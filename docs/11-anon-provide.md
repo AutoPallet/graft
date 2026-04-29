@@ -47,24 +47,45 @@ So the path forward needs (a) a target representation that reaches
 the linker through the symbol table and (b) an identifier robust to
 name drift.
 
-## Design: addend-encoded targets via one SHN_ABS symbol
+## Design: per-target SHN_ABS symbols, one per resolution target
 
-We exploit two ELF facts:
+We exploit one ELF fact: a symbol with `st_shndx = SHN_ABS` and
+`st_value = V` resolves to the constant `V` at link time — no
+section, no relocation, just a baked-in number.
 
-1. A symbol with `st_shndx = SHN_ABS` and `st_value = V` resolves
-   to the constant `V` at link time — no section, no relocation,
-   just a baked-in number.
-2. Most "compute final value" reloc types use `S + A` (absolute)
-   or `S + A - P` (PC-relative). With `S = 0`, the result is just
-   `A`, the explicit addend in the RELA record.
+Synthesize **one SHN_ABS symbol per unique base-resolution target**
+within each pruned `.o` (`__graft_sym_<symhash>`, `st_value =
+base_vaddr`). Rewrite each base-bound reloc to reference that
+symbol, leaving the *original addend* unchanged. The linker
+resolves references the same way it resolves any defined absolute
+symbol — `S + A`, `S + A - P`, GOT-slot value `S` — so PC-relative,
+absolute, AND GOT-relative relocs all work uniformly without
+special handling at our end.
 
-Combining the two: synthesize **one SHN_ABS symbol per overlay input
-object** with `st_value = 0` and a fixed name (`__graft_const`).
-Rewrite each Providable-anon STT_SECTION reloc to reference this
-symbol with `addend = base_anon_vaddr + original_addend`. The
-linker computes `0 + target = target` and writes it. No PROVIDE(),
-no script changes, one extra symtab row per object regardless of
-how many distinct anons we redirect.
+The symbol name is keyed on the target's symhash (16-byte content
+hash) where known, falling back to a vaddr-derived key for
+STT_SECTION / wrap-fallback targets that carry no symhash. Same
+content across base rebuilds → same name, even if base's address
+layout shifts.
+
+### Why not a single `__graft_const + (vaddr+A)` shared anchor
+
+The earlier v1 design used one SHN_ABS=0 symbol per pruned `.o`
+with `addend = base_vaddr + original_addend`. It works for direct
+relocs (PC32, ABS32, ABS64) where the linker writes `S + A`
+straight into the instruction slot — `S=0`, so `A` carries the
+target. It does **not** work for `R_X86_64_GOTPCREL` (and
+GOTPCRELX/REX_GOTPCRELX): the linker populates the allocated GOT
+slot with the symbol *value* `S` (= 0), not `S + A`, so the slot
+ends up holding 0 instead of the target address. The instruction's
+disp gets the addend folded in alongside the GOT-base delta,
+resulting in a load from `GOT_slot + base_vaddr - 4` — almost
+always an unmapped address.
+
+Per-target symbols sidestep this: `S = base_vaddr` puts the
+target's address into the GOT slot directly. Cost: a few hundred
+to a few thousand extra symtab rows across the build, well below
+linker scale limits.
 
 ### Pipeline
 
@@ -81,22 +102,25 @@ how many distinct anons we redirect.
    - If hash misses: anon is Included normally (ships in overlay).
 
 3. **Reloc rewrite, pre-link.** For each input `.o` with at least
-   one Providable anon:
-   - Append one symtab entry: `{st_shndx: SHN_ABS, st_value: 0,
-     st_name: "__graft_const", st_info: STB_LOCAL|STT_NOTYPE}`.
-   - For every reloc whose target is a Providable anon, rewrite
-     `r_info.sym_index → __graft_const`, `r_addend → base_vaddr
-     + original_addend`. Reloc type unchanged.
+   one base-bound reloc:
+   - For each unique resolution target, append one symtab entry:
+     `{st_shndx: SHN_ABS, st_value: base_vaddr, st_name:
+     "__graft_sym_<symhash_hex>", st_info: STB_LOCAL|STT_NOTYPE}`.
+   - For every reloc whose target resolves to base, rewrite
+     `r_info.sym_index → that target's __graft_sym`, leaving
+     `r_addend` at its original value. Reloc type unchanged.
 
 4. **Link.** ld processes normally. `--gc-sections` sees the reloc
-   edges going to an absolute symbol (which pins no section), so
+   edges going to absolute symbols (which pin no section), so
    Providable anons in overlay's input objects get pruned. Result:
    they don't ship in the overlay payload.
 
 ### Cost
 
-- One extra symtab row per overlay input object (~24 bytes ELF64).
-- O(reloc-records-touching-anons) byte rewrites in `.rela.*`
+- One extra symtab row per *unique base-resolution target* per
+  pruned `.o` (~24 bytes ELF64 each). Roborack3-scale: order
+  hundreds-to-low-thousands across the whole build.
+- O(reloc-records-touching-base) byte rewrites in `.rela.*`
   sections of input `.o`s. Cheap; happens during prune.
 - Zero change to overlay link script, zero base.elf mutation.
 
@@ -143,24 +167,11 @@ Current proposal: skip MERGE in v1; revisit if measurements warrant.
 
 ### Cosmetics
 
-`objdump -d` will display thousands of relocations as
-`__graft_const+0xADDR`, with the symbol name carrying no
-information about which anon was meant. Functionally inert;
-debugger-unfriendly.
-
-When we want to recover debug ergonomics (e.g. addr2line landing
-on a sensible name for an anon's address), the same scheme works
-with a *named* SHN_ABS symbol per Providable anon — content-hash
-becomes the name (`__graft_anon_<hash16>`), each reloc points at
-its own symbol, and `st_value = base_vaddr` directly (addend stays
-at the original value). Trades one symtab row per object for one
-per Providable anon — a few thousand rows in roborack3-scale
-projects, well below symtab sizes ld already handles routinely.
-
-For now (v1): single `__graft_const` symbol. Document the per-anon
-variant as a follow-up; pull the trigger on it when symbol-name
-fidelity in disassembly or post-link debugger fixup becomes the
-limiting factor.
+`objdump -d` displays each base-bound reloc as
+`__graft_sym_<symhash16>+0xADDEND`. The 16-byte hex content hash
+isn't a Rust mangled name, but identical content across a build
+shares the same symbol so addr2line / disassembly diffs can group
+references coherently.
 
 ## Validation
 

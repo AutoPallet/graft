@@ -8,11 +8,14 @@
 //!     * Targets that resolve to a kept section/symbol pass through.
 //!     * Targets that resolve to a base-defined address (a pruned-section
 //!       symbol whose definition lives in base, or a UND symbol satisfied
-//!       by base) get encoded as `(__graft_const, addend = base_vaddr +
-//!       original_addend)`. `__graft_const` is a single SHN_ABS=0 symbol
-//!       injected per pruned `.o`, so the linker computes
-//!       `0 + (base_vaddr + addend) = base_vaddr + addend` directly into
-//!       the reloc slot. No PROVIDE() or symbol-name plumbing required.
+//!       by base) get encoded as `(__graft_sym_<symhash>, addend =
+//!       original_addend)`. Each unique target gets its own SHN_ABS
+//!       symbol (st_value = base_vaddr), keyed on content (the target's
+//!       symhash) so the emitted name is stable across base rebuilds.
+//!       The linker resolves references the same way it resolves any
+//!       defined absolute symbol, so PC-relative, absolute, AND
+//!       GOT-relative relocs all work uniformly. No PROVIDE() or
+//!       symbol-name plumbing required.
 //!
 //! See `docs/11-anon-provide.md` for the rationale.
 
@@ -196,9 +199,23 @@ pub fn prune_object(
         sym_map.insert(src_sym.index(), out.add_symbol(wsym));
     }
 
-    // Per-object SHN_ABS=0 anchor for every base-bound reloc. Created
-    // lazily so objects with zero base refs don't carry a dead entry.
-    let mut const_sym: Option<SymbolId> = None;
+    // Per-target SHN_ABS anchors for base-bound relocs. Each unique
+    // resolution target gets its own symbol (`__graft_sym_<hex>`,
+    // st_value = vaddr); the reloc points at it with the *original*
+    // addend. Keyed on content (target's symhash) where known so the
+    // emitted name is stable across base rebuilds whose address
+    // layout shifts but whose symbol contents don't; falls back to
+    // a vaddr-derived key for STT_SECTION / wrap-fallback targets
+    // that carry no symhash.
+    //
+    // Why one-symbol-per-target instead of a single `__graft_const
+    // + (vaddr+A)`: GOTPCREL/GOTPCRELX populate the GOT slot with
+    // the symbol VALUE (S), not S+A. With S=vaddr the slot correctly
+    // holds the target's address; with S=0 the slot would hold 0
+    // and the addend would miscombine into the instruction's disp.
+    // PC32/ABS-style relocs are unaffected — they fold S+A directly.
+    // See `docs/11-anon-provide.md`.
+    let mut addr_syms: HashMap<crate::hash::Symhash, SymbolId> = HashMap::new();
     // Cache: target_sec_idx -> base vaddr of section start (i.e. the
     // surrogate's base vaddr minus its offset within the section).
     let mut section_base_vaddr: HashMap<SectionIndex, i64> = HashMap::new();
@@ -271,7 +288,7 @@ pub fn prune_object(
                                         "reloc in {from_section}: can't resolve wrap target {wrap_name} against base"
                                     ),
                                 )?;
-                                Outcome::Base { vaddr: vaddr as i64 }
+                                Outcome::Base { vaddr: vaddr as i64, key: key_from_vaddr(vaddr) }
                             } else {
                                 // Three-way classification:
                                 //   1. Overlay sees this symbol AND
@@ -321,7 +338,7 @@ pub fn prune_object(
                                         };
                                         Outcome::Internal { sym_id: wsym_id, addend_extra: 0 }
                                     } else if let Some(entry) = base.by_symhash.get(&sh) {
-                                        Outcome::Base { vaddr: entry.address as i64 }
+                                        Outcome::Base { vaddr: entry.address as i64, key: sh }
                                     } else {
                                         bail!(
                                             "reloc in {from_section}: {name} (local={was_local}) \
@@ -334,7 +351,7 @@ pub fn prune_object(
                                     // (e.g. inside a libcore `.o`
                                     // lazy discovery skipped). Trust
                                     // base.elf's `.symtab` by name.
-                                    Outcome::Base { vaddr: vaddr as i64 }
+                                    Outcome::Base { vaddr: vaddr as i64, key: key_from_vaddr(vaddr) }
                                 } else {
                                     bail!(
                                         "reloc in {from_section}: can't resolve {name} \
@@ -363,26 +380,22 @@ pub fn prune_object(
 
             let (sym_id, final_addend) = match outcome {
                 Outcome::Internal { sym_id, addend_extra } => (sym_id, addend + addend_extra),
-                Outcome::Base { vaddr } => {
+                Outcome::Base { vaddr, key } => {
                     abs_rewrites += 1;
-                    let csym = match const_sym {
-                        Some(id) => id,
-                        None => {
-                            let id = out.add_symbol(WSymbol {
-                                name: b"__graft_const".to_vec(),
-                                value: 0,
-                                size: 0,
-                                kind: SymbolKind::Label, // STT_NOTYPE
-                                scope: write::SymbolScope::Compilation, // STB_LOCAL
-                                weak: false,
-                                section: WSymbolSection::Absolute,
-                                flags: write::SymbolFlags::None,
-                            });
-                            const_sym = Some(id);
-                            id
-                        }
-                    };
-                    (csym, vaddr + addend)
+                    let csym = *addr_syms.entry(key).or_insert_with(|| {
+                        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+                        out.add_symbol(WSymbol {
+                            name: format!("__graft_sym_{hex}").into_bytes(),
+                            value: vaddr as u64,
+                            size: 0,
+                            kind: SymbolKind::Label, // STT_NOTYPE
+                            scope: write::SymbolScope::Compilation, // STB_LOCAL
+                            weak: false,
+                            section: WSymbolSection::Absolute,
+                            flags: write::SymbolFlags::None,
+                        })
+                    });
+                    (csym, addend)
                 }
             };
 
@@ -428,7 +441,7 @@ pub fn prune_object(
             section_base_vaddr.insert(target_sec_idx, v);
             v
         };
-        Ok(Outcome::Base { vaddr })
+        Ok(Outcome::Base { vaddr, key: key_from_vaddr(vaddr as u64) })
     }
 
     let bytes = out.write().map_err(|e| anyhow!("write pruned object: {e}"))?;
@@ -442,7 +455,21 @@ pub fn prune_object(
 #[allow(clippy::large_enum_variant)]
 enum Outcome {
     Internal { sym_id: SymbolId, addend_extra: i64 },
-    Base { vaddr: i64 },
+    /// Resolved to base. `key` deduplicates symbol minting within the
+    /// pruned `.o`: when known, it's the target's content symhash
+    /// (stable across base rebuilds); for STT_SECTION / wrap-fallback
+    /// targets we synthesize a key from the vaddr instead.
+    Base { vaddr: i64, key: crate::hash::Symhash },
+}
+
+/// Synthesize a `Symhash` from a raw vaddr — used as the dedup key
+/// for base-bound relocs whose target carries no real symhash
+/// (anon `STT_SECTION` references, wrap fallbacks). Distinct vaddrs
+/// produce distinct keys; stable within a single base.elf.
+fn key_from_vaddr(vaddr: u64) -> crate::hash::Symhash {
+    let mut k = [0u8; 16];
+    k[..8].copy_from_slice(&vaddr.to_le_bytes());
+    k
 }
 
 fn compute_section_base_vaddr(
