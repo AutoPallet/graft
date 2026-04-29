@@ -155,12 +155,12 @@ fn run(argv: Vec<String>) -> Result<()> {
         }
         s
     };
-    let base_addr_by_name = collect_base_globals(&base_path)?;
+    let script_absolute_names = collect_script_absolutes(&base_path)?;
     let base_resolver_wrapped: HashSet<String> =
         link_args.wrapped.iter().cloned().collect();
     let base_resolver = prune::BaseResolver {
         by_symhash: &base.by_symhash,
-        wrap_addr_by_name: &base_addr_by_name,
+        script_absolute_names: &script_absolute_names,
         wrapped: &base_resolver_wrapped,
         closure_symhashes: &closure_symhashes,
         overlay_symhash_globals: &overlay_symhash_globals,
@@ -669,23 +669,33 @@ fn write_overlay_layout_ld(path: &Path, base_addr: u64) -> Result<()> {
 /// First-seen-wins on duplicate names — base occasionally has
 /// same-named locals across TUs, but for global-name resolution any
 /// of their addresses suffices (ld would have picked one).
-fn collect_base_globals(base_path: &Path) -> Result<HashMap<String, u64>> {
+/// Names of every `SHN_ABS` symbol in base.elf — i.e. linker-script
+/// absolute assignments like `__udivdi3 = 0x40002544` (rom stubs) or
+/// peripheral-register PROVIDEs. These are defined by linker scripts
+/// that overlay's link *also* consumes (same `--T` flags), so a UND
+/// reference in a pruned `.o` resolves identically in overlay's
+/// link without graft's SHN_ABS bridge. Used by prune to decide
+/// "leave UND, ld'll handle it" vs. "must rewrite to base address".
+fn collect_script_absolutes(base_path: &Path) -> Result<HashSet<String>> {
     use object::{Object, ObjectSymbol};
     let bytes = std::fs::read(base_path)
         .with_context(|| format!("read {}", base_path.display()))?;
     let elf = object::File::parse(&*bytes).context("parse base ELF")?;
-    let mut map: HashMap<String, u64> = HashMap::new();
+    let mut names: HashSet<String> = HashSet::new();
     for sym in elf.symbols() {
         if sym.is_undefined() {
+            continue;
+        }
+        if !matches!(sym.section(), object::SymbolSection::Absolute) {
             continue;
         }
         let name = match sym.name() {
             Ok(n) if !n.is_empty() => n,
             _ => continue,
         };
-        map.entry(name.to_string()).or_insert_with(|| sym.address());
+        names.insert(name.to_string());
     }
-    Ok(map)
+    Ok(names)
 }
 
 

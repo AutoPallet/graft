@@ -57,12 +57,17 @@ pub struct BaseResolver<'a> {
     pub overlay_symhash_locals_any_tu: &'a HashMap<String, crate::hash::Symhash>,
     /// `--wrap=<sym>` targets (extracted from the link argv).
     /// Wrapped names get their reloc redirected to `__wrap_<sym>` at
-    /// prune time — `wrap_addr_by_name` provides that address.
+    /// prune time and resolved through the same symhash path as any
+    /// other base-defined function.
     pub wrapped: &'a HashSet<String>,
-    /// Name → address from base.elf's `.symtab`. Only consulted for
-    /// the `__wrap_<sym>` wrap-target lookup (wrap names are stable,
-    /// so name-based lookup is safe).
-    pub wrap_addr_by_name: &'a HashMap<String, u64>,
+    /// Names of every `SHN_ABS` symbol in base.elf. These come from
+    /// linker scripts (rom stubs like `__udivdi3 = 0x40002544`,
+    /// peripheral-register PROVIDEs) that overlay's link consumes
+    /// with the same `--T` flags, so a UND reference resolves
+    /// identically without us bridging. If a reloc target name is in
+    /// this set and not in any symhash table, prune emits the reloc
+    /// as UND and lets ld's normal script processing handle it.
+    pub script_absolute_names: &'a HashSet<String>,
     /// Symhashes of every symbol defined in a closure-included
     /// section. Cross-`.o` relocs to these must stay as UND symbol
     /// references so ld resolves them to overlay's re-emitted copy.
@@ -201,12 +206,9 @@ pub fn prune_object(
 
     // Per-target SHN_ABS anchors for base-bound relocs. Each unique
     // resolution target gets its own symbol (`__graft_sym_<hex>`,
-    // st_value = vaddr); the reloc points at it with the *original*
-    // addend. Keyed on content (target's symhash) where known so the
-    // emitted name is stable across base rebuilds whose address
-    // layout shifts but whose symbol contents don't; falls back to
-    // a vaddr-derived key for STT_SECTION / wrap-fallback targets
-    // that carry no symhash.
+    // st_value = vaddr), keyed on the target's content symhash so
+    // the emitted name is stable across base rebuilds whose address
+    // layout shifts but whose symbol contents don't.
     //
     // Why one-symbol-per-target instead of a single `__graft_const
     // + (vaddr+A)`: GOTPCREL/GOTPCRELX populate the GOT slot with
@@ -216,9 +218,11 @@ pub fn prune_object(
     // PC32/ABS-style relocs are unaffected — they fold S+A directly.
     // See `docs/11-anon-provide.md`.
     let mut addr_syms: HashMap<crate::hash::Symhash, SymbolId> = HashMap::new();
-    // Cache: target_sec_idx -> base vaddr of section start (i.e. the
-    // surrogate's base vaddr minus its offset within the section).
-    let mut section_base_vaddr: HashMap<SectionIndex, i64> = HashMap::new();
+    // Cache: target_sec_idx -> (base vaddr of section start, surrogate
+    // symhash). Surrogate vaddr is anchor's base vaddr minus its
+    // offset within the section; symhash is kept around for dedup
+    // keying when emitting the SHN_ABS anchor.
+    let mut section_base_vaddr: HashMap<SectionIndex, (i64, crate::hash::Symhash)> = HashMap::new();
     // Cache: wrap-targeted symbol name -> UND SymbolId in output.
     // Lazily emitted so we don't add UND entries for wrap names
     // that don't appear in any reloc.
@@ -277,87 +281,105 @@ pub fn prune_object(
                                 src_sym.scope(),
                                 SymbolScope::Compilation | SymbolScope::Unknown
                             );
-                            // Wraps are name-stable: ld would
-                            // redirect `<name>` → `__wrap_<name>`.
-                            // Pre-apply by name-looking up
-                            // `__wrap_<name>` in base.elf's .symtab.
-                            if base.wrapped.contains(name) {
-                                let wrap_name = format!("__wrap_{name}");
-                                let vaddr = base.wrap_addr_by_name.get(&wrap_name).copied().ok_or_else(
-                                    || anyhow!(
-                                        "reloc in {from_section}: can't resolve wrap target {wrap_name} against base"
-                                    ),
-                                )?;
-                                Outcome::Base { vaddr: vaddr as i64, key: key_from_vaddr(vaddr) }
+                            // Wraps: ld would redirect `<name>` →
+                            // `__wrap_<name>`. Pre-apply the rename
+                            // and let normal symhash routing find it.
+                            // `__wrap_<name>` is a regular function in
+                            // base, so it has a symhash entry like
+                            // anything else.
+                            let lookup_name: String = if base.wrapped.contains(name) {
+                                format!("__wrap_{name}")
                             } else {
-                                // Three-way classification:
-                                //   1. Overlay sees this symbol AND
-                                //      its symhash is in the closure
-                                //      → it's been re-emitted with
-                                //      different content; emit UND
-                                //      so ld resolves to overlay.
-                                //   2. Overlay sees it AND base has
-                                //      a matching symhash → SHN_ABS
-                                //      to base's address.
-                                //   3. Overlay doesn't see it (lazy
-                                //      discovery skipped its `.o`)
-                                //      → fall back to name lookup
-                                //      against base.elf's `.symtab`.
-                                //      Safe for stable-named symbols.
-                                let overlay_sh = if was_local {
-                                    base.overlay_symhash_locals
-                                        .get(&(name.to_string(), source_tu_id))
-                                        .copied()
-                                        .or_else(|| base.overlay_symhash_globals.get(name).copied())
-                                        .or_else(|| base.overlay_symhash_locals_any_tu.get(name).copied())
-                                } else {
-                                    base.overlay_symhash_globals
-                                        .get(name)
-                                        .copied()
-                                        .or_else(|| base.overlay_symhash_locals_any_tu.get(name).copied())
-                                };
-                                if let Some(sh) = overlay_sh {
-                                    if base.closure_symhashes.contains(&sh) {
-                                        // Closure-included → UND.
-                                        let wsym_id = match wrap_sym_map.get(name) {
-                                            Some(&id) => id,
-                                            None => {
-                                                let id = out.add_symbol(WSymbol {
-                                                    name: name.as_bytes().to_vec(),
-                                                    value: 0,
-                                                    size: 0,
-                                                    kind: SymbolKind::Unknown,
-                                                    scope: write::SymbolScope::Dynamic,
-                                                    weak: false,
-                                                    section: WSymbolSection::Undefined,
-                                                    flags: write::SymbolFlags::None,
-                                                });
-                                                wrap_sym_map.insert(name.to_string(), id);
-                                                id
-                                            }
-                                        };
-                                        Outcome::Internal { sym_id: wsym_id, addend_extra: 0 }
-                                    } else if let Some(entry) = base.by_symhash.get(&sh) {
-                                        Outcome::Base { vaddr: entry.address as i64, key: sh }
-                                    } else {
-                                        bail!(
-                                            "reloc in {from_section}: {name} (local={was_local}) \
-                                             has overlay symhash but no matching base entry — \
-                                             content drift but not in closure (graft bug?)"
-                                        );
-                                    }
-                                } else if let Some(&vaddr) = base.wrap_addr_by_name.get(name) {
-                                    // Overlay didn't see the symbol
-                                    // (e.g. inside a libcore `.o`
-                                    // lazy discovery skipped). Trust
-                                    // base.elf's `.symtab` by name.
-                                    Outcome::Base { vaddr: vaddr as i64, key: key_from_vaddr(vaddr) }
+                                name.to_string()
+                            };
+                            // Symhash routing:
+                            //   1. Overlay sees this symbol AND its
+                            //      symhash is in the closure → UND so
+                            //      ld resolves to overlay's re-emitted
+                            //      copy.
+                            //   2. Overlay sees it AND base has a
+                            //      matching symhash → SHN_ABS-bridge to
+                            //      base's address.
+                            //   3. Overlay doesn't see it BUT the name
+                            //      is `SHN_ABS` in base (linker-script
+                            //      absolute) → emit UND and let
+                            //      overlay's same script resolve it.
+                            //   4. Otherwise: hard error. We don't
+                            //      silently fall back to name+address
+                            //      lookup — that path would mask real
+                            //      bugs (lazy-archive misses, content
+                            //      drift, etc.).
+                            let overlay_sh = if was_local {
+                                base.overlay_symhash_locals
+                                    .get(&(lookup_name.clone(), source_tu_id))
+                                    .copied()
+                                    .or_else(|| base.overlay_symhash_globals.get(&lookup_name).copied())
+                                    .or_else(|| base.overlay_symhash_locals_any_tu.get(&lookup_name).copied())
+                            } else {
+                                base.overlay_symhash_globals
+                                    .get(&lookup_name)
+                                    .copied()
+                                    .or_else(|| base.overlay_symhash_locals_any_tu.get(&lookup_name).copied())
+                            };
+                            if let Some(sh) = overlay_sh {
+                                if base.closure_symhashes.contains(&sh) {
+                                    let wsym_id = match wrap_sym_map.get(lookup_name.as_str()) {
+                                        Some(&id) => id,
+                                        None => {
+                                            let id = out.add_symbol(WSymbol {
+                                                name: lookup_name.as_bytes().to_vec(),
+                                                value: 0,
+                                                size: 0,
+                                                kind: SymbolKind::Unknown,
+                                                scope: write::SymbolScope::Dynamic,
+                                                weak: false,
+                                                section: WSymbolSection::Undefined,
+                                                flags: write::SymbolFlags::None,
+                                            });
+                                            wrap_sym_map.insert(lookup_name.clone(), id);
+                                            id
+                                        }
+                                    };
+                                    Outcome::Internal { sym_id: wsym_id, addend_extra: 0 }
+                                } else if let Some(entry) = base.by_symhash.get(&sh) {
+                                    Outcome::Base { vaddr: entry.address as i64, key: sh }
                                 } else {
                                     bail!(
-                                        "reloc in {from_section}: can't resolve {name} \
-                                         (local={was_local}) — not in overlay scan or base .symtab"
+                                        "reloc in {from_section}: {lookup_name} (local={was_local}) \
+                                         has overlay symhash but no matching base entry — \
+                                         content drift but not in closure (graft bug?)"
                                     );
                                 }
+                            } else if base.script_absolute_names.contains(&lookup_name) {
+                                // Linker-script absolute (SHN_ABS in
+                                // base). Same script in overlay's
+                                // link, same value — leave UND.
+                                let wsym_id = match wrap_sym_map.get(lookup_name.as_str()) {
+                                    Some(&id) => id,
+                                    None => {
+                                        let id = out.add_symbol(WSymbol {
+                                            name: lookup_name.as_bytes().to_vec(),
+                                            value: 0,
+                                            size: 0,
+                                            kind: SymbolKind::Unknown,
+                                            scope: write::SymbolScope::Dynamic,
+                                            weak: false,
+                                            section: WSymbolSection::Undefined,
+                                            flags: write::SymbolFlags::None,
+                                        });
+                                        wrap_sym_map.insert(lookup_name.clone(), id);
+                                        id
+                                    }
+                                };
+                                Outcome::Internal { sym_id: wsym_id, addend_extra: 0 }
+                            } else {
+                                bail!(
+                                    "reloc in {from_section}: can't resolve {lookup_name} \
+                                     (local={was_local}) — not in overlay scan, not in base \
+                                     symhash table, not a linker-script absolute. If this is a \
+                                     position-relative script symbol that genuinely needs \
+                                     bridging to base's value, add explicit handling."
+                                );
                             }
                         }
                     }
@@ -418,7 +440,7 @@ pub fn prune_object(
         target_sec_idx: SectionIndex,
         src: &object::File<'src>,
         sec_map: &HashMap<SectionIndex, SectionId>,
-        section_base_vaddr: &mut HashMap<SectionIndex, i64>,
+        section_base_vaddr: &mut HashMap<SectionIndex, (i64, crate::hash::Symhash)>,
         base: &BaseResolver<'_>,
         tu_id: [u8; 8],
         out: &mut WObject<'_>,
@@ -428,7 +450,7 @@ pub fn prune_object(
             let sym_id = out.section_symbol(new_id);
             return Ok(Outcome::Internal { sym_id, addend_extra: 0 });
         }
-        let vaddr = if let Some(&v) = section_base_vaddr.get(&target_sec_idx) {
+        let (vaddr, key) = if let Some(&v) = section_base_vaddr.get(&target_sec_idx) {
             v
         } else {
             let v = compute_section_base_vaddr(src, target_sec_idx, base, tu_id)
@@ -441,7 +463,7 @@ pub fn prune_object(
             section_base_vaddr.insert(target_sec_idx, v);
             v
         };
-        Ok(Outcome::Base { vaddr, key: key_from_vaddr(vaddr as u64) })
+        Ok(Outcome::Base { vaddr, key })
     }
 
     let bytes = out.write().map_err(|e| anyhow!("write pruned object: {e}"))?;
@@ -455,21 +477,13 @@ pub fn prune_object(
 #[allow(clippy::large_enum_variant)]
 enum Outcome {
     Internal { sym_id: SymbolId, addend_extra: i64 },
-    /// Resolved to base. `key` deduplicates symbol minting within the
-    /// pruned `.o`: when known, it's the target's content symhash
-    /// (stable across base rebuilds); for STT_SECTION / wrap-fallback
-    /// targets we synthesize a key from the vaddr instead.
+    /// Resolved to base. `key` is the target's content symhash —
+    /// dedup key for the SHN_ABS anchor symbol, stable across base
+    /// rebuilds. Always content-keyed: every code path that emits
+    /// `Outcome::Base` resolves through a real symhash (named symbols
+    /// via the symhash table; section anchors via the surrogate sym
+    /// they pick to compute section-start vaddr).
     Base { vaddr: i64, key: crate::hash::Symhash },
-}
-
-/// Synthesize a `Symhash` from a raw vaddr — used as the dedup key
-/// for base-bound relocs whose target carries no real symhash
-/// (anon `STT_SECTION` references, wrap fallbacks). Distinct vaddrs
-/// produce distinct keys; stable within a single base.elf.
-fn key_from_vaddr(vaddr: u64) -> crate::hash::Symhash {
-    let mut k = [0u8; 16];
-    k[..8].copy_from_slice(&vaddr.to_le_bytes());
-    k
 }
 
 fn compute_section_base_vaddr(
@@ -477,11 +491,12 @@ fn compute_section_base_vaddr(
     target_sec_idx: SectionIndex,
     base: &BaseResolver<'_>,
     tu_id: [u8; 8],
-) -> Result<i64> {
+) -> Result<(i64, crate::hash::Symhash)> {
     // Pick the lowest-addressed named, non-File/Section symbol defined
     // in the section. Resolve it through `base`. Subtract the surrogate's
     // offset within the section to get the section start in base's
-    // address space.
+    // address space. Return the surrogate's symhash too so the caller
+    // can use it as a content-stable dedup key for the SHN_ABS anchor.
     let mut best: Option<(u64, &str, bool)> = None;
     for sym in src.symbols() {
         if sym.section_index() != Some(target_sec_idx) {
@@ -508,13 +523,13 @@ fn compute_section_base_vaddr(
             target_sec_idx.0,
         )
     })?;
-    let (_sh, surrogate_vaddr) = base.resolve(name, was_local, tu_id).ok_or_else(|| {
+    let (sh, surrogate_vaddr) = base.resolve(name, was_local, tu_id).ok_or_else(|| {
         anyhow!(
             "surrogate {name} (local={was_local}) for pruned section #{} not in base",
             target_sec_idx.0,
         )
     })?;
-    Ok(surrogate_vaddr as i64 - off as i64)
+    Ok((surrogate_vaddr as i64 - off as i64, sh))
 }
 
 fn map_kind(k: SymbolKind) -> SymbolKind {

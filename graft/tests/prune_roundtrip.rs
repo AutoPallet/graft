@@ -50,7 +50,7 @@ fn prune_keep_all_preserves_shape() {
     let osh_l: HashMap<(String, [u8; 8]), Symhash> = HashMap::new();
     let osh_lat: HashMap<String, Symhash> = HashMap::new();
     let w: HashSet<String> = HashSet::new();
-    let wrap_addr: HashMap<String, u64> = HashMap::new();
+    let script_abs: HashSet<String> = HashSet::new();
     let cs: HashSet<Symhash> = HashSet::new();
     let resolver = prune::BaseResolver {
         by_symhash: &by_sh,
@@ -58,7 +58,7 @@ fn prune_keep_all_preserves_shape() {
         overlay_symhash_locals: &osh_l,
         overlay_symhash_locals_any_tu: &osh_lat,
         wrapped: &w,
-        wrap_addr_by_name: &wrap_addr,
+        script_absolute_names: &script_abs,
         closure_symhashes: &cs,
     };
     let result = prune::prune_object(&bytes, [0; 8], &keep, &resolver)
@@ -88,7 +88,7 @@ fn prune_keep_none_still_parses() {
     let osh_l: HashMap<(String, [u8; 8]), Symhash> = HashMap::new();
     let osh_lat: HashMap<String, Symhash> = HashMap::new();
     let w: HashSet<String> = HashSet::new();
-    let wrap_addr: HashMap<String, u64> = HashMap::new();
+    let script_abs: HashSet<String> = HashSet::new();
     let cs: HashSet<Symhash> = HashSet::new();
     let resolver = prune::BaseResolver {
         by_symhash: &by_sh,
@@ -96,7 +96,7 @@ fn prune_keep_none_still_parses() {
         overlay_symhash_locals: &osh_l,
         overlay_symhash_locals_any_tu: &osh_lat,
         wrapped: &w,
-        wrap_addr_by_name: &wrap_addr,
+        script_absolute_names: &script_abs,
         closure_symhashes: &cs,
     };
     let result = prune::prune_object(&bytes, [0xAB; 8], &keep, &resolver).unwrap_or_else(|e| {

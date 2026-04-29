@@ -217,13 +217,23 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedObject> {
 
 fn classify_bind<'data, 'file>(sym: &object::Symbol<'data, 'file, &'data [u8]>) -> SymbolBind {
     if sym.is_weak() {
-        SymbolBind::Weak
-    } else {
-        match sym.scope() {
-            SymbolScope::Compilation => SymbolBind::Local,
-            SymbolScope::Linkage | SymbolScope::Dynamic => SymbolBind::Global,
-            SymbolScope::Unknown => SymbolBind::Local,
-        }
+        return SymbolBind::Weak;
+    }
+    // UND symbols in well-formed `.o`s are STB_GLOBAL (or STB_WEAK,
+    // handled above): the linker resolves them by name from another
+    // input. The `object` crate maps UND to `SymbolScope::Unknown`,
+    // which `scope()`-based classification would collapse into
+    // `Local` — wrong for demand-load (scan/scan.rs filters
+    // archive-pull candidates on `Global | Weak` bind, so misclassed
+    // UND refs would silently skip pulling their defining archive
+    // members like libunwind.a's `_Unwind_Resume`).
+    if sym.is_undefined() {
+        return SymbolBind::Global;
+    }
+    match sym.scope() {
+        SymbolScope::Compilation => SymbolBind::Local,
+        SymbolScope::Linkage | SymbolScope::Dynamic => SymbolBind::Global,
+        SymbolScope::Unknown => SymbolBind::Local,
     }
 }
 
