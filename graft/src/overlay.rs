@@ -811,6 +811,37 @@ fn verify_assumed_names(overlay_elf: &Path, assumed: &HashMap<String, u64>) -> R
                 None => writeln!(&mut msg, "  {name}: assumed {assumed_addr:#x}, missing"),
             };
         }
+        // Heuristic: if the failing list contains canonically-esp-idf
+        // layout symbols, this is the early-trampoline / shared-layout
+        // case. Point the reader at the design note. The names below
+        // are the prefixes that show up when `call_start_cpu0`'s
+        // literal pool is in the closure (bss-clear, flash MMU, vector
+        // table — see `cpu_start.c.obj`).
+        const LAYOUT_TELLTALES: &[&str] = &[
+            "_bss_start", "_bss_end",
+            "_rtc_bss_start", "_rtc_bss_end",
+            "_ext_ram_bss_start", "_ext_ram_bss_end",
+            "_instruction_reserved_start", "_instruction_reserved_end",
+            "_rodata_reserved_start", "_rodata_reserved_end",
+            "_vector_table",
+        ];
+        let hit_layout_symbol = mismatches
+            .iter()
+            .any(|(n, _, _)| LAYOUT_TELLTALES.contains(&n.as_str()));
+        if hit_layout_symbol {
+            use std::fmt::Write;
+            let _ = writeln!(
+                &mut msg,
+                "\nThe failing names include esp-idf layout symbols defined by the\n\
+                 linker script as `_bss_start = .;` / `_vector_table = ABSOLUTE(.);`\n\
+                 / etc. Their values are layout-derived and the overlay's pruned\n\
+                 link produces different values from base's. graft does not yet\n\
+                 patch the overlay's linker scripts to PROVIDE base's values back\n\
+                 — see docs/13-early-trampoline.md for the design and what's\n\
+                 left to implement before early-trampoline / init-code-change\n\
+                 handling is real.",
+            );
+        }
         bail!("{msg}");
     }
     Ok(())
