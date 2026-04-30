@@ -67,18 +67,27 @@ script's `_bss_start = .;` assignment and produces overlay's
 distinct value. The verify then sees `assumed=base_addr,
 overlay_placed=overlay_addr` and bails.
 
-For aggregator brackets (`__init_array_start/end` etc.), graft
-already exempts these from verify on the same reasoning: relocs go
-through the anchor at base's address; ld's separate resolution of
-the original name is irrelevant.
+Aggregator brackets (`__init_array_start/end` etc.) are *not*
+exempted from verify, even though one might be tempted: the
+substantively-correct case ("relocs go through the anchor at base's
+address; ld's separate resolution of the original name is
+irrelevant") only holds when the aggregator's content actually
+matches base. If a constructor was added/removed/reordered in the
+overlay's input, the merged init_array's content has changed — but
+graft's scan can't detect that today (the contributor sections live
+in archive members ld pulls via `KEEP(*(.init_array .init_array.*))`,
+which scan's UND-driven demand-load doesn't follow). Channel 1 (the
+content-aware closure path) can't fire because the aggregator never
+becomes a graph node; channel 2 can't fire because brackets never
+land in `by_symhash`; channel 3 fires unconditionally with base's
+address; and overlay's `call_start_cpu0` (if early-trampolined)
+would walk *base's* stale init_array and miss the new constructor.
 
-The natural extension is to do the same for the layout-derived
-script symbols. But just exempting them in verify isn't sufficient
-— overlay's link script will still re-derive them, and any code in
-overlay that *isn't* routed through graft's anchor (for instance,
-if something in overlay's pruned input has its own reloc to
-`_bss_start` that ld resolves through the script) will get the
-wrong value silently.
+Verifying these is the only signal we have. Failing the verify is
+correct — the user is asking for an init-code-change handling that
+graft doesn't actually support yet, and silently producing a
+wrong-init binary would be much worse than a fail-loud bail with a
+pointer to this doc.
 
 ## The intended fix
 
