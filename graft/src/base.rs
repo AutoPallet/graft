@@ -242,11 +242,19 @@ fn build_section_table(scan: &ScanResult, elf_bytes: &[u8]) -> Result<SectionTab
         }
     }
 
-    // Per-node candidate section-base addresses, kept separate so a
-    // single authoritative local outvotes any number of cross-resolved
-    // globals.
+    // Per-node candidate section-base addresses, kept separate because
+    // they carry different authority: ld can resolve a *global/weak*
+    // name to a different copy than this node's (cross-resolution), so
+    // those are majority-voted; an STB_LOCAL symbol is NEVER resolved
+    // to another object's copy, so locals aren't a vote at all — they
+    // are ground truth. Any disagreement among one node's locals means
+    // the section was not placed as a single unit (an identity-model
+    // violation), and the base build fails loud rather than recording
+    // an address that resolves some references into the wrong bytes.
     struct Votes {
-        local: Vec<u64>,
+        /// (symbol name, back-computed section base) — names kept for
+        /// the unanimity-violation diagnostic.
+        local: Vec<(String, u64)>,
         other: Vec<u64>,
     }
     let mut votes: HashMap<u32, Votes> = HashMap::new();
@@ -266,7 +274,11 @@ fn build_section_table(scan: &ScanResult, elf_bytes: &[u8]) -> Result<SectionTab
             let v = votes
                 .entry(nid)
                 .or_insert_with(|| Votes { local: Vec::new(), other: Vec::new() });
-            if is_local { v.local.push(base) } else { v.other.push(base) }
+            if is_local {
+                v.local.push((sym.name.clone(), base));
+            } else {
+                v.other.push(base);
+            }
         }
     }
 
@@ -282,8 +294,52 @@ fn build_section_table(scan: &ScanResult, elf_bytes: &[u8]) -> Result<SectionTab
     let mut by_th: HashMap<[u8; 16], u64> = HashMap::new();
     let mut ambiguous: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
     for (&nid, v) in &votes {
-        let pool = if v.local.is_empty() { &v.other } else { &v.local };
-        let Some(base) = majority(pool) else { continue };
+        // Aggregator nodes fold many contributor sections into one node;
+        // a single "section base" is meaningless for them (and their
+        // contributors' locals would trip the unanimity check below).
+        // They resolve through bracket names via base_symtab (channel 3),
+        // never positionally — keep them out of the table.
+        if scan.graph.nodes[nid as usize].is_aggregator() {
+            continue;
+        }
+        let base = if v.local.is_empty() {
+            let Some(base) = majority(&v.other) else { continue };
+            base
+        } else {
+            // Locals are ground truth and must agree exactly (see the
+            // Votes doc above). Fail the BASE build on disagreement —
+            // this is the self-check that turns an identity-model
+            // violation into a build error instead of an overlay that
+            // resolves references into the wrong bytes at runtime.
+            let first = v.local[0].1;
+            if v.local.iter().any(|&(_, b)| b != first) {
+                let nm = &scan.graph.nodes[nid as usize];
+                let mut evidence = String::new();
+                for (name, b) in &v.local {
+                    use std::fmt::Write;
+                    let _ = write!(evidence, "\n    {name} → section base {b:#x}");
+                }
+                let where_ = nm
+                    .segments
+                    .first()
+                    .map(|seg| {
+                        let obj = &scan.objects[seg.object as usize];
+                        format!(
+                            "{} :: {}",
+                            obj.tu_name,
+                            obj.sections[seg.section as usize].name
+                        )
+                    })
+                    .unwrap_or_else(|| "<no segments>".into());
+                bail!(
+                    "graft base self-check: STB_LOCAL symbols of one node disagree on \
+                     its section base — the section was not placed as a unit, so \
+                     positional resolution against it would be unsound.\n  node {nid} \
+                     ({where_}):{evidence}"
+                );
+            }
+            first
+        };
         let th = scan.trans_hash[nid as usize];
         match by_th.entry(th) {
             Entry::Vacant(e) => {

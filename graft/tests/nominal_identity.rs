@@ -129,6 +129,52 @@ fn readonly_content_identity_is_unchanged_by_names() {
 }
 
 #[test]
+fn scc_members_get_distinct_trans_hashes() {
+    // Two sections referencing each other form one SCC. On xtensa this
+    // shape is unavoidable (code l32r's into its literal pool; the pool
+    // holds addresses of handlers back in the code), and base places
+    // the two sections at different addresses. If SCC members shared
+    // one trans_hash, `by_section[th]` would be ill-defined — the M2
+    // bug that resolved `ram_resident_step` into the middle of the
+    // literal pool. Each member's hash must mix in its own content.
+    use graft::elf::CanonicalReloc;
+    let mk_text = |name: &str, bytes: &[u8], target: &str| SectionInfo {
+        name: name.into(),
+        kind: SectionKind::Text,
+        alloc: true,
+        sh_flags: u64::from(SHF_ALLOC | SHF_EXECINSTR),
+        bytes: bytes.to_vec(),
+        relocs: vec![CanonicalReloc {
+            offset: 0,
+            target: format!("<section:{target}>"),
+            r_type: 1,
+            addend: 0,
+        }],
+    };
+    let obj = obj_with_sections(
+        vec![
+            mk_text(".text.code", &[0x90, 0x90, 0x90, 0x90], ".text.pool"),
+            mk_text(".text.pool", &[0x00, 0x00, 0x00, 0x00], ".text.code"),
+        ],
+        vec![],
+    );
+    let objects = vec![obj];
+    let g = graph::build(&objects, None);
+    let scc = graph::tarjan_scc(&g);
+    assert_eq!(
+        scc.members.len(),
+        1,
+        "the two sections must form one SCC for this test to mean anything"
+    );
+    let ths = hash::compute(&objects, &g, &scc);
+    assert_ne!(
+        ths[0], ths[1],
+        "SCC members are distinct sections at distinct addresses — they \
+         must not collapse onto one trans_hash"
+    );
+}
+
+#[test]
 fn ram_resident_code_stays_content_addressable() {
     // `.rwtext`-style sections (exec, possibly in a writable segment)
     // are immutable *content* — the predicate must keep them
