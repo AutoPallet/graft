@@ -132,7 +132,20 @@ impl NodeMeta {
 }
 
 /// Build the forward-reloc graph across a set of parsed objects.
-pub fn build(objects: &[ParsedObject]) -> Graph {
+///
+/// `entry_symbol` names graft's single trampoline target (the base /
+/// overlay cut point). Edges whose *target* is the entry node are folded
+/// in as external sentinels rather than internal edges, so the entry's
+/// content does NOT propagate into its callers' trans_hashes. This is
+/// sound — and necessary — because the trampoline redirects the entry's
+/// *address*: base's callers of the entry are reused verbatim and stay
+/// correct regardless of the overlay's new entry content, so an edit to
+/// the entry must not make its callers (e.g. `main`, the IRAM runtime
+/// that calls `main`) look "changed". A caller that *inlines* part of the
+/// entry instead has different bytes, which `bytes_hash`/`mih` already
+/// capture, so the cut hides nothing real. See
+/// `docs/14-identity-granularity.md`.
+pub fn build(objects: &[ParsedObject], entry_symbol: Option<&str>) -> Graph {
     // First, classify each allocated input section into one of three
     // shapes:
     //   - Aggregator contributor (`.init_array.NN`, etc.): folded into
@@ -361,6 +374,10 @@ pub fn build(objects: &[ParsedObject]) -> Graph {
         })
         .collect();
 
+    // The trampoline target node (if the entry symbol resolves). Edges
+    // into it are cut to external sentinels below.
+    let entry_node = entry_symbol.and_then(|n| symbols.resolve_global(n));
+
     // Edges + external counts. Outgoing edges come from each segment's
     // relocs; aggregator nodes naturally accumulate edges from all
     // contributor segments because their (obj, sec) → NodeId mappings
@@ -395,11 +412,18 @@ pub fn build(objects: &[ParsedObject]) -> Graph {
                         .or_else(|| symbols.resolve_local(&r.target, obj.tu_id))
                 };
                 match target {
-                    Some(t) if t != nid => edges[nid as usize].push(t),
-                    Some(_) => {
+                    Some(t) if t == nid => {
                         // self-edge — ignored for SCC; section already
                         // depends on itself trivially via its own bytes.
                     }
+                    Some(t) if Some(t) == entry_node => {
+                        // Trampoline cut: a reference to the entry target
+                        // binds to its (trampolined) address, not its
+                        // content. Fold in a sentinel so the entry's
+                        // content doesn't propagate into this caller.
+                        external_counts[nid as usize] += 1;
+                    }
+                    Some(t) => edges[nid as usize].push(t),
                     None => external_counts[nid as usize] += 1,
                 }
             }

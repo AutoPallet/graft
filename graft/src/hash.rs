@@ -1,27 +1,39 @@
 //! Transitive hash computation.
 //!
-//! Processes SCCs in reverse topological order (successors first) and
-//! assigns one `trans_hash` per SCC. Every member section in the SCC
-//! inherits that hash, so base and overlay builds can compare per-symbol
-//! hashes via the flat `symbol → trans_hash` table.
+//! Processes SCCs in reverse topological order (successors first),
+//! computes one transitive hash per SCC, then derives each node's
+//! `trans_hash` by mixing the node's own member hash back in — so two
+//! members of one cycle (e.g. xtensa code ↔ its literal pool) stay
+//! distinguishable while still reflecting all transitive content.
 //!
 //! ```text
-//! trans_hash(scc) = blake3(
-//!     concat(sorted(
-//!         blake3(member.bytes || postcard(canonical_relocs(member)))
-//!         for member in scc
-//!     ))
+//! member_hash(n) = blake3(n.bytes || nominal_salt(n)?
+//!                          || postcard(canonical_relocs(n)))
+//! scc_hash(scc) = blake3(
+//!     concat(sorted(member_hash(m) for m in scc))
 //!     || concat(sorted(
-//!         trans_hash(succ) for succ in distinct out-of-SCC successors
+//!         scc_hash(succ) for succ in distinct out-of-SCC successors
 //!         ++ [[0u8;16] repeated external_edge_count times]
 //!     ))
 //! )[:16]
+//! trans_hash(n) = blake3(scc_hash(scc_of(n)) || member_hash(n))[:16]
 //! ```
 //!
 //! Members contribute a "bytes+relocs" hash so the SCC's final hash is
 //! invariant under permutations of member order in the `.o` file.
 //! Successor hashes are sorted so edge-order shifts (e.g. reloc
 //! dedup / resort) don't affect the result.
+//!
+//! `nominal_salt` applies only to sections that are NOT content-
+//! addressable (see `SectionInfo::content_addressable`): mutable data
+//! (`.bss`, `.data`) and zero-size sections, whose bytes don't define
+//! their identity. Without it, every zero-init static in the program
+//! shares one trans_hash and positional resolution aliases distinct
+//! variables onto one base address. The salt is the section's sorted
+//! (symbol name, st_value) pairs — names with the `.llvm.<id>`
+//! internal-linkage suffix stripped, so CGU repartitioning doesn't
+//! churn the identity of an otherwise-unchanged static (which would
+//! silently *duplicate* its state into the overlay).
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -29,80 +41,41 @@ use crate::graph::{Graph, SccResult};
 use crate::elf::{CanonicalReloc, ParsedObject};
 
 pub type TransHash = [u8; 16];
-pub type Symhash = [u8; 16];
 
 pub const EXTERNAL_SENTINEL: TransHash = [0u8; 16];
 
-/// Per-symbol fingerprint stored in `.graft.symhash`.
+// Identity is keyed purely on `TransHash` (the section's transitive
+// content hash). The former per-symbol `symhash` (name ‖ trans_hash) and
+// its `stable_name_part` name-canonicalizer are gone: resolution is
+// positional (section trans_hash → base address + in-section offset), and
+// the only place a name still disambiguates — content-identical sections
+// base placed at distinct addresses — is handled at prune time via the
+// base.elf symtab snapshot. See `docs/14-identity-granularity.md`.
+
+/// Per-node blake3 over the node's *identity bytes*: each segment's
+/// content (respecting sub-ranges for per-string nodes) plus, for
+/// non-content-addressable sections, the nominal salt. Aggregator nodes
+/// own their contributors as segments, so this naturally captures the
+/// merged-output content. This is the fingerprint that both the
+/// trans_hash member-hash and the `ContentResolver` canonicalization
+/// build on; exposed so the diagnostic dump (`debug_dump`) can reproduce
+/// `compute` exactly instead of re-deriving it (and drifting).
 ///
-/// `symhash_of(stable_name, trans_hash) = blake3(stable_name? ‖ NUL ‖ trans_hash)`
-///
-/// `stable_name` is `Some(s)` for symbols whose name is invariant
-/// across builds of the same source (most rust-mangled symbols, C
-/// globals). It's `None` for symbols whose name embeds a
-/// build-specific fingerprint that drifts on every cargo
-/// incremental re-emit:
-///   - `anon.<cgu_fp>.<n>(.llvm.<id>)?` — rustc anonymous data.
-///   - Same shape used by some allocator/format internals.
-///
-/// Folding the stable name in disambiguates two distinct symbols that
-/// happen to compile to byte-identical sections. Folding the
-/// trans_hash in catches content + dependency changes — anon symbols
-/// rely on this exclusively. Two builds of the same source produce
-/// the same symhash regardless of CGU re-partitioning,
-/// `.llvm.<digits>` suffix drift, or STT_SECTION ↔ symbol reloc form.
-pub fn symhash_of(stable_name: Option<&str>, trans_hash: &TransHash) -> Symhash {
-    let mut h = blake3::Hasher::new();
-    if let Some(n) = stable_name {
-        h.update(n.as_bytes());
-    }
-    h.update(b"\0");
-    h.update(trans_hash);
-    let digest = *h.finalize().as_bytes();
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&digest[..16]);
-    out
+/// The salt must be in here (not only in the SCC member hash): the
+/// resolver rewrites reloc *targets* to these fingerprints, and without
+/// it a referrer that swaps which of two same-content statics each
+/// instruction touches would produce a byte-identical canonical reloc
+/// list and an identical edge *set* — an invisible change.
+pub fn node_identity_hashes(graph: &Graph, objects: &[ParsedObject]) -> Vec<blake3::Hash> {
+    let salts = nominal_salts(objects);
+    node_identity_hashes_with(graph, objects, &salts)
 }
 
-/// Extract the stable part of a symbol name, or `None` if the name is
-/// build-noise. The classifier mirrors what `M1.q.2`'s
-/// `ContentResolver::canonicalize_target` already strips for
-/// trans_hash inputs:
-///
-///   - `anon.<hex>.<n>` (with optional `.llvm.<id>` suffix) → drop
-///     entirely; identity is purely content-based.
-///   - `<name>.llvm.<digits>` → strip the `.llvm.<digits>` suffix
-///     (rustc internal-linkage symbols whose suffix shifts when CGU
-///     content shifts). The pre-suffix part already includes rustc's
-///     content-derived hash, so it's stable.
-///   - Empty names → `None`.
-///   - Otherwise → return as-is.
-pub fn stable_name_part(name: &str) -> Option<&str> {
-    if name.is_empty() {
-        return None;
-    }
-    if name.starts_with("anon.") {
-        return None;
-    }
-    // Strip a trailing `.llvm.<digits>` suffix if present.
-    if let Some(idx) = name.rfind(".llvm.") {
-        let suffix = &name[idx + ".llvm.".len()..];
-        if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
-            return Some(&name[..idx]);
-        }
-    }
-    Some(name)
-}
-
-/// Per-node blake3 over the node's bytes — each segment respecting its
-/// sub-range for per-string nodes, concatenated in segment order.
-/// Aggregator nodes own their contributors as segments, so this
-/// naturally captures the merged-output content. This is the content
-/// fingerprint that both the trans_hash member-hash and the
-/// `ContentResolver` canonicalization build on; exposed so the
-/// diagnostic dump (`debug_dump`) can reproduce `compute` exactly
-/// instead of re-deriving it (and drifting).
-pub fn node_bytes_hashes(graph: &Graph, objects: &[ParsedObject]) -> Vec<blake3::Hash> {
+fn node_identity_hashes_with(
+    graph: &Graph,
+    objects: &[ParsedObject],
+    salts: &HashMap<(u32, u32), Vec<u8>>,
+) -> Vec<blake3::Hash> {
     graph
         .nodes
         .iter()
@@ -110,10 +83,65 @@ pub fn node_bytes_hashes(graph: &Graph, objects: &[ParsedObject]) -> Vec<blake3:
             let mut h = blake3::Hasher::new();
             for seg in &nm.segments {
                 h.update(seg.bytes_in(&objects[seg.object as usize].sections));
+                if seg.range.is_none()
+                    && let Some(salt) = salts.get(&(seg.object, seg.section))
+                {
+                    h.update(salt);
+                }
             }
             h.finalize()
         })
         .collect()
+}
+
+/// `(object, section) → identity salt` for every section that is NOT
+/// content-addressable (mutable data, NOBITS, zero-size). The salt is a
+/// marker plus the section's sorted (stripped symbol name, st_value)
+/// pairs — nominal identity for sections whose bytes don't define them.
+/// Content-addressable sections have no entry (their hash input is
+/// byte-for-byte what it was before this mechanism existed).
+fn nominal_salts(objects: &[ParsedObject]) -> HashMap<(u32, u32), Vec<u8>> {
+    let mut entries: HashMap<(u32, u32), Vec<(String, u64)>> = HashMap::new();
+    for (oi, obj) in objects.iter().enumerate() {
+        for (si, sec) in obj.sections.iter().enumerate() {
+            if !sec.content_addressable() {
+                entries.insert((oi as u32, si as u32), Vec::new());
+            }
+        }
+        for sym in &obj.symbols {
+            let Some(si) = sym.defining_section else { continue };
+            if sym.name.is_empty() {
+                continue;
+            }
+            if let Some(v) = entries.get_mut(&(oi as u32, si as u32)) {
+                v.push((strip_llvm_suffix(&sym.name).to_string(), sym.value));
+            }
+        }
+    }
+    entries
+        .into_iter()
+        .map(|(k, mut syms)| {
+            syms.sort();
+            syms.dedup();
+            let mut blob = b"\0graft-nominal\0".to_vec();
+            for (name, value) in &syms {
+                blob.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                blob.extend_from_slice(name.as_bytes());
+                blob.extend_from_slice(&value.to_le_bytes());
+            }
+            (k, blob)
+        })
+        .collect()
+}
+
+/// Strip rustc/LLVM's per-build internal-linkage suffix
+/// (`foo.llvm.1234567890`) so the nominal salt doesn't churn when CGU
+/// repartitioning renumbers it.
+fn strip_llvm_suffix(name: &str) -> &str {
+    match name.find(".llvm.") {
+        Some(i) => &name[..i],
+        None => name,
+    }
 }
 
 /// Compute a `TransHash` for every node. All nodes in the same SCC
@@ -123,14 +151,16 @@ pub fn compute(
     graph: &Graph,
     scc: &SccResult,
 ) -> Vec<TransHash> {
-    // Two-pass member hashing. Pass 1: per-node blake3 of just the
-    // section bytes — a stable content fingerprint that doesn't depend
-    // on names, ordering, or other build-time noise. Pass 2: full
-    // per-node hash (bytes + canonicalized reloc list, where reloc
-    // target names are rewritten to content-fingerprints whenever the
-    // name itself is build-time noise — see `canonicalize_target`).
-    let bytes_hashes = node_bytes_hashes(graph, objects);
-    let resolver = ContentResolver::build(objects, graph, &bytes_hashes);
+    // Two-pass member hashing. Pass 1: per-node blake3 of the section
+    // bytes plus, for non-content-addressable sections, the nominal
+    // salt — a stable identity fingerprint that doesn't depend on
+    // ordering or other build-time noise. Pass 2: full per-node hash
+    // (identity bytes + canonicalized reloc list, where reloc target
+    // names are rewritten to identity-fingerprints whenever the name
+    // itself is build-time noise — see `canonicalize_target`).
+    let salts = nominal_salts(objects);
+    let identity_hashes = node_identity_hashes_with(graph, objects, &salts);
+    let resolver = ContentResolver::build(objects, graph, &identity_hashes);
 
     let member_input_hash: Vec<blake3::Hash> = graph
         .nodes
@@ -148,6 +178,9 @@ pub fn compute(
                 // node's input-hash is invariant to relocs that
                 // belong to other parts of the section.
                 if seg.range.is_none() {
+                    if let Some(salt) = salts.get(&(seg.object, seg.section)) {
+                        h.update(salt);
+                    }
                     let encoded = encode_relocs(&sec.relocs, seg.object, obj.tu_id, &resolver);
                     h.update(&encoded);
                 }
@@ -195,10 +228,26 @@ pub fn compute(
         scc_hash[sid] = trunc;
     }
 
-    // Fan out SCC hashes to every node.
+    // Fan out: each node's trans_hash = SCC transitive hash ‖ its own
+    // member-input hash. Members of a multi-node SCC share transitive
+    // content but are DISTINCT sections that base places at distinct
+    // addresses — on xtensa, code and its literal pool reference each
+    // other (`.rwtext` ↔ `.rwtext.literal`) and so *always* form a
+    // cycle. Folding an SCC onto one shared hash made `by_section[th]`
+    // ill-defined: base's vote flagged the pair ambiguous and the
+    // "representative" copy resolved `ram_resident_step` into the
+    // middle of the literal pool. Mixing in the member hash keeps every
+    // change-detection property (any transitive change still changes
+    // the SCC hash, hence every member's value) while giving each
+    // member a well-defined address mapping.
     graph.nodes.iter().enumerate().map(|(nid, _)| {
         let sid = scc.scc_of_node[nid];
-        scc_hash[sid as usize]
+        let mut h = blake3::Hasher::new();
+        h.update(&scc_hash[sid as usize]);
+        h.update(member_input_hash[nid].as_bytes());
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&h.finalize().as_bytes()[..16]);
+        out
     }).collect()
 }
 

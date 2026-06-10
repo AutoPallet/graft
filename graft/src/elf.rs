@@ -40,6 +40,33 @@ pub struct SectionInfo {
     pub relocs: Vec<CanonicalReloc>,
 }
 
+impl SectionInfo {
+    /// True iff this section's identity can be its *content* — the basis
+    /// for positional (trans_hash-keyed) resolution against base.
+    ///
+    /// Mirrors what ld itself is willing to content-fold: read-only data
+    /// and code, never writable data. Two byte-identical mutable sections
+    /// (`.bss.A` / `.bss.B`, zero-init `.data.X` / `.data.Y`) are
+    /// *distinct variables* that merely look alike — binding a reference
+    /// to "an interchangeable copy" silently aliases program state (the
+    /// M2 xtensa call-to-0: three `.bss` statics and `esp_println::LOCK`
+    /// all collapsed onto one base address). NOBITS and zero-size
+    /// sections have no bytes at all, so their content hash is fully
+    /// degenerate. Non-content-addressable sections get a *nominal*
+    /// identity instead: `hash::compute` salts their leaf hash with the
+    /// sorted (symbol, offset) pairs they define.
+    ///
+    /// RAM-resident code (`.rwtext`, SHF_WRITE|SHF_EXECINSTR placement
+    /// artifacts) stays content-addressable: code is immutable content
+    /// regardless of segment writability.
+    pub fn content_addressable(&self) -> bool {
+        use object::elf::{SHF_EXECINSTR, SHF_WRITE};
+        !self.bytes.is_empty()
+            && (self.sh_flags & u64::from(SHF_WRITE) == 0
+                || self.sh_flags & u64::from(SHF_EXECINSTR) != 0)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SectionKind {
     Text,

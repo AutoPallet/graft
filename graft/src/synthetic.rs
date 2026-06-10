@@ -31,10 +31,10 @@ pub struct Aggregator {
     /// How to identify input sections that contribute to this output.
     pub contributor: Contributor,
     /// Real linker-script-defined bracket symbols. Their addresses
-    /// live in base.elf's `.symtab`; refs from code resolve through
-    /// the normal symhash machinery once the aggregator node is in
-    /// the graph and these names are appended to its
-    /// `defined_symbols` list.
+    /// live in base.elf's `.symtab`; refs from code resolve through the
+    /// base.elf symtab snapshot (prune channel 3, with post-link verify)
+    /// — they carry no section content of their own. The aggregator node
+    /// is still in the graph so its contributors hash/close correctly.
     pub bracket_symbols: &'static [&'static str],
 }
 

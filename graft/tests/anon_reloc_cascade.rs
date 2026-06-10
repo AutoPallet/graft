@@ -89,7 +89,7 @@ fn foo_trans_hash(obj_bytes: &[u8]) -> [u8; 16] {
     let path = dir.path().join("synth.o");
     std::fs::write(&path, obj_bytes).expect("write");
 
-    let r = graft::scan::run::<PathBuf>(&[path.clone()], &[], &[], &[]).expect("scan");
+    let r = graft::scan::run::<PathBuf>(&[path.clone()], &[], &[], &[], None).expect("scan");
     // `foo`'s defining section is `.text.foo`. Find the NodeId for it
     // and look up its trans_hash.
     let (obj_idx, sec_idx) = r

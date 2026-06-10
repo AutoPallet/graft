@@ -28,11 +28,11 @@ fn run_cache_info(path: &Path) -> anyhow::Result<()> {
     let bytes = std::fs::read(path)?;
     let manifest_bytes = elf_attach::read_section(&bytes, metadata::SECTION_MANIFEST)?
         .ok_or_else(|| anyhow::anyhow!("no {} in {}", metadata::SECTION_MANIFEST, path.display()))?;
-    let symhash_bytes = elf_attach::read_section(&bytes, metadata::SECTION_SYMHASH)?
-        .ok_or_else(|| anyhow::anyhow!("no {} in {}", metadata::SECTION_SYMHASH, path.display()))?;
+    let sections_bytes = elf_attach::read_section(&bytes, metadata::SECTION_SECTIONS)?
+        .ok_or_else(|| anyhow::anyhow!("no {} in {}", metadata::SECTION_SECTIONS, path.display()))?;
 
     let m = metadata::decode_manifest(manifest_bytes)?;
-    let entries = metadata::decode_symhash(symhash_bytes)?;
+    let table = metadata::decode_sections(sections_bytes)?;
 
     println!("manifest:");
     println!("  version          {}", m.version);
@@ -41,17 +41,22 @@ fn run_cache_info(path: &Path) -> anyhow::Result<()> {
     println!("  toolchain_stamp  {}", m.toolchain_stamp);
     println!("  overlay_region   {:#x}..{:#x}", m.overlay_region.0, m.overlay_region.1);
     println!();
-    println!("symhash: {} entries ({} bytes on disk)", entries.len(), symhash_bytes.len());
+    println!(
+        "sections: {} entries, {} ambiguous ({} bytes on disk)",
+        table.entries.len(),
+        table.ambiguous.len(),
+        sections_bytes.len()
+    );
 
     if let Ok(pat) = std::env::var("GRAFT_GREP")
         && !pat.is_empty()
     {
         println!();
-        println!("entries with symhash prefix matching {pat:?}:");
-        for e in &entries {
-            let hh: String = e.symhash.iter().map(|b| format!("{b:02x}")).collect();
+        println!("entries with trans_hash prefix matching {pat:?}:");
+        for e in &table.entries {
+            let hh: String = e.trans_hash.iter().map(|b| format!("{b:02x}")).collect();
             if hh.contains(&pat) {
-                println!("  {:#010x}  sz={:<6} symhash={hh}", e.address, e.size);
+                println!("  {:#010x}  trans_hash={hh}", e.address);
             }
         }
     }
@@ -60,10 +65,10 @@ fn run_cache_info(path: &Path) -> anyhow::Result<()> {
     {
         println!();
         println!("entries at address {want:#x}:");
-        for e in &entries {
+        for e in &table.entries {
             if e.address == want {
-                let hh: String = e.symhash.iter().map(|b| format!("{b:02x}")).collect();
-                println!("  {:#010x}  sz={:<6} symhash={hh}", e.address, e.size);
+                let hh: String = e.trans_hash.iter().map(|b| format!("{b:02x}")).collect();
+                println!("  {:#010x}  trans_hash={hh}", e.address);
             }
         }
     }
@@ -149,7 +154,7 @@ pub fn scan_dump(args: &[String]) -> ExitCode {
     let (eager, deferred): (Vec<_>, Vec<_>) = inputs.into_iter().partition(|p| {
         p.extension().and_then(|e| e.to_str()) != Some("a")
     });
-    let scan_result = match scan::run(&eager, &deferred, &[], &[]) {
+    let scan_result = match scan::run(&eager, &deferred, &[], &[], None) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("graft scan-dump: {e:#}");

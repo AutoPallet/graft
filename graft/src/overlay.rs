@@ -6,7 +6,7 @@
 //!   3. Hash + graph overlay's inputs    (scan::run)
 //!   4. Compute closure                  (reachability walk from `main`,
 //!                                        with per-section trans_hash
-//!                                        match against base.symhash)
+//!                                        match against base's section table)
 //!   5. Prune each input `.o`            (separate `prune` module)
 //!   6. Generate base_symbols.ld         (PROVIDE entries for hits)
 //!   7. Exec real linker                 (with pruned .o's + scripts)
@@ -26,9 +26,7 @@ use crate::elf::SymbolBind;
 use crate::elf_attach;
 use crate::graph::NodeId;
 use crate::hash::TransHash;
-use crate::metadata::{
-    self, GraftManifest, SCHEMA_VERSION, SECTION_MANIFEST, SECTION_SYMHASH, SymHashEntry,
-};
+use crate::metadata::{self, GraftManifest, SCHEMA_VERSION, SECTION_MANIFEST, SECTION_SECTIONS};
 use crate::prune;
 use crate::roots;
 use crate::scan::{self, ScanResult};
@@ -68,8 +66,14 @@ fn run(argv: Vec<String>) -> Result<()> {
     let driver = crate::argv::driver_path(&argv);
     let (eager_inputs, deferred_inputs) = resolve_scan_inputs(&link_args, &driver);
     let t_scan_start = std::time::Instant::now();
-    let scan = scan::run(&eager_inputs, &deferred_inputs, &link_args.undefined, &link_args.wrapped)
-        .context("overlay pre-scan")?;
+    let scan = scan::run(
+        &eager_inputs,
+        &deferred_inputs,
+        &link_args.undefined,
+        &link_args.wrapped,
+        Some(base.manifest.entry_symbol.as_str()),
+    )
+    .context("overlay pre-scan")?;
     let t_scan = t_scan_start.elapsed();
 
     if let Ok(p) = std::env::var("GRAFT_DEBUG_DUMP_GRAPH")
@@ -80,16 +84,14 @@ fn run(argv: Vec<String>) -> Result<()> {
         }
     }
 
-    // Single source of truth for overlay-side per-symbol content
-    // fingerprints (`symhash_of(stable_name_part(name), th)`). Built
-    // once from the scan and consumed by *both* the closure decision
-    // (`classify_provided`) and prune's reloc resolution — see
-    // `OverlaySymhashes` for the consistency invariant this enforces.
-    let osh = OverlaySymhashes::build(&scan);
+    // Overlay-side positional-resolution inputs: name → (node
+    // trans_hash, in-section offset). Consumed by prune; the closure
+    // decision keys on the same trans_hashes, so the two can't drift.
+    let offsets = OverlayOffsets::build(&scan);
 
     let t_closure_start = std::time::Instant::now();
     let roots = roots::find_roots(&scan, &base, &link_args)?;
-    let closure = compute_closure(&scan, &base, &roots, &osh)?;
+    let closure = compute_closure(&scan, &base, &roots)?;
     let t_closure = t_closure_start.elapsed();
 
     // Scratch dir next to the output path. Cleaned and recreated each
@@ -102,31 +104,33 @@ fn run(argv: Vec<String>) -> Result<()> {
     std::fs::create_dir_all(&work_dir)
         .with_context(|| format!("create {}", work_dir.display()))?;
 
-    // Build the symhash-keyed resolver inputs. The name→symhash maps
-    // (prune channels 1/2) and the closure symhash set both come from
-    // the single `osh` source built above (see `OverlaySymhashes`):
-    //   - `osh.globals` / `osh.locals` / `osh.locals_any_tu`: name →
-    //     symhash for every defined symbol, so prune can translate raw
-    //     reloc-target names into content-keyed lookups against base's
-    //     `by_symhash`.
-    //   - `closure_symhashes`: the symhashes of every symbol defined in
-    //     a closure-included section. Cross-`.o` relocs targeting these
-    //     must NOT be anchored to base (their content differs); ld
-    //     resolves them to overlay's own re-emitted copy.
-    // Because both come from `osh`, prune's per-symbol lookup and the
-    // closure decision cannot drift.
-    let closure_symhashes = osh.closure_set(&closure.closure);
+    // Resolver inputs. Prune resolves a reloc target positionally:
+    //   - `closure_trans_hashes`: nodes overlay re-emits; a ref to one
+    //     stays UND so ld binds it to overlay's own copy (channel 1).
+    //   - `by_section` (trans_hash → base section addr) + the offset
+    //     maps (`overlay_*`): a content-matched ref anchors at
+    //     `by_section[th] + offset` (channel 2).
+    //   - `ambiguous_sections` + `base_symtab`: content-identical
+    //     multi-address sections resolve a *named* ref to base's exact
+    //     copy with post-link verify; crt/script/bracket names base
+    //     resolved but overlay never saw go through `base_symtab` too
+    //     (channel 3).
+    // classify and prune both key on trans_hash, so they can't drift.
+    let closure_ths = closure_trans_hashes(&scan, &closure.closure);
+    let mutable_ths = mutable_trans_hashes(&scan);
     let base_resolver_wrapped: HashSet<String> =
         link_args.wrapped.iter().cloned().collect();
     let base_resolver = prune::BaseResolver {
-        by_symhash: &base.by_symhash,
+        by_section: &base.by_section,
+        ambiguous_sections: &base.ambiguous_sections,
         base_symtab: &base.by_name,
         base_symtab_ambiguous: &base.by_name_ambiguous,
         wrapped: &base_resolver_wrapped,
-        closure_symhashes: &closure_symhashes,
-        overlay_symhash_globals: &osh.globals,
-        overlay_symhash_locals: &osh.locals,
-        overlay_symhash_locals_any_tu: &osh.locals_any_tu,
+        closure_trans_hashes: &closure_ths,
+        mutable_trans_hashes: &mutable_ths,
+        overlay_globals: &offsets.globals,
+        overlay_locals: &offsets.locals,
+        overlay_locals_any_tu: &offsets.locals_any_tu,
     };
 
     // Prune each source object; collect the pruned-.o paths.
@@ -284,14 +288,14 @@ fn run(argv: Vec<String>) -> Result<()> {
     write_combine_stats(&stats_path, &combine_stats)?;
 
     let summary = format!(
-        "graft overlay: base {} symhash · overlay {} objs / {} sections · \
+        "graft overlay: base {} sections · overlay {} objs / {} sections · \
          closure {} sections · \
          pruned {} objs / {} sections / {} abs-rewrites / {} base-assumed (ch3) · \
          combined {} bytes (overlay payload {} @ {:#x}, {} trampolines) · \
          scan {:.1?} · closure {:.1?} · prune {:.1?} · link {:.1?} · combine {:.1?} · \
          total {:.1?}\n\
          overlay.elf: {}\n",
-        base.by_symhash.len(),
+        base.by_section.len(),
         scan.objects.len(),
         scan.graph.nodes.len(),
         closure.closure.len(),
@@ -418,7 +422,8 @@ fn prune_all(
     for (obj_idx, keep_set) in by_obj {
         let input = &scan.inputs[obj_idx as usize];
         let parsed = &scan.objects[obj_idx as usize];
-        let p = prune::prune_object(&input.bytes, parsed.tu_id, &keep_set, base_resolver)
+        let sec_ths = object_section_trans_hashes(scan, obj_idx);
+        let p = prune::prune_object(&input.bytes, parsed.tu_id, &keep_set, base_resolver, &sec_ths)
             .with_context(|| format!("prune {}", input.label()))?;
         match input.member_name.as_deref() {
             None => {
@@ -812,15 +817,22 @@ fn run_real_linker(
 
 pub struct BaseMetadata {
     pub manifest: GraftManifest,
-    /// Content-keyed lookup. Every entry in base's `.graft.symhash`
-    /// indexed by its 16-byte symhash (folds stable name + section
-    /// trans_hash). Identity is build-invariant: same symhash means
-    /// "base has interchangeable bytes for this content", regardless
-    /// of CGU re-partition or `.llvm.<id>` suffix drift.
-    pub by_symhash: HashMap<crate::hash::Symhash, SymHashEntry>,
+    /// Content-keyed section table from base's `.graft.sections`:
+    /// `trans_hash → section base address`. A reference resolves
+    /// positionally as `by_section[node.trans_hash] + in_section_offset`.
+    /// Build-invariant: same `trans_hash` means base has byte-identical
+    /// section content (hence identical layout), regardless of CGU
+    /// re-partition or `.llvm.<id>` suffix drift.
+    pub by_section: HashMap<TransHash, u64>,
+    /// `trans_hash`es base saw at more than one distinct address
+    /// (content-identical sections it did not fold). Excluded from
+    /// `by_section`; a *named* reference to one resolves to base's exact
+    /// copy via `by_name` (preserving address identity), a section
+    /// reference bails.
+    pub ambiguous_sections: HashSet<TransHash>,
     /// Snapshot of base's post-link `.symtab`: name → final address.
     /// Channel-of-last-resort for reloc resolution — used when a
-    /// name isn't matched by overlay's scan or by `by_symhash`.
+    /// name isn't matched by overlay's scan or by `by_section`.
     /// Resolution rewrites relocs to a per-name `__graft_assumed_<hex>`
     /// SHN_ABS anchor at this address, post-link-verified.
     ///
@@ -842,8 +854,8 @@ fn load_base_metadata(path: &std::path::Path) -> Result<BaseMetadata> {
     let bytes = std::fs::read(path).with_context(|| format!("read base {}", path.display()))?;
     let manifest_bytes = elf_attach::read_section(&bytes, SECTION_MANIFEST)?
         .ok_or_else(|| anyhow!("{}: no {}", path.display(), SECTION_MANIFEST))?;
-    let symhash_bytes = elf_attach::read_section(&bytes, SECTION_SYMHASH)?
-        .ok_or_else(|| anyhow!("{}: no {}", path.display(), SECTION_SYMHASH))?;
+    let sections_bytes = elf_attach::read_section(&bytes, SECTION_SECTIONS)?
+        .ok_or_else(|| anyhow!("{}: no {}", path.display(), SECTION_SECTIONS))?;
 
     let manifest = metadata::decode_manifest(manifest_bytes)?;
     if manifest.magic != metadata::GRAFT_MAGIC {
@@ -858,12 +870,12 @@ fn load_base_metadata(path: &std::path::Path) -> Result<BaseMetadata> {
         );
     }
 
-    let entries = metadata::decode_symhash(symhash_bytes)?;
-    let mut by_symhash: HashMap<crate::hash::Symhash, SymHashEntry> =
-        HashMap::with_capacity(entries.len());
-    for e in entries {
-        by_symhash.entry(e.symhash).or_insert(e);
+    let table = metadata::decode_sections(sections_bytes)?;
+    let mut by_section: HashMap<TransHash, u64> = HashMap::with_capacity(table.entries.len());
+    for e in &table.entries {
+        by_section.entry(e.trans_hash).or_insert(e.address);
     }
+    let ambiguous_sections: HashSet<TransHash> = table.ambiguous.iter().copied().collect();
 
     // Walk base.elf's `.symtab` for the channel-of-last-resort
     // (`name → address`) lookup. Done lazily here from the file we've
@@ -908,7 +920,7 @@ fn load_base_metadata(path: &std::path::Path) -> Result<BaseMetadata> {
         by_name.remove(n);
     }
 
-    Ok(BaseMetadata { manifest, by_symhash, by_name, by_name_ambiguous })
+    Ok(BaseMetadata { manifest, by_section, ambiguous_sections, by_name, by_name_ambiguous })
 }
 
 pub(crate) struct Closure {
@@ -919,98 +931,118 @@ pub(crate) struct Closure {
     pub closure: Vec<NodeId>,
 }
 
-/// Overlay-side per-symbol content fingerprints, computed once from the
-/// scan and used by *both* the closure walk and prune — the single
-/// source of truth for `symhash_of(stable_name_part(name), th)`.
-///
-/// CONSISTENCY INVARIANT (the classify-vs-prune contract). The closure
-/// walk decides inclusion at *section* granularity; prune resolves
-/// relocs at *symbol* granularity. They agree because both read from
-/// this one structure. A node has exactly one trans_hash, so every
-/// named symbol it defines maps to the same (name-modulo) symhash in
-/// both passes. Globals can't be multiply-defined with differing
-/// trans_hashes (`base::build_symhash` bails at base-link time if they
-/// are); locals are keyed by `(name, tu_id)`, unique per TU. Therefore
-/// the symhash prune channel 1 looks up via `globals`/`locals` is the
-/// same symhash that's in `closure_set(...)` whenever the name's
-/// section is in the closure. Keeping a single builder makes this
-/// structural rather than load-bearing-by-convention.
-pub(crate) struct OverlaySymhashes {
-    /// name → symhash for STB_GLOBAL/WEAK defs and aggregator brackets.
-    pub globals: HashMap<String, crate::hash::Symhash>,
-    /// (name, tu_id) → symhash for STB_LOCAL defs.
-    pub locals: HashMap<(String, [u8; 8]), crate::hash::Symhash>,
-    /// name → symhash, first-write across TUs. Cross-CGU fallback for
-    /// locals whose referencing `.o` carries a different tu_id than the
-    /// defining one; safe because identical content → identical symhash.
-    pub locals_any_tu: HashMap<String, crate::hash::Symhash>,
-    /// Per-`NodeId`: the symhashes of every symbol the node defines.
-    /// Drives the closure decision and the closure symhash set.
-    node_symhashes: Vec<Vec<crate::hash::Symhash>>,
+/// Overlay-side positional-resolution inputs: for every defined symbol,
+/// its node's `trans_hash` and in-section offset. prune turns a reloc
+/// target name into a base address via `by_section[trans_hash] + offset`
+/// (see `docs/14-identity-granularity.md`). The closure decision
+/// (`classify_provided`) keys on the same `trans_hash`, so inclusion and
+/// resolution can't drift.
+pub(crate) struct OverlayOffsets {
+    /// name → (defining node trans_hash, in-section offset) for
+    /// STB_GLOBAL/WEAK defs.
+    pub globals: HashMap<String, (TransHash, u64)>,
+    /// (name, tu_id) → (trans_hash, offset) for STB_LOCAL defs.
+    pub locals: HashMap<(String, [u8; 8]), (TransHash, u64)>,
+    /// name → (trans_hash, offset), first-write across TUs. Cross-CGU
+    /// fallback for locals referenced from a `.o` with a different tu_id
+    /// than the defining one; safe because identical content → identical
+    /// trans_hash → an interchangeable copy.
+    pub locals_any_tu: HashMap<String, (TransHash, u64)>,
 }
 
-impl OverlaySymhashes {
-    /// Build from `graph.nodes[].defined_symbols` — the canonical
-    /// per-node symbol list (string-pool symbols already dispatched to
-    /// the right per-string node, aggregator brackets already attached).
-    /// This is the *same* iteration `classify_provided` reads, so the
-    /// two can't disagree.
+impl OverlayOffsets {
+    /// Build from each object's real symbols (which carry `st_value`).
+    /// Aggregator brackets and other synthesized / linker-script symbols
+    /// are intentionally absent — they have no section offset and resolve
+    /// through the base.elf symtab snapshot (`by_name`, prune channel 3).
+    ///
+    /// First-write-wins for a multiply-defined weak name is safe now:
+    /// every definition's `trans_hash` is recorded in base's section
+    /// table, so whichever copy a reference resolves through is
+    /// byte-identical and interchangeable.
     pub(crate) fn build(scan: &ScanResult) -> Self {
-        let mut globals: HashMap<String, crate::hash::Symhash> = HashMap::new();
-        let mut locals: HashMap<(String, [u8; 8]), crate::hash::Symhash> = HashMap::new();
-        let mut locals_any_tu: HashMap<String, crate::hash::Symhash> = HashMap::new();
-        let mut node_symhashes: Vec<Vec<crate::hash::Symhash>> =
-            vec![Vec::new(); scan.graph.nodes.len()];
+        // (object, section) → node, first-match (mirrors base's address
+        // recovery and `node_id_of`).
+        let mut node_of: HashMap<(u32, u32), NodeId> = HashMap::new();
         for (nid, nm) in scan.graph.nodes.iter().enumerate() {
-            let th = scan.trans_hash[nid];
-            for sym in &nm.defined_symbols {
+            for seg in &nm.segments {
+                node_of.entry((seg.object, seg.section)).or_insert(nid as NodeId);
+            }
+        }
+        let mut globals: HashMap<String, (TransHash, u64)> = HashMap::new();
+        let mut locals: HashMap<(String, [u8; 8]), (TransHash, u64)> = HashMap::new();
+        let mut locals_any_tu: HashMap<String, (TransHash, u64)> = HashMap::new();
+        for (obj_idx, obj) in scan.objects.iter().enumerate() {
+            for sym in &obj.symbols {
+                let Some(sec_idx) = sym.defining_section else { continue };
                 if sym.name.is_empty() {
                     continue;
                 }
-                let sh = crate::hash::symhash_of(crate::hash::stable_name_part(&sym.name), &th);
-                node_symhashes[nid].push(sh);
+                let Some(&nid) = node_of.get(&(obj_idx as u32, sec_idx as u32)) else {
+                    continue;
+                };
+                let th = scan.trans_hash[nid as usize];
+                let off = sym.value;
                 match sym.bind {
                     SymbolBind::Global | SymbolBind::Weak => {
-                        globals.entry(sym.name.clone()).or_insert(sh);
+                        globals.entry(sym.name.clone()).or_insert((th, off));
                     }
                     SymbolBind::Local => {
-                        // Aggregator brackets carry tu_id = None but are
-                        // emitted as Global above; a Local always has a
-                        // tu_id.
-                        let tu = sym.tu_id.expect("local symbol must carry tu_id");
-                        locals.insert((sym.name.clone(), tu), sh);
-                        locals_any_tu.entry(sym.name.clone()).or_insert(sh);
+                        locals.insert((sym.name.clone(), obj.tu_id), (th, off));
+                        locals_any_tu.entry(sym.name.clone()).or_insert((th, off));
                     }
                 }
             }
         }
-        Self { globals, locals, locals_any_tu, node_symhashes }
-    }
-
-    /// Symhashes of every symbol defined in any closure-included node.
-    pub(crate) fn closure_set(&self, closure: &[NodeId]) -> HashSet<crate::hash::Symhash> {
-        let mut s = HashSet::new();
-        for &nid in closure {
-            s.extend(self.node_symhashes[nid as usize].iter().copied());
-        }
-        s
-    }
-
-    /// True iff base can satisfy this node — at least one of its defined
-    /// symbols is content-matched in `base.by_symhash`. A node with no
-    /// matchable symbol must be Included (no base address to anchor to).
-    fn node_provided_by(&self, nid: NodeId, base: &BaseMetadata) -> bool {
-        let shs = &self.node_symhashes[nid as usize];
-        !shs.is_empty() && shs.iter().any(|sh| base.by_symhash.contains_key(sh))
+        Self { globals, locals, locals_any_tu }
     }
 }
 
-fn compute_closure(
-    scan: &ScanResult,
-    base: &BaseMetadata,
-    roots: &[NodeId],
-    osh: &OverlaySymhashes,
-) -> Result<Closure> {
+/// `trans_hash`es of every closure-included (Included) node. A reloc
+/// targeting one stays UND so ld binds it to overlay's re-emitted copy.
+fn closure_trans_hashes(scan: &ScanResult, closure: &[NodeId]) -> HashSet<TransHash> {
+    closure.iter().map(|&nid| scan.trans_hash[nid as usize]).collect()
+}
+
+/// `trans_hash`es of every node backed by a non-content-addressable
+/// section (mutable data / NOBITS / zero-size — nominal identity, see
+/// `SectionInfo::content_addressable`). Prune must never resolve an
+/// *ambiguous* one of these to a representative copy: byte-identical
+/// mutable sections at distinct addresses are distinct variables, and
+/// aliasing them is exactly the silent-stale-bind failure mode this
+/// design exists to prevent.
+fn mutable_trans_hashes(scan: &ScanResult) -> HashSet<TransHash> {
+    let mut out = HashSet::new();
+    for (nid, nm) in scan.graph.nodes.iter().enumerate() {
+        let mutable = nm.segments.iter().any(|seg| {
+            seg.range.is_none()
+                && !scan.objects[seg.object as usize].sections[seg.section as usize]
+                    .content_addressable()
+        });
+        if mutable {
+            out.insert(scan.trans_hash[nid as usize]);
+        }
+    }
+    out
+}
+
+/// Per-object `0-based section index → node trans_hash`, for resolving
+/// `STT_SECTION` relocs into pruned sections positionally. Only ordinary
+/// (single-node) sections are meaningful here; string-pool / aggregator
+/// sections are never Provided-and-pruned in a way that reaches this map.
+fn object_section_trans_hashes(scan: &ScanResult, obj_idx: u32) -> HashMap<u32, TransHash> {
+    let mut out = HashMap::new();
+    for (nid, nm) in scan.graph.nodes.iter().enumerate() {
+        for seg in &nm.segments {
+            if seg.object == obj_idx {
+                out.entry(seg.section).or_insert(scan.trans_hash[nid]);
+            }
+        }
+    }
+    out
+}
+
+fn compute_closure(scan: &ScanResult, base: &BaseMetadata, roots: &[NodeId]) -> Result<Closure> {
     let mut closure: Vec<NodeId> = Vec::new();
 
     // Per-node state: Unknown / Included / Provided. We don't walk into
@@ -1033,7 +1065,7 @@ fn compute_closure(
         if decision[nid as usize] != Decision::Unknown {
             continue;
         }
-        if classify_provided(nid, scan, base, osh) {
+        if classify_provided(nid, scan, base) {
             decision[nid as usize] = Decision::Provided;
         } else {
             decision[nid as usize] = Decision::Included;
@@ -1050,47 +1082,33 @@ fn compute_closure(
     Ok(Closure { closure })
 }
 
-/// Returns true iff this section can be satisfied by base — at least
-/// one defined symbol's `symhash_of(stable_name, trans_hash)` matches
-/// an entry in `base.by_symhash`. Sections with no matchable symbol
-/// must be Included (no address to point a reloc at).
-///
-/// The decision reads the precomputed `osh.node_symhashes` so it shares
-/// a single source of truth with prune (see `OverlaySymhashes`). The
-/// `GRAFT_DEBUG_MISMATCH` diagnostic re-walks the node's symbols only
-/// to pair each non-matching symhash with its name — a cold, env-gated
-/// path, not part of the decision.
-fn classify_provided(
-    nid: NodeId,
-    scan: &ScanResult,
-    base: &BaseMetadata,
-    osh: &OverlaySymhashes,
-) -> bool {
-    let provided = osh.node_provided_by(nid, base);
+/// True iff base can satisfy this node positionally: its `trans_hash` is
+/// in base's section table (a recovered, unambiguous address) or is a
+/// known content-identical-but-multi-address section (resolved by name at
+/// prune time). Otherwise the node must be Included — base either has no
+/// copy (content differs) or graft couldn't recover its address, and
+/// re-emitting is the safe default. See `docs/14-identity-granularity.md`.
+fn classify_provided(nid: NodeId, scan: &ScanResult, base: &BaseMetadata) -> bool {
+    let th = scan.trans_hash[nid as usize];
+    let provided = base.by_section.contains_key(&th) || base.ambiguous_sections.contains(&th);
     if !provided && let Ok(p) = std::env::var("GRAFT_DEBUG_MISMATCH") {
         let nm = &scan.graph.nodes[nid as usize];
-        let th: TransHash = scan.trans_hash[nid as usize];
-        for sym in &nm.defined_symbols {
-            let symhash = crate::hash::symhash_of(crate::hash::stable_name_part(&sym.name), &th);
-            if base.by_symhash.contains_key(&symhash) {
-                continue;
-            }
-            let oh: String = symhash[..8].iter().map(|b| format!("{b:02x}")).collect();
-            let tag = match sym.bind {
-                SymbolBind::Local => 'L',
-                _ => 'G',
-            };
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&p)
-                .and_then(|mut f| {
-                    std::io::Write::write_all(
-                        &mut f,
-                        format!("{tag} {} symhash={oh} (no base match)\n", sym.name).as_bytes(),
+        let oh: String = th[..8].iter().map(|b| format!("{b:02x}")).collect();
+        let names: Vec<&str> = nm.defined_symbols.iter().map(|s| s.name.as_str()).collect();
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+            .and_then(|mut f| {
+                std::io::Write::write_all(
+                    &mut f,
+                    format!(
+                        "node {nid} trans_hash={oh} (no base section) syms=[{}]\n",
+                        names.join(", ")
                     )
-                });
-        }
+                    .as_bytes(),
+                )
+            });
     }
     provided
 }

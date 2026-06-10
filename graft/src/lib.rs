@@ -23,4 +23,4 @@ pub mod subcommands;
 pub mod synthetic;
 pub mod telemetry;
 
-pub use metadata::{GRAFT_MAGIC, GraftManifest, SCHEMA_VERSION, SymHashEntry};
+pub use metadata::{GRAFT_MAGIC, GraftManifest, SCHEMA_VERSION, SectionEntry, SectionTable};

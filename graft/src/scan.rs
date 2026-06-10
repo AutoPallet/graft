@@ -23,7 +23,10 @@ pub struct ScanResult {
     pub objects: Vec<ParsedObject>,
     pub graph: Graph,
     pub scc: SccResult,
-    /// Indexed by `NodeId`. All members of an SCC share a hash.
+    /// Indexed by `NodeId`. Per-node identity: the containing SCC's
+    /// transitive hash mixed with the node's own member hash, so cycle
+    /// members (xtensa code ↔ literal pool) don't collapse onto one
+    /// value. See `hash::compute`.
     pub trans_hash: Vec<TransHash>,
     /// Canonical paths of `.a` / `.rlib` archives we expanded (any
     /// member parsed). Overlay uses this to know which forwarded
@@ -49,6 +52,11 @@ pub fn run<P: AsRef<Path>>(
     deferred_paths: &[P],
     extra_roots: &[String],
     wrapped: &[String],
+    // graft's single trampoline target. Edges into it are cut from the
+    // trans_hash graph (see `graph::build`) so an edit to the entry
+    // doesn't make its callers look changed. Base and overlay must pass
+    // the same name for their trans_hashes to match.
+    entry_symbol: Option<&str>,
 ) -> Result<ScanResult> {
     let collected = archive::collect_eager(eager_paths)?;
     let mut inputs = collected.inputs;
@@ -97,8 +105,8 @@ pub fn run<P: AsRef<Path>>(
     // doesn't pull `libmain.a`'s app_main if Rust's eager
     // libesp_idf_sys.rlib already defines it. Without the
     // already-defined check, we'd over-pull and end up with multiple
-    // Global definitions of the same name in scan.objects — which
-    // base::build_symhash treats as a hard error per ld semantics.
+    // Global definitions of the same name in scan.objects — which the
+    // real linker rejects, and which would corrupt base address recovery.
     //
     // Seeded with `extra_roots` (`-u <sym>` / `--undefined=<sym>`)
     // so members ld would force-load via those flags also get pulled.
@@ -187,7 +195,7 @@ pub fn run<P: AsRef<Path>>(
         }
     }
 
-    let graph = graph::build(&objects);
+    let graph = graph::build(&objects, entry_symbol);
     let scc = graph::tarjan_scc(&graph);
     let trans_hash = hash::compute(&objects, &graph, &scc);
 

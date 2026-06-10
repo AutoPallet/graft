@@ -64,7 +64,7 @@ pub fn dump_graph(path: &Path, scan: &ScanResult) -> std::io::Result<()> {
     // trans_hash inputs (a hand-rolled copy previously drifted — it
     // keyed on whole-section bytes and ignored string-pool sub-ranges,
     // reporting fingerprints `compute` never produced).
-    let bytes_hashes = crate::hash::node_bytes_hashes(g, &scan.objects);
+    let bytes_hashes = crate::hash::node_identity_hashes(g, &scan.objects);
     let resolver = crate::hash::ContentResolver::build(&scan.objects, g, &bytes_hashes);
 
     // Per-node logical key (used for cross-scan join AND for emitting

@@ -98,18 +98,22 @@ any byte patching. They usually do.
 `prune_object`'s reloc resolution is a cascade. The ordering is load-
 bearing, not cosmetic:
 
-1. overlay saw it AND it's in the closure → UND (ld resolves to
-   overlay's re-emitted copy).
-2. overlay saw it AND its symhash matches base → SHN_ABS anchor at
-   base's address (content-identical, safe).
+1. overlay saw it AND its node's trans_hash is in the closure → UND
+   (ld resolves to overlay's re-emitted copy).
+2. overlay saw it AND its trans_hash is in base's section table →
+   SHN_ABS anchor at `by_section[th] + offset` (positional,
+   content-keyed, no verify). Ambiguous hashes (base placed identical
+   content at several addresses): unique name in base.symtab → pin
+   that copy + verify; no pin and the content is MUTABLE → bail
+   (aliasing distinct variables); read-only/exec → representative.
 3. **overlay saw it but neither of the above** → BAIL. The symbol's
    content differs from base and it wasn't re-emitted; binding to
    base's address would silently call base's stale code. This check
    MUST come before channel "base_symtab" (M2 fixed a bug where it
    came after and was shadowed — channel 3 silently bound drifted
    content to base).
-4. overlay never saw it (`overlay_sh.is_none()`) AND base_symtab has a
-   unique address → SHN_ABS anchor + post-link verify. This is the
+4. overlay never saw it AND base_symtab has a unique address →
+   SHN_ABS anchor + post-link verify. This is the
    channel-of-last-resort, ONLY for names not in overlay's inputs
    (crt/startup, linker-script absolutes, ROM/PROVIDE, prebuilt libs).
    Ambiguous base names (multiple distinct addresses) bail.
@@ -141,3 +145,45 @@ yourself reaching for a fresh-PT_LOAD "append everything" path, that's
 the retired design (it never worked on xtensa — one IROM/DROM segment
 only — and carried the trickiest ELF surgery in the tree). Reserve
 more slack instead.
+
+## Content identity is only sound for immutable content
+
+Two byte-identical sections are interchangeable ONLY if they're
+read-only or code. `.bss` sections have no bytes at all; zero-init
+`.data` sections are all byte-identical — but they are *distinct
+mutable variables*, and binding a reference to "an interchangeable
+copy" silently aliases program state (M2 xtensa: `TICK_COUNTER`,
+`ATOMIC_TICK`, and esp_println's `TIMED_OUT` all bound to one address;
+`esp_println::LOCK` aliased `ESP_HAL_LOCK`). ld itself never
+content-folds writable sections — mirror it.
+
+`SectionInfo::content_addressable` is the predicate (has bytes AND
+(read-only OR exec)). Non-addressable sections get a nominal salt
+(sorted symbol/offset pairs, `.llvm.<id>` stripped) folded into their
+hash, and prune refuses representative resolution for ambiguous
+mutable hashes. If you're adding a resolution path, ask: "could this
+bind two distinct mutable variables to one address?" If yes, it needs
+a name pin or a bail. `tests/nominal_identity.rs` pins the predicate.
+
+## trans_hash is per-node; SCC members must NOT share one
+
+Code and its literal pool reference each other on xtensa
+(`.rwtext` ↔ `.rwtext.literal`), so they ALWAYS form an SCC. If SCC
+members share a hash, `by_section[th]` is ill-defined: base records
+one hash at two addresses, the ambiguity machinery treats them as
+"identical copies", and resolution lands in the wrong section (M2:
+`ram_resident_step` resolved into the middle of the literal pool —
+runtime jump to garbage). The per-node hash is
+`blake3(scc_hash ‖ member_input_hash)` (see `hash::compute`). Never
+"simplify" it back to the bare SCC hash; equality of trans_hash must
+mean "interchangeable bytes at a recoverable address."
+
+## The container bind-mounts the repo root — git affects the host
+
+`docker exec graft-esp32s3 … /workspace` IS the host checkout. A
+`git stash`/`checkout`/`clean` run inside the container (or in any
+scripted container command) hits the real working tree — with the
+refactor uncommitted, a stray `git stash` wiped every in-flight
+change mid-session (recovered via `git stash pop`). Never put git
+state commands in container scripts; run them deliberately on the
+host only.
