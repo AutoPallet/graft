@@ -199,6 +199,90 @@ fn a2_ambiguous_base_name_bails() {
     );
 }
 
+/// `.text.foo` (kept) has an STT_SECTION reloc into `.shared` (pruned).
+/// `.shared` defines two symbols: `lowsym` at offset 0 (NOT content-
+/// matched in base) and `hisym` at offset 8 (content-matched). The
+/// section-surrogate path must try *all* symbols and resolve via `hisym`,
+/// not bail on the lowest-addressed `lowsym`. (Regression for the
+/// esp-hal `__pre_init` surrogate failure.)
+fn synth_obj_section_ref() -> Vec<u8> {
+    let mut obj = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+
+    let text_id = obj.add_section(Vec::new(), b".text.foo".to_vec(), SectionKind::Text);
+    obj.set_section_data(text_id, vec![0xccu8; 16], 4);
+    obj.add_symbol(Symbol {
+        name: b"foo".to_vec(),
+        value: 0,
+        size: 16,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Dynamic,
+        weak: false,
+        section: SymbolSection::Section(text_id),
+        flags: SymbolFlags::None,
+    });
+
+    let shared_id = obj.add_section(Vec::new(), b".shared".to_vec(), SectionKind::Text);
+    obj.set_section_data(shared_id, vec![0x90u8; 16], 4);
+    // lowsym at offset 0 (lowest), hisym at offset 8.
+    obj.add_symbol(Symbol {
+        name: b"lowsym".to_vec(),
+        value: 0,
+        size: 8,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Dynamic,
+        weak: false,
+        section: SymbolSection::Section(shared_id),
+        flags: SymbolFlags::None,
+    });
+    obj.add_symbol(Symbol {
+        name: b"hisym".to_vec(),
+        value: 8,
+        size: 8,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Dynamic,
+        weak: false,
+        section: SymbolSection::Section(shared_id),
+        flags: SymbolFlags::None,
+    });
+
+    // STT_SECTION reloc from .text.foo+4 into .shared (+addend 8).
+    let shared_section_sym = obj.section_symbol(shared_id);
+    obj.add_relocation(
+        text_id,
+        Relocation {
+            offset: 4,
+            symbol: shared_section_sym,
+            addend: 8,
+            flags: RelocationFlags::Generic {
+                kind: RelocationKind::Absolute,
+                encoding: RelocationEncoding::Generic,
+                size: 64,
+            },
+        },
+    )
+    .expect("add section reloc");
+
+    obj.write().expect("emit ELF")
+}
+
+#[test]
+fn section_surrogate_tries_all_symbols_not_just_lowest() {
+    let bytes = synth_obj_section_ref();
+    let keep = keep_text_foo(&bytes); // keep only .text.foo; .shared is pruned
+    const SH_HI: Symhash = [0x77u8; 16];
+    let mut t = Tables::default();
+    // Only `hisym` resolves; `lowsym` (lower address) does not.
+    t.overlay_globals.insert("hisym".into(), SH_HI);
+    t.by_symhash.insert(SH_HI, SymHashEntry { symhash: SH_HI, address: 0x5000, size: 8 });
+
+    let p = prune::prune_object(&bytes, [0; 8], &keep, &t.resolver())
+        .expect("must resolve the section via hisym, not bail on lowsym");
+    assert_eq!(
+        p.abs_rewrites, 1,
+        "the STT_SECTION reloc should anchor via the content-matched sibling"
+    );
+}
+
 #[test]
 fn unresolvable_name_bails() {
     // overlay never saw it, base never defined it, not weak → hard error.

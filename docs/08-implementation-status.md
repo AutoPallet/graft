@@ -706,6 +706,60 @@ an identical-shape combined ELF the same way xtensa does. A stale
 `GRAFT_OVERLAY_MODE=append` is a hard error (`slack::ensure_splice_mode`),
 not a silent switch. `~250` lines deleted from `combine.rs`/`overlay.rs`.
 
+### Hardware validation (esp32s3) + section-surrogate improvement
+
+Ran the M2 build through real hardware in the `graft-esp32s3` dev
+container (device on `/dev/ttyACM0`):
+
+- **Base path works on hardware.** M2 base build boots cleanly
+  (`SPI_FAST_FLASH_BOOT`) and runs the fixture loop; `.graft.*`
+  metadata + slack symbols all present.
+- **M2 does not regress xtensa.** The Hello→Howdy overlay build fails
+  at prune — but pre-M2 graft (HEAD~1) fails with the byte-identical
+  error, so this is a pre-existing bug, not anything M2 introduced.
+
+While chasing it, hardened the section-surrogate resolver
+(`prune::compute_section_base_vaddr`): it now tries *all* named symbols
+in a pruned section (first content-match wins) instead of only the
+lowest-addressed one, and emits a precise "tried: …" diagnostic. Sound
+(content-match only). Regression test in `tests/prune_channels.rs`.
+
+### Open: classify-vs-resolve inconsistency for multiply-defined weak globals
+
+Root cause of the pre-existing Hello→Howdy overlay failure on current
+esp-hal (precisely diagnosed via the graph dump):
+
+- Current esp-hal/rustc compiles the fixture to **2 CGUs**, and lumps
+  the entire IRAM-resident reset/exception machinery + `ram_resident_step`
+  into one giant catch-all `.rwtext` section per CGU (30+ functions,
+  ~94 external reloc edges → one `trans_hash` over all of it).
+- `graft_entry`'s literal pool references `ram_resident_step` (inside
+  `.rwtext`) via an `R_XTENSA_32 .rwtext+0x504` STT_SECTION reloc.
+- The closure walk reaches `.rwtext` and `classify` marks it Provided
+  (some symbol's per-node symhash matches base — via
+  `osh.node_symhashes`). So it's pruned.
+- But prune's surrogate resolves by *name* through the first-write-wins
+  `osh.globals` map. A weak global duplicated across the two CGUs'
+  `.rwtext` sections has a *different* symhash in each (the symhash
+  folds the whole section's `trans_hash`, and the two CGUs' `.rwtext`
+  differ). First-write-wins picks the other CGU's symhash, which isn't
+  in `by_symhash` → resolve misses → prune bails.
+
+So `classify` (per-node symhash) and prune resolution (name-keyed,
+first-write-wins) **disagree** when a name maps to multiple nodes with
+differing section `trans_hashes`. It fails loud (no silent wrong
+binary), but it blocks xtensa overlays on current esp-hal.
+
+The sound fix: resolve the section surrogate through the target
+section's **own node** symhashes against `by_symhash` (taking the base
+address from the matched `SymHashEntry`), exactly as `classify` does —
+rather than the lossy name-keyed map. This needs per-node content
+resolution plumbed into prune (the prune↔overlay boundary), plus an
+x86 reproduction first (synthetic 2-node weak-global-in-catch-all). It
+is soundness-critical and deferred to its own pass rather than rushed.
+A deeper structural option is finer-grained nodes (don't fold a whole
+CGU's `.rwtext` into one trans_hash), which would also shrink overlays.
+
 ## Things that turned out to not matter (or got simpler)
 
 - **Per-call-site `l32r` literals.** Not needed — only one

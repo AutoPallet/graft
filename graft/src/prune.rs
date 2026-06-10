@@ -626,12 +626,21 @@ fn compute_section_base_vaddr(
     base: &BaseResolver<'_>,
     tu_id: [u8; 8],
 ) -> Result<(i64, crate::hash::Symhash)> {
-    // Pick the lowest-addressed named, non-File/Section symbol defined
-    // in the section. Resolve it through `base`. Subtract the surrogate's
-    // offset within the section to get the section start in base's
-    // address space. Return the surrogate's symhash too so the caller
-    // can use it as a content-stable dedup key for the SHN_ABS anchor.
-    let mut best: Option<(u64, &str, bool)> = None;
+    // Resolve the section's base start address via any of its defined
+    // symbols that base content-matches. The section start is
+    // `surrogate_vaddr - surrogate_offset_within_section`; content-match
+    // (symhash) guarantees the surrogate's bytes are identical in base,
+    // so its in-section offset is the same there.
+    //
+    // We try *every* named symbol in the section (sorted by (addr, name)
+    // for determinism), using the first that resolves — not just the
+    // lowest-addressed one. The lowest isn't always the symbol base
+    // recorded: e.g. esp-hal reset hooks (`__pre_init`) share a section
+    // with ordinary functions and aren't content-keyed in base, while a
+    // sibling (`ram_resident_step`) is. Since the section was reached and
+    // classified Provided, at least one of its symbols content-matches;
+    // this finds it. Content-match only — no name→address fallback.
+    let mut candidates: Vec<(u64, String, bool)> = Vec::new();
     for sym in src.symbols() {
         if sym.section_index() != Some(target_sec_idx) {
             continue;
@@ -645,25 +654,31 @@ fn compute_section_base_vaddr(
         }
         let was_local =
             matches!(sym.scope(), SymbolScope::Compilation | SymbolScope::Unknown);
-        let addr = sym.address();
-        if best.map_or(true, |(b, _, _)| addr < b) {
-            best = Some((addr, name, was_local));
-        }
+        candidates.push((sym.address(), name.to_string(), was_local));
     }
-    let (off, name, was_local) = best.ok_or_else(|| {
-        anyhow!(
+    if candidates.is_empty() {
+        bail!(
             "no named surrogate symbol in pruned section #{} — anonymous-only sections \
              are not yet supported by the SHN_ABS path",
             target_sec_idx.0,
-        )
-    })?;
-    let (sh, surrogate_vaddr) = base.resolve(name, was_local, tu_id).ok_or_else(|| {
-        anyhow!(
-            "surrogate {name} (local={was_local}) for pruned section #{} not in base",
-            target_sec_idx.0,
-        )
-    })?;
-    Ok((surrogate_vaddr as i64 - off as i64, sh))
+        );
+    }
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut tried: Vec<String> = Vec::new();
+    for (off, name, was_local) in &candidates {
+        if let Some((sh, surrogate_vaddr)) = base.resolve(name, *was_local, tu_id) {
+            return Ok((surrogate_vaddr as i64 - *off as i64, sh));
+        }
+        tried.push(name.clone());
+    }
+    bail!(
+        "no content-matchable surrogate symbol in pruned section #{}: none of its \
+         defined symbols resolve against base (tried: {}). The section is referenced \
+         but graft can't pin its base address — likely a closure/scan-discovery gap.",
+        target_sec_idx.0,
+        tried.join(", "),
+    )
 }
 
 fn map_kind(k: SymbolKind) -> SymbolKind {
