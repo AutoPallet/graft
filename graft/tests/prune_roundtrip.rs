@@ -51,6 +51,7 @@ fn prune_keep_all_preserves_shape() {
     let osh_lat: HashMap<String, Symhash> = HashMap::new();
     let w: HashSet<String> = HashSet::new();
     let base_symtab: HashMap<String, u64> = HashMap::new();
+    let base_symtab_amb: HashSet<String> = HashSet::new();
     let cs: HashSet<Symhash> = HashSet::new();
     let resolver = prune::BaseResolver {
         by_symhash: &by_sh,
@@ -59,6 +60,7 @@ fn prune_keep_all_preserves_shape() {
         overlay_symhash_locals_any_tu: &osh_lat,
         wrapped: &w,
         base_symtab: &base_symtab,
+        base_symtab_ambiguous: &base_symtab_amb,
         closure_symhashes: &cs,
     };
     let result = prune::prune_object(&bytes, [0; 8], &keep, &resolver)
@@ -89,6 +91,7 @@ fn prune_keep_none_still_parses() {
     let osh_lat: HashMap<String, Symhash> = HashMap::new();
     let w: HashSet<String> = HashSet::new();
     let base_symtab: HashMap<String, u64> = HashMap::new();
+    let base_symtab_amb: HashSet<String> = HashSet::new();
     let cs: HashSet<Symhash> = HashSet::new();
     let resolver = prune::BaseResolver {
         by_symhash: &by_sh,
@@ -97,6 +100,7 @@ fn prune_keep_none_still_parses() {
         overlay_symhash_locals_any_tu: &osh_lat,
         wrapped: &w,
         base_symtab: &base_symtab,
+        base_symtab_ambiguous: &base_symtab_amb,
         closure_symhashes: &cs,
     };
     let result = prune::prune_object(&bytes, [0xAB; 8], &keep, &resolver).unwrap_or_else(|e| {

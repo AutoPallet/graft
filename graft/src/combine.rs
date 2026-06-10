@@ -1,16 +1,22 @@
 //! Combine base + overlay ELFs into a runnable combined executable.
 //!
-//! Pure splice: no relocation work. Overlay is already fully linked at
-//! disjoint addresses (see `overlay.rs` — disjoint flat region on x86,
-//! the slack past base's IROM/DROM on xtensa), and its references to
-//! base symbols are resolved as absolute constants through
-//! `base_addresses.ld`. Combine's job is just:
+//! Pure splice: no relocation work. Overlay is already fully linked into
+//! base's reserved slack regions (see `overlay.rs` and `slack.rs`), and
+//! its references to base symbols are resolved as absolute constants at
+//! prune time. Combine's job is just:
 //!
 //!   1. Copy base.elf verbatim.
-//!   2. Append each overlay PT_LOAD's payload to the end of the file.
-//!   3. Rewrite the program header table to include the new PT_LOADs.
-//!   4. Install **one** trampoline at base's `entry_symbol` (typically
+//!   2. Byte-splice each overlay section over the slack-filling 0xFFs at
+//!      its file offset inside base's existing segments. (RAM-resident
+//!      segments that legitimately fall past base — e.g. xtensa
+//!      `.rwtext` copied flash→IRAM at boot — are appended as fresh
+//!      PT_LOADs by `append_pt_loads`; everything else splices in place.)
+//!   3. Install **one** trampoline at base's `entry_symbol` (typically
 //!      `main`), redirecting crt (or the boot path) to overlay's entry.
+//!
+//! The output ELF keeps base's exact shape and (for the common
+//! splice-only case) its exact size — only the slack bytes and the one
+//! trampoline differ, which is what makes partial reflashing cheap.
 //!
 //! Only the entry-point trampoline is needed. Every other base→closure
 //! reloc is impossible by construction: if some base section pointed
@@ -132,212 +138,34 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
         );
     }
 
-    let e_machine = u16::from_le_bytes(base_bytes[18..20].try_into().unwrap());
-    let mode = crate::slack::Mode::resolve(e_machine)?;
-    if mode == crate::slack::Mode::Splice {
-        return combine_splice(
-            base_path,
-            &base_bytes,
-            overlay_path,
-            &overlay_bytes,
-            base_class,
-            output_path,
-        );
-    }
-
-    // Find every overlay PT_LOAD. linkall.x emits dummy placeholder
-    // LOADs (`.rwdata_dummy`, `.vectors`) that overlap base's RAM at
-    // identical vaddrs and carry no overlay-specific data. esp-hal also
-    // page-aligns DROM/IROM PT_LOADs DOWN to a 4KB boundary, so an
-    // overlay's `.rodata` at 0x3c0019ac sits in a LOAD with
-    // p_vaddr=0x3c001000 — overlapping base's DROM by ~6 KB even though
-    // the actual content is past it. Wholesale-dropping such LOADs
-    // would lose overlay's literal pool. So we *trim* each LOAD to its
-    // non-overlapping subrange instead: keep only the bytes whose
-    // vaddrs are strictly past every base PT_LOAD.
-    let base_phdrs_for_filter = read_program_headers(&base_bytes, base_class)?;
-    let base_loads: Vec<Phdr> = base_phdrs_for_filter
-        .iter()
-        .copied()
-        .filter(|p| p.p_type == PT_LOAD)
-        .collect();
-    let ov_phdrs = read_program_headers(&overlay_bytes, ov_class)?;
-    let mut overlay_loads: Vec<Phdr> = Vec::new();
-    for ov in ov_phdrs.iter().filter(|p| p.p_type == PT_LOAD) {
-        if ov.p_filesz == 0 {
-            continue;
-        }
-        // Highest base end-vaddr that the overlay LOAD's start lands
-        // before. If we're entirely past every base LOAD, no trim.
-        let mut min_keep_vaddr = ov.p_vaddr;
-        for b in &base_loads {
-            let b_end = b.p_vaddr + b.p_memsz;
-            if ov.p_vaddr < b_end && ov.p_vaddr + ov.p_memsz > b.p_vaddr {
-                // Overlap. The non-overlapping tail starts at b_end.
-                if b_end > min_keep_vaddr {
-                    min_keep_vaddr = b_end;
-                }
-            }
-        }
-        if min_keep_vaddr >= ov.p_vaddr + ov.p_memsz {
-            // Entirely overlapped — nothing to keep.
-            continue;
-        }
-        let trim = min_keep_vaddr - ov.p_vaddr;
-        overlay_loads.push(Phdr {
-            p_type: PT_LOAD,
-            p_flags: ov.p_flags,
-            p_offset: ov.p_offset + trim,
-            p_vaddr: ov.p_vaddr + trim,
-            p_paddr: ov.p_paddr + trim,
-            p_filesz: ov.p_filesz.saturating_sub(trim),
-            p_memsz: ov.p_memsz - trim,
-            p_align: ov.p_align,
-        });
-    }
-    // Empty overlay_loads is OK if the overlay closure is genuinely
-    // empty (no main redirect either) — handled by the trampoline
-    // short-circuit below. Bail only if we have trampolines but no
-    // payload, which would mean we'd jump into nothing.
-
-    // Find the one symbol we bridge: base's manifest tells us which
-    // user-level entry crt calls (always `main` on hosted x86-64; the
-    // bootloader entry for xtensa).
-    let manifest_bytes = elf_attach::read_section(&base_bytes, metadata::SECTION_MANIFEST)?
-        .ok_or_else(|| anyhow!("{}: no {}", base_path.display(), metadata::SECTION_MANIFEST))?;
-    let manifest = metadata::decode_manifest(manifest_bytes)?;
-    let entry = manifest.entry_symbol.as_str();
-
-    let base_obj = object::File::parse(&*base_bytes)
-        .with_context(|| format!("parse {}", base_path.display()))?;
-    let overlay_obj = object::File::parse(&*overlay_bytes)
-        .with_context(|| format!("parse {}", overlay_path.display()))?;
-    let base_entry_addr = find_text_def(&base_obj, entry)
-        .ok_or_else(|| anyhow!("entry symbol {entry:?} not defined in base"))?;
-    // Overlay's entry must live inside one of the overlay PT_LOADs;
-    // if the link resolved entry to a base PROVIDE address it'd be
-    // outside, meaning the closure didn't cascade to entry — guard.
-    let overlay_entry_addr = find_text_def(&overlay_obj, entry).filter(|&a| {
-        overlay_loads
-            .iter()
-            .any(|p| a >= p.p_vaddr && a < p.p_vaddr + p.p_memsz)
-    });
-    let trampolines: Vec<Trampoline> = match overlay_entry_addr {
-        Some(a) => vec![Trampoline {
-            name: entry.to_string(),
-            base_addr: base_entry_addr,
-            overlay_addr: a,
-        }],
-        None => Vec::new(),
-    };
-
-    if !trampolines.is_empty() && overlay_loads.is_empty() {
-        bail!(
-            "trampolines reference overlay but no overlay-specific \
-             PT_LOAD survived overlap trim — overlay layout broken"
-        );
-    }
-
-    // No trampoline → base never jumps into overlay. KEEP()'d sections
-    // can land in overlay even without a code change but are unreachable
-    // without a trampoline. Short-circuit to byte-identical base output.
-    if trampolines.is_empty() {
-        write_executable(output_path, &base_bytes)?;
-        return Ok(Stats {
-            trampolines,
-            overlay_load_size: 0,
-            overlay_vaddr: 0,
-            combined_size: base_bytes.len() as u64,
-        });
-    }
-
-    // Build output: start from base, apply trampolines, append every
-    // overlay PT_LOAD, append a new PHT extending base's.
-    let mut out = base_bytes.clone();
-
-    let base_phdrs = read_program_headers(&base_bytes, base_class)?;
-    let e_machine = u16::from_le_bytes(base_bytes[18..20].try_into().unwrap());
-    apply_trampolines(&mut out, &base_phdrs, &trampolines, e_machine)?;
-
-    // For each overlay LOAD: append its bytes, padded to memsz; track
-    // the new file offset for the rewritten PHT entry. Each LOAD is
-    // page-aligned so the kernel/bootloader can mmap cleanly.
-    let mut new_loads: Vec<Phdr> = Vec::with_capacity(overlay_loads.len());
-    let primary_load = overlay_loads[0]; // for Stats reporting
-    for ov_load in &overlay_loads {
-        align_up(&mut out, 0x1000);
-        let new_offset = out.len() as u64;
-        let load_data = &overlay_bytes
-            [ov_load.p_offset as usize..(ov_load.p_offset + ov_load.p_filesz) as usize];
-        out.extend_from_slice(load_data);
-        if ov_load.p_memsz > ov_load.p_filesz {
-            out.resize(out.len() + (ov_load.p_memsz - ov_load.p_filesz) as usize, 0);
-        }
-        new_loads.push(Phdr {
-            p_type: PT_LOAD,
-            p_flags: ov_load.p_flags,
-            p_offset: new_offset,
-            p_vaddr: ov_load.p_vaddr,
-            p_paddr: ov_load.p_vaddr,
-            p_filesz: ov_load.p_filesz,
-            p_memsz: ov_load.p_memsz,
-            p_align: 0x1000,
-        });
-    }
-
-    align_up(&mut out, 8);
-    let new_phoff = out.len() as u64;
-    let new_phnum = base_phdrs.len() + new_loads.len();
-    let pht_size = new_phnum * base_class.phdr_size();
-
-    // ELF64 hosted (x86 musl): the kernel needs e_phoff to fall inside
-    // *some* PT_LOAD for AT_PHDR to be a valid virtual address (else
-    // musl SEGVs in __init_libc reading phdrs for TLS setup). Stretch
-    // the last new LOAD to cover the trailing PHT.
-    if let Some(last) = new_loads.last_mut() {
-        let new_filesz = (new_phoff + pht_size as u64) - last.p_offset;
-        last.p_filesz = new_filesz;
-        last.p_memsz = new_filesz;
-    }
-
-    for p in base_phdrs.iter().chain(new_loads.iter()) {
-        out.extend_from_slice(&p.to_le_bytes(base_class));
-    }
-
-    // Patch e_phoff + e_phnum in the ELF header.
-    let ho = base_class.header_offsets();
-    match ho.e_phoff_size {
-        4 => out[ho.e_phoff..ho.e_phoff + 4].copy_from_slice(&(new_phoff as u32).to_le_bytes()),
-        8 => out[ho.e_phoff..ho.e_phoff + 8].copy_from_slice(&new_phoff.to_le_bytes()),
-        n => bail!("unexpected e_phoff_size {n}"),
-    }
-    out[ho.e_phnum..ho.e_phnum + 2].copy_from_slice(&(new_phnum as u16).to_le_bytes());
-
-    // Add section headers for each overlay LOAD so downstream tools
-    // (e.g., espflash, which builds image segments by walking the
-    // section table rather than the PHT) actually see the overlay
-    // bytes. Without this, overlay's slack PT_LOADs are present in the
-    // file but invisible to espflash save-image.
-    add_overlay_section_headers(&mut out, &new_loads, base_class)?;
-
-    write_executable(output_path, &out)?;
-
-    let total_overlay_filesz: u64 = overlay_loads.iter().map(|p| p.p_filesz).sum();
-    Ok(Stats {
-        trampolines,
-        overlay_load_size: total_overlay_filesz,
-        overlay_vaddr: primary_load.p_vaddr,
-        combined_size: out.len() as u64,
-    })
+    // Splice is the only overlay mode. Overlay's sections were linked
+    // into base's reserved slack regions, so combine byte-splices them
+    // in place (RAM-resident segments that legitimately fall past base,
+    // e.g. xtensa `.rwtext`, are appended by `combine_splice`'s pass 2).
+    // The old "append everything at a fresh PT_LOAD" path — with its
+    // overlap-trim, AT_PHDR stretching, and PHT rewrite — is gone.
+    combine_splice(
+        base_path,
+        &base_bytes,
+        overlay_path,
+        &overlay_bytes,
+        base_class,
+        output_path,
+    )
 }
 
-/// Xtensa splice path (M1.k): overlay's `.text` and `.rodata` are linked
-/// into base's slack regions (`GRAFT_TEXT_SLACK`, `GRAFT_RODATA_SLACK`),
-/// so they live *inside* base's existing IROM/DROM PT_LOADs. Combine
-/// just splices the overlay section bytes over the slack-filling 0xFFs
-/// in the base ELF, then patches the entry trampoline. No new PT_LOADs,
-/// no PHT rewrite, no SHT extension — espflash sees a single IROM and
-/// single DROM segment exactly as it did for plain base.
+/// The splice path (all targets). Overlay's `.text` / `.rodata` are
+/// linked into base's slack regions (`GRAFT_TEXT_SLACK`,
+/// `GRAFT_RODATA_SLACK`, `GRAFT_DATA_SLACK`), so they live *inside*
+/// base's existing PT_LOADs. Combine splices the overlay section bytes
+/// over the slack-filling 0xFFs in the base ELF, then patches the entry
+/// trampoline. For the common case there are no new PT_LOADs, no PHT
+/// rewrite, no SHT extension — the output is base's exact shape and
+/// size. RAM-resident overlay segments that legitimately fall past base
+/// (e.g. xtensa `.rwtext`) are the one exception: they're appended via
+/// `append_pt_loads`. Any overlay section that would land on *live* base
+/// content (outside slack, inside a base PT_LOAD) is a hard error, not a
+/// silent clobber.
 fn combine_splice(
     base_path: &Path,
     base_bytes: &[u8],
@@ -548,10 +376,8 @@ fn combine_splice(
 
     let mut appended_filesz: u64 = 0;
     if !append_loads.is_empty() {
-        // for_hosted_kernel = false: xtensa firmware target (the only
-        // path that reaches this splice flow). Don't pad to memsz.
         let new_loads =
-            append_pt_loads(&mut out, overlay_bytes, &append_loads, &base_phdrs, class, false)?;
+            append_pt_loads(&mut out, overlay_bytes, &append_loads, &base_phdrs, class)?;
         appended_filesz = new_loads.iter().map(|p| p.p_filesz).sum();
         if overlay_vaddr_first == 0
             && let Some(p) = new_loads.first()
@@ -572,24 +398,21 @@ fn combine_splice(
 
 /// Append a set of overlay PT_LOADs to `out`, extend the PHT, and add
 /// matching SHT entries so espflash's section-walking image builder
-/// emits image segments for them. Used by both the x86 hosted append
-/// path and the xtensa splice path's RAM-resident segment append.
+/// emits image segments for them. Used by the splice path for
+/// RAM-resident segments that legitimately fall past base (e.g. xtensa
+/// `.rwtext` copied from flash to IRAM at boot).
 ///
-/// `for_hosted_kernel`: when `true` (x86 hosted), pads each appended
-/// LOAD to memsz with zeros and stretches the last LOAD to cover the
-/// trailing PHT, so musl's `__init_libc` can map AT_PHDR. When
-/// `false` (xtensa firmware), keeps `p_memsz = p_filesz` and writes
-/// no NOBITS-filling zeros — the bootloader doesn't care about
-/// AT_PHDR, and zero-padding the appended LOAD to overlay's full
-/// `memsz` would overflow `dram2_seg` into heap territory (overlay's
-/// `.stack` is a NOBITS region absorbing all of RWDATA).
+/// Keeps `p_memsz = p_filesz` and writes no NOBITS-filling zeros: the
+/// firmware bootloader doesn't care about AT_PHDR, and zero-padding an
+/// appended LOAD to overlay's full `memsz` would overflow `dram2_seg`
+/// into heap territory (overlay's `.stack` is a NOBITS region absorbing
+/// all of RWDATA).
 fn append_pt_loads(
     out: &mut Vec<u8>,
     overlay_bytes: &[u8],
     overlay_loads: &[Phdr],
     base_phdrs: &[Phdr],
     class: ElfClass,
-    for_hosted_kernel: bool,
 ) -> Result<Vec<Phdr>> {
     let mut new_loads: Vec<Phdr> = Vec::with_capacity(overlay_loads.len());
     for ov_load in overlay_loads {
@@ -598,17 +421,6 @@ fn append_pt_loads(
         let load_data = &overlay_bytes
             [ov_load.p_offset as usize..(ov_load.p_offset + ov_load.p_filesz) as usize];
         out.extend_from_slice(load_data);
-        let memsz = if for_hosted_kernel {
-            // Pad output bytes to memsz so the kernel sees the full
-            // BSS-extended LOAD even though the file content stops at
-            // filesz.
-            if ov_load.p_memsz > ov_load.p_filesz {
-                out.resize(out.len() + (ov_load.p_memsz - ov_load.p_filesz) as usize, 0);
-            }
-            ov_load.p_memsz
-        } else {
-            ov_load.p_filesz
-        };
         new_loads.push(Phdr {
             p_type: PT_LOAD,
             p_flags: ov_load.p_flags,
@@ -616,7 +428,7 @@ fn append_pt_loads(
             p_vaddr: ov_load.p_vaddr,
             p_paddr: ov_load.p_vaddr,
             p_filesz: ov_load.p_filesz,
-            p_memsz: memsz,
+            p_memsz: ov_load.p_filesz,
             p_align: 0x1000,
         });
     }
@@ -624,18 +436,6 @@ fn append_pt_loads(
     align_up(out, 8);
     let new_phoff = out.len() as u64;
     let new_phnum = base_phdrs.len() + new_loads.len();
-    let pht_size = new_phnum * class.phdr_size();
-
-    if for_hosted_kernel
-        && let Some(last) = new_loads.last_mut()
-    {
-        // ELF64 hosted (x86 musl): kernel needs e_phoff inside *some*
-        // PT_LOAD for AT_PHDR validity. Stretch the last new LOAD to
-        // cover the trailing PHT.
-        let new_filesz = (new_phoff + pht_size as u64) - last.p_offset;
-        last.p_filesz = new_filesz;
-        last.p_memsz = new_filesz;
-    }
 
     for p in base_phdrs.iter().chain(new_loads.iter()) {
         out.extend_from_slice(&p.to_le_bytes(class));

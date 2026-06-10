@@ -66,8 +66,14 @@ pub struct BaseResolver<'a> {
     /// address, rewrites the reloc to a per-name SHN_ABS anchor, and
     /// records the assumption for post-link verify. Subsumes the
     /// previous "linker-script absolute" handling — those names are
-    /// in this map automatically.
+    /// in this map automatically. Names base defined at multiple
+    /// distinct addresses are excluded (see `base_symtab_ambiguous`).
     pub base_symtab: &'a HashMap<String, u64>,
+    /// Names base defined at more than one distinct address (same-named
+    /// locals across TUs). Channel 3 has no tu_id to disambiguate, so
+    /// rather than silently bind to an arbitrary one it errors when a
+    /// reloc target lands here.
+    pub base_symtab_ambiguous: &'a HashSet<String>,
     /// Symhashes of every symbol defined in a closure-included
     /// section. Cross-`.o` relocs to these must stay as UND symbol
     /// references so ld resolves them to overlay's re-emitted copy.
@@ -105,6 +111,7 @@ impl<'a> BaseResolver<'a> {
 }
 
 /// Result of pruning one source `.o`.
+#[derive(Debug)]
 pub struct Pruned {
     pub bytes: Vec<u8>,
     pub kept_sections: usize,
@@ -379,14 +386,46 @@ pub fn prune_object(
                                     key: sh,
                                     verify_name: None,
                                 }
+                            } else if overlay_sh.is_some() {
+                                // Overlay scanned a definition for this
+                                // symbol, but its symhash is neither in
+                                // the closure (channel 1) nor a content
+                                // match against base (channel 2) — so
+                                // overlay's content for it DIFFERS from
+                                // base, yet the closure walk never
+                                // re-emitted it. Falling through to
+                                // channel 3 here would bind the reloc to
+                                // base's *stale* address, silently calling
+                                // base's old copy. That's a closure /
+                                // scan-discovery bug, not a resolvable
+                                // reloc — bail loud. Channel 3 below is
+                                // reserved for names overlay never saw at
+                                // all (crt/startup, linker-script
+                                // absolutes, ROM/PROVIDE addresses,
+                                // prebuilt-lib symbols), so it must only
+                                // fire when `overlay_sh.is_none()`.
+                                bail!(
+                                    "reloc in {from_section}: {lookup_name} (local={was_local}) \
+                                     has overlay content that differs from base but is not in \
+                                     the closure — refusing to bind to base's stale address. \
+                                     Likely a closure / scan-discovery bug."
+                                );
                             } else if let Some(&addr) = base.base_symtab.get(&lookup_name) {
-                                // (3) Channel-of-last-resort: name was
-                                // resolved by base's linker but graft's
-                                // scan didn't see a content-keyed entry
-                                // (linker-script absolute, PROVIDE
-                                // default, weak fallback, etc.). Assume
-                                // base's address; anchor keyed by name
-                                // hash; verify post-link.
+                                // (3) Channel-of-last-resort: overlay
+                                // never saw this symbol (`overlay_sh` is
+                                // None), but base's linker resolved it —
+                                // a linker-script absolute, PROVIDE
+                                // default, ROM address, crt/startup
+                                // symbol, or prebuilt-lib symbol whose
+                                // content isn't in overlay's inputs.
+                                // Assume base's address; anchor keyed by
+                                // name hash; verify post-link.
+                                if std::env::var("GRAFT_DEBUG_CH3").is_ok() {
+                                    eprintln!(
+                                        "graft DEBUG ch3: {from_section} -> {lookup_name} \
+                                         @ {addr:#x}",
+                                    );
+                                }
                                 let mut k = [0u8; 16];
                                 k.copy_from_slice(
                                     &blake3::hash(lookup_name.as_bytes()).as_bytes()[..16],
@@ -396,6 +435,21 @@ pub fn prune_object(
                                     key: k,
                                     verify_name: Some(lookup_name.clone()),
                                 }
+                            } else if base.base_symtab_ambiguous.contains(&lookup_name) {
+                                // Base defined this name at more than one
+                                // distinct address (same-named locals
+                                // across TUs). Channel 3 carries no
+                                // tu_id, so any address we picked would
+                                // be a guess. Fail loud rather than bind
+                                // a reloc to the wrong copy — exactly the
+                                // silent-wrong-address class we want gone.
+                                bail!(
+                                    "reloc in {from_section}: {lookup_name} (local={was_local}) \
+                                     is defined at multiple distinct addresses in base.elf — \
+                                     channel-3 resolution can't disambiguate without a tu_id. \
+                                     This means overlay's scan didn't produce a content-keyed \
+                                     entry for it (upstream scan-discovery gap)."
+                                );
                             } else if src_sym.is_weak() {
                                 // Weak undef: base's linker also
                                 // couldn't find a definition and
@@ -423,13 +477,12 @@ pub fn prune_object(
                                     }
                                 };
                                 Outcome::Internal { sym_id: wsym_id, addend_extra: 0 }
-                            } else if overlay_sh.is_some() {
-                                bail!(
-                                    "reloc in {from_section}: {lookup_name} (local={was_local}) \
-                                     has overlay symhash but no matching base entry — \
-                                     content drift but not in closure (graft bug?)"
-                                );
                             } else {
+                                // `overlay_sh.is_none()` here (the
+                                // is_some case bailed above), so this is a
+                                // name graft never saw in any scanned
+                                // section and that base didn't resolve
+                                // either.
                                 bail!(
                                     "reloc in {from_section}: can't resolve {lookup_name} \
                                      (local={was_local}) — not in overlay scan, not in base \

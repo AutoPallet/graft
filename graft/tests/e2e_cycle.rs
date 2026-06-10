@@ -23,22 +23,38 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
+
+/// Both tests mutate the single `e2e/x86/` fixture in place and exec the
+/// same combined binary, so they cannot run concurrently — a parallel
+/// run produces confusing "Text file busy" / "fixture missing … stale?"
+/// failures as one test's edit (or its Drop-time restore) clobbers the
+/// other's. Serialize them on a process-wide lock instead of relying on
+/// the caller to pass `--test-threads=1`. Poison-tolerant: a panicking
+/// test still releases the fixture for the next one.
+static FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_fixture() -> MutexGuard<'static, ()> {
+    FIXTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 struct Fixture {
     dir: PathBuf,
     original_lib: String,
     original_main: String,
+    _guard: MutexGuard<'static, ()>,
 }
 
 impl Fixture {
     fn new() -> Self {
+        let _guard = lock_fixture();
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../e2e/x86")
             .canonicalize()
             .expect("canonicalize e2e/x86 fixture path");
         let original_lib = std::fs::read_to_string(dir.join("base/src/lib.rs")).unwrap();
         let original_main = std::fs::read_to_string(dir.join("app/src/main.rs")).unwrap();
-        Fixture { dir, original_lib, original_main }
+        Fixture { dir, original_lib, original_main, _guard }
     }
 
     fn edit(&self, rel: &str, from: &str, to: &str) {

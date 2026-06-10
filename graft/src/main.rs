@@ -18,10 +18,35 @@ fn main() -> ExitCode {
         }
     }
 
-    match env::var("GRAFT").as_deref() {
-        Ok("base") => graft::base::link(args),
-        Ok("overlay") => graft::overlay::link(args),
-        _ => passthrough(&args),
+    // Mode selection. A *set-but-unrecognized* GRAFT value is a hard
+    // error, never a silent passthrough: a typo like `GRAFT=bse` would
+    // otherwise link a normal, un-instrumented binary that looks fine
+    // but carries no `.graft.*` metadata — breaking the next overlay
+    // build, or worse, shipping a "base" that can never be patched.
+    // GRAFT *unset* is the legitimate passthrough path (IDEs, `cargo
+    // check`, build.rs probes link without it).
+    match env::var("GRAFT") {
+        Ok(v) => match v.as_str() {
+            "base" => graft::base::link(args),
+            "overlay" => graft::overlay::link(args),
+            // Explicit opt-out. Empty string is treated as unset — a
+            // shell exporting `GRAFT=` almost always means "off".
+            "passthrough" | "" => passthrough(&args),
+            other => {
+                eprintln!(
+                    "graft: GRAFT={other:?} is not a recognized mode \
+                     (expected `base`, `overlay`, or `passthrough`). \
+                     Refusing to silently fall through to the real linker. \
+                     Unset GRAFT for passthrough."
+                );
+                ExitCode::FAILURE
+            }
+        },
+        Err(env::VarError::NotPresent) => passthrough(&args),
+        Err(env::VarError::NotUnicode(_)) => {
+            eprintln!("graft: GRAFT env var is not valid UTF-8");
+            ExitCode::FAILURE
+        }
     }
 }
 

@@ -636,6 +636,76 @@ Serial capture intermittency this session: `espflash` reset successfully wrote t
 
 The previous M1.k / M1.l hardware tests in the same setup *did* boot cleanly, so the chip and wiring are fine — likely a transient USB driver state. Plausible follow-ups: physical power cycle, switch USB host port, replace `python3 scripts/capture.py` with a better-behaved tool. None done in this session — symbolic verification is sufficient signal that the build pipeline handles each feature.
 
+## M2 — robustness & simplification pass
+
+A focused pass to virtually eliminate "silent failure" (a combined
+binary that doesn't behave as the compiler expected) and to shed the
+least-load-bearing code. All changes validated against the x86
+`e2e_cycle` fixture (both `full_cycle` and `payload_sizes_for_typical_edits`)
+plus the new `prune_channels` unit suite.
+
+### Soundness fixes (could previously mis-bind silently)
+
+- **Channel 3 gated on `overlay_sh.is_none()`.** `prune` resolved a
+  reloc through the `base_symtab` name→address snapshot even when
+  overlay's own scan had seen a *differing-content* definition for the
+  name (not in the closure, not a `by_symhash` match) — silently
+  binding to base's stale address. The "content drift but not in
+  closure" bail that was meant to catch this sat *after* channel 3 and
+  was shadowed. Channel 3 now fires only for names overlay never saw
+  (crt/startup, linker-script absolutes, ROM/PROVIDE, prebuilt libs);
+  the drift case bails loud. See `prune.rs` and the `a1_*` test.
+- **Ambiguous `base_symtab` names rejected.** A name base defined at
+  multiple distinct addresses (same-named STB_LOCAL statics across TUs,
+  common in C-heavy esp-idf builds) is excluded from the channel-3 map
+  and listed in `by_name_ambiguous`; channel 3 errors instead of
+  binding to a first-seen address it can't disambiguate without a
+  tu_id. See `overlay::load_base_metadata` and the `a2_*` test.
+- **Weak-undef demand-load now matches ld.** `scan` only extracts an
+  archive member for a *strong* (STB_GLOBAL) undefined reference. It
+  used to pull on weak undefs too, which could make base treat a weak
+  symbol as null while overlay pulled and called a real definition — a
+  base/overlay divergence. (Xtensa needs a hardware re-validation pass;
+  the change only ever *removes* over-pulls, never adds, and the x86
+  e2e is unaffected.)
+- **`debug_dump` shares `hash::ContentResolver`.** The diagnostic dump
+  had a hand-rolled copy of the reloc-target canonicalization that had
+  already drifted — it keyed on whole-section bytes and ignored
+  string-pool sub-ranges, so for `.rodata.str1.1` relocs it reported
+  fingerprints `hash::compute` never produces. It now canonicalizes
+  through the exact same code path, so it can't mis-explain a
+  divergence.
+
+### Fail-loud hygiene (silent → explicit)
+
+- `GRAFT=<typo>` is a hard error, not a silent passthrough that would
+  ship an un-instrumented "base".
+- `GRAFT_*_SLACK_LEN` set-but-malformed errors instead of falling back
+  to a default size.
+- A truncated/corrupt `.rlib`, or a deferred archive with members but
+  no symbol index, errors instead of silently contributing nothing.
+
+### Single source of truth (`OverlaySymhashes`)
+
+The overlay-side name→symhash maps, the closure symhash set, and the
+closure `classify` decision were three separate computations of
+`symhash_of(stable_name_part(name), th)` that had to agree by
+convention. They're now one builder (`overlay::OverlaySymhashes`,
+iterating the canonical `graph.nodes[].defined_symbols`) consumed by
+both prune and the closure walk — the classify-vs-prune contract is
+structural, and the old re-walk's latent string-pool dispatch bug is
+gone.
+
+### Append overlay mode retired — splice only
+
+`GRAFT_OVERLAY_MODE=append` and the entire x86-hosted append path
+(fresh PT_LOAD past base, overlap-trim, AT_PHDR-stretch, PHT/SHT
+rewrite — the trickiest, least-tested ELF surgery in the tree) are
+gone. Splice is the only mode on every target; x86 hosted now produces
+an identical-shape combined ELF the same way xtensa does. A stale
+`GRAFT_OVERLAY_MODE=append` is a hard error (`slack::ensure_splice_mode`),
+not a silent switch. `~250` lines deleted from `combine.rs`/`overlay.rs`.
+
 ## Things that turned out to not matter (or got simpler)
 
 - **Per-call-site `l32r` literals.** Not needed — only one

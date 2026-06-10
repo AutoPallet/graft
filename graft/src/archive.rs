@@ -82,7 +82,14 @@ pub fn collect_eager<P: AsRef<Path>>(paths: &[P]) -> Result<CollectResult> {
             "rlib" => {
                 let bytes = std::fs::read(p).with_context(|| format!("read {}", p.display()))?;
                 if !is_ar_magic(&bytes) {
-                    continue;
+                    // An `.rlib` is always an `ar` archive. A non-archive
+                    // here means a truncated / corrupt artifact — skipping
+                    // it would silently drop a whole crate's objects from
+                    // the scan and produce a wrong closure. Fail loud.
+                    anyhow::bail!(
+                        "{}: .rlib is not an `ar` archive (truncated or corrupt?)",
+                        p.display()
+                    );
                 }
                 scan_archive_bytes(p, &bytes, &mut result.inputs)
                     .with_context(|| format!("scan archive {}", p.display()))?;
@@ -129,22 +136,40 @@ impl DeferredArchive {
         let archive = ArchiveFile::parse(&*bytes)
             .map_err(|e| anyhow!("parse archive {}: {e}", path.display()))?;
         let mut sym_to_off: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-        // Some archives lack a symbol index entirely (e.g., produced
-        // by `ar` without `s`). For those we'd need to fall back to
-        // walking every member's symtab — but in practice every system
-        // archive we touch has an index. If missing, log and treat as
-        // empty (no member is demand-loadable; the archive contributes
-        // nothing).
-        if let Some(symbols) = archive.symbols().map_err(|e| anyhow!("{e}"))? {
-            for sym_result in symbols {
-                let sym = sym_result.map_err(|e| anyhow!("{e}"))?;
-                if let Ok(name) = std::str::from_utf8(sym.name()) {
-                    // First defining member wins. Mirrors ld's
-                    // archive-resolution semantics (left-to-right
-                    // search, first hit binds).
-                    sym_to_off
-                        .entry(name.to_string())
-                        .or_insert(sym.offset().0);
+        match archive.symbols().map_err(|e| anyhow!("{e}"))? {
+            Some(symbols) => {
+                for sym_result in symbols {
+                    let sym = sym_result.map_err(|e| anyhow!("{e}"))?;
+                    if let Ok(name) = std::str::from_utf8(sym.name()) {
+                        // First defining member wins. Mirrors ld's
+                        // archive-resolution semantics (left-to-right
+                        // search, first hit binds).
+                        sym_to_off
+                            .entry(name.to_string())
+                            .or_insert(sym.offset().0);
+                    }
+                }
+            }
+            None => {
+                // No symbol-table member. An archive with object members
+                // but no index can't be demand-loaded — by graft *or* by
+                // ld (which errors "archive has no index; run ranlib").
+                // Treating it as empty would silently drop every member
+                // from the scan and produce a wrong closure, so fail
+                // loud. An empty archive (no members) legitimately has no
+                // index and is fine.
+                let has_members = archive
+                    .members()
+                    .next()
+                    .transpose()
+                    .map_err(|e| anyhow!("{e}"))?
+                    .is_some();
+                if has_members {
+                    anyhow::bail!(
+                        "{}: archive has members but no symbol index — \
+                         graft cannot demand-load from it (run `ranlib`)",
+                        path.display()
+                    );
                 }
             }
         }

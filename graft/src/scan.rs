@@ -156,7 +156,18 @@ pub fn run<P: AsRef<Path>>(
                 if sym.defining_section.is_some() {
                     continue;
                 }
-                if !matches!(sym.bind, SymbolBind::Global | SymbolBind::Weak) {
+                // Only a *strong* (STB_GLOBAL) undefined reference forces
+                // an archive member to be extracted — this mirrors ld
+                // exactly. A weak undef does NOT pull a member (ld leaves
+                // it resolved to 0). Over-pulling on weak undefs would let
+                // graft include + call code that base's real link left as
+                // null, so base and overlay would disagree on whether the
+                // symbol is a function or zero. `classify_bind` maps weak
+                // undefs to `Weak` and strong undefs to `Global`, so this
+                // filter is the precise ld-matching rule. (A genuinely
+                // needed member is still pulled: any member with a strong
+                // undef anywhere triggers the load.)
+                if !matches!(sym.bind, SymbolBind::Global) {
                     continue;
                 }
                 if sym.name.is_empty() {

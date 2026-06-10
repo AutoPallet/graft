@@ -56,60 +56,16 @@ fn stripped_label(label: &str) -> String {
 /// for diff readability while still producing collision-resistant
 /// keys at the scales we care about.
 pub fn dump_graph(path: &Path, scan: &ScanResult) -> std::io::Result<()> {
-    use crate::elf::SymbolBind;
     let g = &scan.graph;
     let scc = graph::tarjan_scc(g);
 
-    // Pre-compute member_input_hash and encoded_relocs_hash per node.
-    let bytes_hashes: Vec<blake3::Hash> = g
-        .nodes
-        .iter()
-        .enumerate()
-        .map(|(_nid, nm)| {
-            let mut h = blake3::Hasher::new();
-            for seg in &nm.segments {
-                h.update(&scan.objects[seg.object as usize].sections[seg.section as usize].bytes);
-            }
-            h.finalize()
-        })
-        .collect();
-
-    // Re-build a content-resolver-equivalent global/local table so we
-    // can encode relocs the same way `hash::compute` does. Mirrors the
-    // logic in `hash::ContentResolver::build`.
-    use std::collections::HashMap;
-    let mut g_section: HashMap<(u32, String), [u8; 8]> = HashMap::new();
-    let mut g_global: HashMap<String, [u8; 8]> = HashMap::new();
-    let mut g_local: HashMap<(String, [u8; 8]), [u8; 8]> = HashMap::new();
-    for (nid, nm) in g.nodes.iter().enumerate() {
-        let mut h8 = [0u8; 8];
-        h8.copy_from_slice(&bytes_hashes[nid].as_bytes()[..8]);
-        for seg in &nm.segments {
-            let sec = &scan.objects[seg.object as usize].sections[seg.section as usize];
-            g_section.insert((seg.object, sec.name.clone()), h8);
-        }
-        for sym in &nm.defined_symbols {
-            match sym.bind {
-                SymbolBind::Global | SymbolBind::Weak => {
-                    g_global.insert(sym.name.clone(), h8);
-                }
-                SymbolBind::Local => {
-                    let tu_id = sym.tu_id.expect("local symbol must carry tu_id");
-                    g_local.insert((sym.name.clone(), tu_id), h8);
-                }
-            }
-        }
-    }
-    let canonicalize_target = |raw: &str, obj_idx: u32, tu_id: [u8; 8]| -> String {
-        if let Some(inner) = raw.strip_prefix("<section:").and_then(|s| s.strip_suffix('>'))
-            && let Some(h) = g_section.get(&(obj_idx, inner.to_string()))
-        { return format!("@{}", hex_of(h)); }
-        if let Some(h) = g_global.get(raw) { return format!("@{}", hex_of(h)); }
-        if let Some(h) = g_local.get(&(raw.to_string(), tu_id)) {
-            return format!("@{}", hex_of(h));
-        }
-        raw.to_string()
-    };
+    // Canonicalize reloc targets through the *exact* code path
+    // `hash::compute` uses, so the dump faithfully reproduces the real
+    // trans_hash inputs (a hand-rolled copy previously drifted — it
+    // keyed on whole-section bytes and ignored string-pool sub-ranges,
+    // reporting fingerprints `compute` never produced).
+    let bytes_hashes = crate::hash::node_bytes_hashes(g, &scan.objects);
+    let resolver = crate::hash::ContentResolver::build(&scan.objects, g, &bytes_hashes);
 
     // Per-node logical key (used for cross-scan join AND for emitting
     // edge target keys).
@@ -186,29 +142,38 @@ pub fn dump_graph(path: &Path, scan: &ScanResult) -> std::io::Result<()> {
             let obj = &scan.objects[seg.object as usize];
             let sec = &obj.sections[seg.section as usize];
 
+            // Bytes the way `hash::compute` sees them: per-string nodes
+            // hash only their sub-range, not the whole pool section.
+            let seg_bytes = seg.bytes_in(&obj.sections);
+
             let stripped = stripped_label(&scan.inputs[seg.object as usize].label());
             let tu_id_hex: String = obj.tu_id.iter().map(|b| format!("{b:02x}")).collect();
-            let bh: String = blake3::hash(&sec.bytes).as_bytes()[..8]
+            let bh: String = blake3::hash(seg_bytes).as_bytes()[..8]
                 .iter().map(|b| format!("{b:02x}")).collect();
 
-            let canonical_relocs: Vec<u8> = {
-                let mut rebuilt = Vec::with_capacity(sec.relocs.len());
-                for r in &sec.relocs {
-                    let target = canonicalize_target(&r.target, seg.object, obj.tu_id);
-                    rebuilt.push(crate::elf::CanonicalReloc {
-                        offset: r.offset,
-                        target,
-                        r_type: r.r_type,
-                        addend: r.addend,
-                    });
-                }
+            // Per-string segments (range = Some) contribute no relocs to
+            // the member hash — string bytes reference nothing. Mirror
+            // `hash::compute` exactly so this dump reproduces the real
+            // trans_hash inputs.
+            let canonical_relocs: Vec<u8> = if seg.range.is_some() {
+                Vec::new()
+            } else {
+                let rebuilt: Vec<crate::elf::CanonicalReloc> = sec
+                    .relocs
+                    .iter()
+                    .map(|r| {
+                        let (target, addend) = resolver
+                            .canonicalize_target_with_addend(&r.target, r.addend, seg.object, obj.tu_id);
+                        crate::elf::CanonicalReloc { offset: r.offset, target, r_type: r.r_type, addend }
+                    })
+                    .collect();
                 postcard::to_allocvec(&rebuilt).unwrap_or_default()
             };
             let enc_h: String = blake3::hash(&canonical_relocs).as_bytes()[..8]
                 .iter().map(|b| format!("{b:02x}")).collect();
 
             let mut h = blake3::Hasher::new();
-            h.update(&sec.bytes);
+            h.update(seg_bytes);
             h.update(&canonical_relocs);
             let mih: String = h.finalize().as_bytes()[..8]
                 .iter().map(|b| format!("{b:02x}")).collect();
@@ -222,8 +187,4 @@ pub fn dump_graph(path: &Path, scan: &ScanResult) -> std::io::Result<()> {
     }
 
     Ok(())
-}
-
-fn hex_of(bytes: &[u8; 8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

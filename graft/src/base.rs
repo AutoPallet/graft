@@ -64,19 +64,13 @@ fn run(argv: Vec<String>) -> Result<()> {
         (r, t.elapsed())
     });
 
-    // Splice mode needs base to carry slack regions. Detect the target
-    // arch from the inputs to pick the right default mode (xtensa
-    // defaults to splice; x86 hosted defaults to append). Inject only
-    // when the resolved mode is Splice.
+    // Splice is the only overlay mode, so base always carries slack
+    // regions for the overlay to splice into. Detect the target arch
+    // from the inputs to mirror it into the synthetic slack `.o`.
+    crate::slack::ensure_splice_mode()?;
     let arch = crate::slack::detect_architecture(&link_args.inputs)
         .context("detect target architecture from input objects")?;
-    let e_machine = e_machine_of(arch);
-    let mode = crate::slack::Mode::resolve(e_machine)?;
-    let argv = if mode == crate::slack::Mode::Splice {
-        inject_slack(argv, arch, &output)?
-    } else {
-        argv
-    };
+    let argv = inject_slack(argv, arch, &output)?;
 
     let t_link_start = std::time::Instant::now();
     let ld_status = exec_real_linker(&argv)?;
@@ -148,7 +142,7 @@ fn inject_slack(
     arch: object::Architecture,
     output: &std::path::Path,
 ) -> Result<Vec<String>> {
-    let params = crate::slack::SlackParams::from_env();
+    let params = crate::slack::SlackParams::from_env()?;
     let bytes = crate::slack::synthesize(arch, &params)?;
     let slack_path = output.with_extension("graft-slack.o");
     atomic_write(&slack_path, &bytes)?;
@@ -158,20 +152,6 @@ fn inject_slack(
     argv.push(format!("-Wl,--undefined={}", crate::slack::RODATA_SYMBOL));
     argv.push(format!("-Wl,--undefined={}", crate::slack::DATA_SYMBOL));
     Ok(argv)
-}
-
-/// Map `object::Architecture` back to its ELF `e_machine` constant.
-/// Used to pick mode defaults without re-reading the input files.
-fn e_machine_of(arch: object::Architecture) -> u16 {
-    use object::Architecture;
-    use object::elf;
-    match arch {
-        Architecture::X86_64 => elf::EM_X86_64,
-        Architecture::I386 => elf::EM_386,
-        Architecture::Aarch64 => elf::EM_AARCH64,
-        Architecture::Xtensa => elf::EM_XTENSA,
-        _ => 0,
-    }
 }
 
 fn exec_real_linker(argv: &[String]) -> Result<std::process::ExitStatus> {

@@ -94,6 +94,28 @@ pub fn stable_name_part(name: &str) -> Option<&str> {
     Some(name)
 }
 
+/// Per-node blake3 over the node's bytes — each segment respecting its
+/// sub-range for per-string nodes, concatenated in segment order.
+/// Aggregator nodes own their contributors as segments, so this
+/// naturally captures the merged-output content. This is the content
+/// fingerprint that both the trans_hash member-hash and the
+/// `ContentResolver` canonicalization build on; exposed so the
+/// diagnostic dump (`debug_dump`) can reproduce `compute` exactly
+/// instead of re-deriving it (and drifting).
+pub fn node_bytes_hashes(graph: &Graph, objects: &[ParsedObject]) -> Vec<blake3::Hash> {
+    graph
+        .nodes
+        .iter()
+        .map(|nm| {
+            let mut h = blake3::Hasher::new();
+            for seg in &nm.segments {
+                h.update(seg.bytes_in(&objects[seg.object as usize].sections));
+            }
+            h.finalize()
+        })
+        .collect()
+}
+
 /// Compute a `TransHash` for every node. All nodes in the same SCC
 /// receive the same hash.
 pub fn compute(
@@ -101,29 +123,13 @@ pub fn compute(
     graph: &Graph,
     scc: &SccResult,
 ) -> Vec<TransHash> {
-    // Two-pass member hashing. Pass 1: per-section blake3 of just the
-    // section bytes — used as a stable content fingerprint that
-    // doesn't depend on names, ordering, or other build-time noise.
-    // Pass 2: full per-section hash (bytes + canonicalized reloc list,
-    // where reloc target names are rewritten to content-fingerprints
-    // whenever the name itself is build-time noise — see
-    // `canonicalize_target`).
-    let bytes_hashes: Vec<blake3::Hash> = graph
-        .nodes
-        .iter()
-        .enumerate()
-        .map(|(_nid, nm)| {
-            // Concat segment bytes (each respecting its sub-range
-            // for per-string nodes) in segment order. Aggregator
-            // nodes own their contributors as segments, so this
-            // naturally captures the merged-output content.
-            let mut h = blake3::Hasher::new();
-            for seg in &nm.segments {
-                h.update(seg.bytes_in(&objects[seg.object as usize].sections));
-            }
-            h.finalize()
-        })
-        .collect();
+    // Two-pass member hashing. Pass 1: per-node blake3 of just the
+    // section bytes — a stable content fingerprint that doesn't depend
+    // on names, ordering, or other build-time noise. Pass 2: full
+    // per-node hash (bytes + canonicalized reloc list, where reloc
+    // target names are rewritten to content-fingerprints whenever the
+    // name itself is build-time noise — see `canonicalize_target`).
+    let bytes_hashes = node_bytes_hashes(graph, objects);
     let resolver = ContentResolver::build(objects, graph, &bytes_hashes);
 
     let member_input_hash: Vec<blake3::Hash> = graph
@@ -246,7 +252,13 @@ fn encode_relocs(
 /// (genuine externals) keep their name, which is fine because the
 /// SCC trans_hash already includes a separate external sentinel
 /// count for those.
-struct ContentResolver {
+///
+/// Public so the diagnostic dump (`debug_dump`) canonicalizes reloc
+/// targets through the *same* code path `compute` uses, rather than a
+/// hand-rolled copy that can (and did) drift — notably on string-pool
+/// sub-ranges, where a copy keyed on whole-section bytes reports
+/// fingerprints `compute` never produced.
+pub struct ContentResolver {
     /// (object_idx, section_name) → 8-byte content fingerprint.
     /// Used for `<section:NAME>` reloc-target resolution. Keyed
     /// per-object because multiple objects can have sections of the
@@ -270,7 +282,7 @@ struct ContentResolver {
 }
 
 impl ContentResolver {
-    fn build(
+    pub fn build(
         objects: &[ParsedObject],
         graph: &Graph,
         bytes_hashes: &[blake3::Hash],
@@ -315,7 +327,7 @@ impl ContentResolver {
         Self { section, string_pool, global, local }
     }
 
-    fn canonicalize_target_with_addend(
+    pub fn canonicalize_target_with_addend(
         &self,
         name: &str,
         addend: i64,

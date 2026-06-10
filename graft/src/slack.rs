@@ -43,43 +43,29 @@ pub const TEXT_SYMBOL: &str = "GRAFT_TEXT_SLACK";
 pub const RODATA_SYMBOL: &str = "GRAFT_RODATA_SLACK";
 pub const DATA_SYMBOL: &str = "GRAFT_DATA_SLACK";
 
-/// Overlay layout strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    /// Overlay's `.text` / `.rodata` placed at base-link-time-reserved
-    /// slack vaddrs and combined by byte-splicing into base's existing
-    /// IROM/DROM segments. Required on xtensa; opt-in on x86 hosted
-    /// (delta-flash benefits, identical image shape).
-    Splice,
-    /// Overlay placed at a fresh address past every base PT_LOAD;
-    /// combine appends new PT_LOAD(s) and rewrites the PHT/SHT.
-    /// Default on x86 hosted (no preallocation cap on overlay size).
-    /// Not supported on xtensa (bootloader maps only one IROM/DROM
-    /// segment per image).
-    Append,
-}
-
-impl Mode {
-    /// Resolve the active mode from the `GRAFT_OVERLAY_MODE` env var,
-    /// falling back to a per-target default. `e_machine` is the base
-    /// ELF's `e_machine` value.
-    pub fn resolve(e_machine: u16) -> anyhow::Result<Self> {
-        match std::env::var("GRAFT_OVERLAY_MODE").ok().as_deref() {
-            Some("splice") => Ok(Mode::Splice),
-            Some("append") => Ok(Mode::Append),
-            Some(other) => anyhow::bail!(
-                "GRAFT_OVERLAY_MODE={other:?}: expected `splice` or `append`"
-            ),
-            None => Ok(default_for_machine(e_machine)),
-        }
-    }
-}
-
-fn default_for_machine(e_machine: u16) -> Mode {
-    if e_machine == object::elf::EM_XTENSA {
-        Mode::Splice
-    } else {
-        Mode::Append
+/// Validate the `GRAFT_OVERLAY_MODE` env var. Splice is the only overlay
+/// layout strategy now: overlay's `.text` / `.rodata` are placed at
+/// base-link-time-reserved slack vaddrs and byte-spliced into base's
+/// existing segments, giving identical image shape and delta-flash
+/// friendliness on every target. The old `append` mode (a fresh PT_LOAD
+/// past base, with PHT/SHT rewrites) is gone — it was never usable on
+/// xtensa (the bootloader maps only one IROM/DROM segment) and carried
+/// the trickiest, least-tested ELF surgery in the codebase.
+///
+/// A stale `GRAFT_OVERLAY_MODE=append` (or any non-`splice` value) is a
+/// hard error rather than a silent fall-through to splice, so an old
+/// config can't quietly change layout strategy under the user.
+pub fn ensure_splice_mode() -> anyhow::Result<()> {
+    match std::env::var("GRAFT_OVERLAY_MODE").ok().as_deref() {
+        None | Some("") | Some("splice") => Ok(()),
+        Some("append") => anyhow::bail!(
+            "GRAFT_OVERLAY_MODE=append is no longer supported — splice is the only \
+             overlay mode. Unset GRAFT_OVERLAY_MODE."
+        ),
+        Some(other) => anyhow::bail!(
+            "GRAFT_OVERLAY_MODE={other:?}: the only accepted value is `splice` (the default); \
+             unset it."
+        ),
     }
 }
 
@@ -91,22 +77,34 @@ pub struct SlackParams {
 }
 
 impl SlackParams {
-    pub fn from_env() -> Self {
-        Self {
-            text_len: env_u32("GRAFT_TEXT_SLACK_LEN").unwrap_or(DEFAULT_TEXT_LEN),
-            rodata_len: env_u32("GRAFT_RODATA_SLACK_LEN").unwrap_or(DEFAULT_RODATA_LEN),
-            data_len: env_u32("GRAFT_DATA_SLACK_LEN").unwrap_or(DEFAULT_DATA_LEN),
-        }
+    pub fn from_env() -> Result<Self> {
+        Ok(Self {
+            text_len: env_u32("GRAFT_TEXT_SLACK_LEN")?.unwrap_or(DEFAULT_TEXT_LEN),
+            rodata_len: env_u32("GRAFT_RODATA_SLACK_LEN")?.unwrap_or(DEFAULT_RODATA_LEN),
+            data_len: env_u32("GRAFT_DATA_SLACK_LEN")?.unwrap_or(DEFAULT_DATA_LEN),
+        })
     }
 }
 
-fn env_u32(name: &str) -> Option<u32> {
-    let s = std::env::var(name).ok()?;
-    if let Some(hex) = s.strip_prefix("0x") {
-        u32::from_str_radix(hex, 16).ok()
+/// `Ok(None)` if unset (caller uses its default); `Ok(Some(n))` if set
+/// and parseable; `Err` if set but malformed. A typo'd slack size must
+/// fail the build, not silently fall back to a default that's the wrong
+/// size for the overlay — an undersized slack would surface much later
+/// as a confusing "section will not fit in region" link error, and an
+/// oversized one silently wastes flash.
+fn env_u32(name: &str) -> Result<Option<u32>> {
+    let Some(raw) = std::env::var_os(name) else { return Ok(None) };
+    let s = raw
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("{name}: value is not valid UTF-8"))?;
+    let parsed = if let Some(hex) = s.strip_prefix("0x") {
+        u32::from_str_radix(hex, 16)
     } else {
-        s.parse().ok()
-    }
+        s.parse::<u32>()
+    };
+    parsed
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("{name}={s:?}: not a valid u32 ({e})"))
 }
 
 /// Build a relocatable ELF for the given architecture (mirrored from

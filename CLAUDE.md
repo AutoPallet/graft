@@ -92,3 +92,52 @@ If you're tempted to special-case a reloc type by patching
 instruction bytes (mov→lea, etc.), step back and check whether
 content-keyed per-target symbols would handle it uniformly without
 any byte patching. They usually do.
+
+## prune's resolution channels are ordered for a reason
+
+`prune_object`'s reloc resolution is a cascade. The ordering is load-
+bearing, not cosmetic:
+
+1. overlay saw it AND it's in the closure → UND (ld resolves to
+   overlay's re-emitted copy).
+2. overlay saw it AND its symhash matches base → SHN_ABS anchor at
+   base's address (content-identical, safe).
+3. **overlay saw it but neither of the above** → BAIL. The symbol's
+   content differs from base and it wasn't re-emitted; binding to
+   base's address would silently call base's stale code. This check
+   MUST come before channel "base_symtab" (M2 fixed a bug where it
+   came after and was shadowed — channel 3 silently bound drifted
+   content to base).
+4. overlay never saw it (`overlay_sh.is_none()`) AND base_symtab has a
+   unique address → SHN_ABS anchor + post-link verify. This is the
+   channel-of-last-resort, ONLY for names not in overlay's inputs
+   (crt/startup, linker-script absolutes, ROM/PROVIDE, prebuilt libs).
+   Ambiguous base names (multiple distinct addresses) bail.
+
+The invariant: a name overlay's scan saw with differing content never
+reaches base_symtab resolution. If you reorder these, you can
+reintroduce a silent stale-bind. `tests/prune_channels.rs` pins every
+channel including the two bail paths — keep it green.
+
+## scan must mirror ld, including what it DOESN'T pull
+
+`scan`'s archive demand-load is graft's model of ld's lazy resolution.
+ld extracts an archive member only for a *strong* (STB_GLOBAL)
+undefined reference — never for a weak undef (those resolve to 0).
+graft must match: demand-load triggers on `Global` only. Over-pulling
+on weak undefs makes graft include+call code ld would have left null,
+so base (real ld) and overlay disagree on whether a weak symbol is a
+function or zero — an invisible runtime divergence. Same principle as
+"don't paper over symbol-resolution failures": when graft's view of
+the inputs diverges from ld's, that divergence is the bug.
+
+## One overlay layout mode: splice
+
+There is no "append" mode anymore. Overlay sections are always linked
+into base's reserved slack (`GRAFT_*_SLACK`) and byte-spliced in place;
+RAM-resident segments that legitimately fall past base (xtensa
+`.rwtext`) are appended by `combine::append_pt_loads`. If you find
+yourself reaching for a fresh-PT_LOAD "append everything" path, that's
+the retired design (it never worked on xtensa — one IROM/DROM segment
+only — and carried the trickiest ELF surgery in the tree). Reserve
+more slack instead.
