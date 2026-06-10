@@ -13,6 +13,7 @@ pub mod elf;
 pub mod elf_attach;
 pub mod graph;
 pub mod hash;
+pub mod mapcheck;
 pub mod metadata;
 pub mod overlay;
 pub mod prune;

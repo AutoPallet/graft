@@ -82,7 +82,19 @@ fn run(argv: Vec<String>) -> Result<()> {
     crate::slack::ensure_splice_mode()?;
     let arch = crate::slack::detect_architecture(&link_args.inputs)
         .context("detect target architecture from input objects")?;
-    let argv = inject_slack(argv, arch, &output)?;
+    let mut argv = inject_slack(argv, arch, &output)?;
+
+    // `-Map` oracle (GRAFT_MAP_ORACLE=1): ask the real linker for its
+    // map and, after address recovery, verify every recovered section
+    // address against it — ld is the reference implementation, so any
+    // disagreement is an identity-model bug that must fail the base
+    // build. Enabled in the e2e suites; see `mapcheck`.
+    let map_oracle = std::env::var("GRAFT_MAP_ORACLE").is_ok_and(|v| !v.is_empty() && v != "0");
+    let map_path = output.with_extension("graft-map");
+    if map_oracle {
+        argv.push(format!("-Wl,-Map={}", map_path.display()));
+    }
+    let argv = argv;
 
     let t_link_start = std::time::Instant::now();
     let ld_status = exec_real_linker(&argv)?;
@@ -107,7 +119,20 @@ fn run(argv: Vec<String>) -> Result<()> {
             eprintln!("graft base: GRAFT_DEBUG_DUMP_GRAPH write {p} failed: {e}");
         }
     }
-    let table = build_section_table(&scan_result, &elf_bytes)?;
+    let (table, node_addrs) = build_section_table(&scan_result, &elf_bytes)?;
+
+    if map_oracle {
+        let text = std::fs::read_to_string(&map_path)
+            .with_context(|| format!("GRAFT_MAP_ORACLE: read {}", map_path.display()))?;
+        let map = crate::mapcheck::parse_map(&text);
+        let stats = crate::mapcheck::oracle_check(&scan_result, &node_addrs, &map)
+            .context("GRAFT_MAP_ORACLE")?;
+        eprintln!(
+            "graft base map-oracle: {} recovered addresses verified against the \
+             linker map · {} ambiguous-key skipped · {} placed-but-unrecovered",
+            stats.checked, stats.skipped_ambiguous_key, stats.coverage_gaps,
+        );
+    }
 
     let manifest = GraftManifest {
         magic: GRAFT_MAGIC,
@@ -196,7 +221,15 @@ fn exec_real_linker(argv: &[String]) -> Result<std::process::ExitStatus> {
 /// linker-script / crt symbols are intentionally NOT in this table —
 /// they carry no section content and resolve overlay-side through the
 /// base.elf symtab snapshot (prune channel 3) with a post-link verify.
-fn build_section_table(scan: &ScanResult, elf_bytes: &[u8]) -> Result<SectionTable> {
+/// Returns the encoded table plus the raw per-node recovery
+/// (`NodeId → placed section base`), which the `-Map` oracle checks
+/// against the linker's own record — including the individual copies
+/// behind an ambiguous trans_hash, which the collapsed table can't
+/// represent.
+fn build_section_table(
+    scan: &ScanResult,
+    elf_bytes: &[u8],
+) -> Result<(SectionTable, std::collections::HashMap<u32, u64>)> {
     use std::collections::HashMap;
     use std::collections::hash_map::Entry;
     let elf = object::File::parse(elf_bytes).context("parse output ELF")?;
@@ -262,6 +295,18 @@ fn build_section_table(scan: &ScanResult, elf_bytes: &[u8]) -> Result<SectionTab
         for sym in &obj.symbols {
             let Some(sec_idx) = sym.defining_section else { continue };
             if sym.name.is_empty() { continue; }
+            // TLS symbols' st_value in the final symtab is an offset
+            // into the TLS template, NOT a virtual address — back-
+            // computing `final − st_value` yields garbage (the map
+            // oracle caught std's .tbss statics "recovered" at 0x20).
+            // TLS sections get no table entry, so a positional
+            // reference to one bails loudly instead of binding to a
+            // nonsense address. (TLS-aware resolution is unsupported;
+            // TPOFF-style relocs need TLS-segment arithmetic, not an
+            // SHN_ABS anchor.)
+            if obj.sections[sec_idx].sh_flags & u64::from(object::elf::SHF_TLS) != 0 {
+                continue;
+            }
             let Some(&nid) = node_of.get(&(obj_idx as u32, sec_idx as u32)) else { continue };
             let (key_tu, is_local) = match sym.bind {
                 SymbolBind::Global | SymbolBind::Weak => (None, false),
@@ -293,6 +338,7 @@ fn build_section_table(scan: &ScanResult, elf_bytes: &[u8]) -> Result<SectionTab
     // sound. See `docs/14-identity-granularity.md`.
     let mut by_th: HashMap<[u8; 16], u64> = HashMap::new();
     let mut ambiguous: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
+    let mut node_addrs: HashMap<u32, u64> = HashMap::new();
     for (&nid, v) in &votes {
         // Aggregator nodes fold many contributor sections into one node;
         // a single "section base" is meaningless for them (and their
@@ -340,6 +386,7 @@ fn build_section_table(scan: &ScanResult, elf_bytes: &[u8]) -> Result<SectionTab
             }
             first
         };
+        node_addrs.insert(nid, base);
         let th = scan.trans_hash[nid as usize];
         match by_th.entry(th) {
             Entry::Vacant(e) => {
@@ -363,7 +410,7 @@ fn build_section_table(scan: &ScanResult, elf_bytes: &[u8]) -> Result<SectionTab
     entries.sort_by(|a, b| a.trans_hash.cmp(&b.trans_hash));
     let mut ambiguous: Vec<[u8; 16]> = ambiguous.into_iter().collect();
     ambiguous.sort();
-    Ok(SectionTable { entries, ambiguous })
+    Ok((SectionTable { entries, ambiguous }, node_addrs))
 }
 
 /// Most frequent value (ties broken toward the smallest). `None` if empty.

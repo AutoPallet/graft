@@ -42,6 +42,7 @@ struct Fixture {
     dir: PathBuf,
     original_lib: String,
     original_main: String,
+    original_inner: String,
     _guard: MutexGuard<'static, ()>,
 }
 
@@ -54,7 +55,8 @@ impl Fixture {
             .expect("canonicalize e2e/x86 fixture path");
         let original_lib = std::fs::read_to_string(dir.join("base/src/lib.rs")).unwrap();
         let original_main = std::fs::read_to_string(dir.join("app/src/main.rs")).unwrap();
-        Fixture { dir, original_lib, original_main, _guard }
+        let original_inner = std::fs::read_to_string(dir.join("base/cshim/inner.c")).unwrap();
+        Fixture { dir, original_lib, original_main, original_inner, _guard }
     }
 
     fn edit(&self, rel: &str, from: &str, to: &str) {
@@ -181,6 +183,7 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::write(self.dir.join("base/src/lib.rs"), &self.original_lib);
         let _ = std::fs::write(self.dir.join("app/src/main.rs"), &self.original_main);
+        let _ = std::fs::write(self.dir.join("base/cshim/inner.c"), &self.original_inner);
     }
 }
 
@@ -208,8 +211,10 @@ fn run_combined(path: &Path) -> String {
 fn full_cycle() {
     let fx = Fixture::new();
 
-    // Base build.
-    fx.cargo_build(&[("GRAFT", "base")]);
+    // Base build. GRAFT_MAP_ORACLE makes base verify every recovered
+    // section address against the linker's own map — the no-hardware
+    // ground-truth check for the address-recovery machinery.
+    fx.cargo_build(&[("GRAFT", "base"), ("GRAFT_MAP_ORACLE", "1")]);
     let base_elf = std::env::temp_dir().join("graft-e2e-base.elf");
     std::fs::copy(fx.app_bin(), &base_elf).unwrap();
     make_executable(&base_elf);
@@ -217,6 +222,8 @@ fn full_cycle() {
     assert!(base_out.contains("hello, graft!"), "baseline: {base_out}");
     assert!(base_out.contains("sum = 105"), "baseline: {base_out}");
     assert!(base_out.contains("mixed = 14280"), "baseline: {base_out}");
+    assert!(base_out.contains("ticks = 1,1,2,2"), "baseline: {base_out}");
+    assert!(base_out.contains("cycle = 10,21"), "baseline: {base_out}");
 
     let base_env = base_elf.to_string_lossy().into_owned();
     let log_path = fx.graft_log_path();
@@ -269,6 +276,85 @@ fn full_cycle() {
         std::fs::read(&fx.app_bin()).unwrap(),
         "D: combined should be byte-identical to base",
     );
+
+    // F. Mutable-static identity (the M2 xtensa call-to-0 shape):
+    //    re-emit `tick` while TICK / COUNT (two content-degenerate
+    //    zero-init statics) stay base-resident. The re-emitted code's
+    //    relocs must bind each static to ITS OWN base address — if the
+    //    two aliased, the atomic would observe the counter's writes and
+    //    the pairs would diverge from (2,1),(4,2).
+    fx.edit(
+        "base/src/lib.rs",
+        "TICK.wrapping_add(step)",
+        "TICK.wrapping_add(step.wrapping_mul(2))",
+    );
+    fx.cargo_build(&overlay_env);
+    assert_eq!(fx.combine_stats().trampolines, 1, "F: trampoline count");
+    let out = run_combined(&fx.app_bin());
+    assert!(out.contains("ticks = 2,1,4,2"), "F (statics must not alias): {out}");
+    assert!(out.contains("cycle = 10,21"), "F: {out}");
+    fx.edit(
+        "base/src/lib.rs",
+        "TICK.wrapping_add(step.wrapping_mul(2))",
+        "TICK.wrapping_add(step)",
+    );
+
+    // G. Section-cycle identity (the M2 xtensa code↔literal-pool
+    //    shape): re-emit `cycle_run` while STEP_TABLE ↔ step_a (one
+    //    SCC, two sections) stay base-resident. The re-emitted code's
+    //    reference must land on the table, not on the cycle's other
+    //    member — a shared SCC hash would make the two
+    //    indistinguishable and resolution could return either address.
+    fx.edit("base/src/lib.rs", ".wrapping_add(0)", ".wrapping_add(100)");
+    fx.cargo_build(&overlay_env);
+    assert_eq!(fx.combine_stats().trampolines, 1, "G: trampoline count");
+    let out = run_combined(&fx.app_bin());
+    assert!(out.contains("cycle = 110,121"), "G (cycle members must stay distinct): {out}");
+    assert!(out.contains("ticks = 1,1,2,2"), "G: {out}");
+    fx.edit("base/src/lib.rs", ".wrapping_add(100)", ".wrapping_add(0)");
+}
+
+/// The single-trampoline cut, x86 edition (no hardware): with the entry
+/// symbol on `cshim_inner`, an edit to inner.c must re-emit inner.o but
+/// NOT outer.o — outer reaches the new code through the trampoline at
+/// base's `cshim_inner`, exactly how esp32's `main` reaches an edited
+/// `graft_entry`. This is the "function above the entry is not
+/// re-emitted" invariant as a checked assertion instead of a closure-dump
+/// eyeball.
+#[test]
+#[ignore]
+fn entry_cut_keeps_caller_in_base() {
+    let fx = Fixture::new();
+
+    fx.cargo_build(&[
+        ("GRAFT", "base"),
+        ("GRAFT_ENTRY_SYMBOL", "cshim_inner"),
+        ("GRAFT_MAP_ORACLE", "1"),
+    ]);
+    let base_elf = std::env::temp_dir().join("graft-e2e-entrycut-base.elf");
+    std::fs::copy(fx.app_bin(), &base_elf).unwrap();
+    make_executable(&base_elf);
+    let base_out = run_combined(&base_elf);
+    assert!(base_out.contains("cshim = 149"), "baseline: {base_out}");
+
+    let base_env = base_elf.to_string_lossy().into_owned();
+    let log_env = fx.graft_log_path().to_string_lossy().into_owned();
+    fx.edit("base/cshim/inner.c", "* 7u + 1u", "* 7u + 2u");
+    fx.cargo_build(&[
+        ("GRAFT", "overlay"),
+        ("GRAFT_BASE_ELF", base_env.as_str()),
+        ("GRAFT_LOG", log_env.as_str()),
+    ]);
+    assert_eq!(fx.combine_stats().trampolines, 1, "trampoline at cshim_inner");
+    let dump = fx.graft_summary();
+    assert!(dump.contains("inner"), "closure must re-emit inner.o:\n{dump}");
+    assert!(
+        !dump.contains("outer"),
+        "trampoline cut: outer.o (the caller above the entry) must NOT be re-emitted:\n{dump}"
+    );
+    let out = run_combined(&fx.app_bin());
+    assert!(out.contains("cshim = 151"), "edited inner, via base's outer + trampoline: {out}");
+    assert!(out.contains("sum = 105"), "rest of base unchanged: {out}");
 }
 
 /// For small, focused source mutations, graft's *overlay payload*
@@ -289,7 +375,7 @@ fn payload_sizes_for_typical_edits() {
     let fx = Fixture::new();
     let log_path = fx.graft_log_path();
 
-    fx.cargo_build(&[("GRAFT", "base")]);
+    fx.cargo_build(&[("GRAFT", "base"), ("GRAFT_MAP_ORACLE", "1")]);
     let base_elf = std::env::temp_dir().join("graft-e2e-tight-base.elf");
     std::fs::copy(fx.app_bin(), &base_elf).unwrap();
     make_executable(&base_elf);
