@@ -1,6 +1,9 @@
 # Third-party research clone — not our code
 /dioxus/
 
+# Scale-test checkouts (bench harness scripts ARE committed; clones aren't)
+/bench/rust-analyzer/
+
 # Rust — target/ at any depth (workspaces nest under e2e/, probes/, etc.)
 target/
 
