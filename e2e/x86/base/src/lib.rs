@@ -82,3 +82,30 @@ fn step_b(x: u32) -> u32 {
 pub fn cycle_run(x: u32) -> u32 {
     STEP_TABLE[(x & 1) as usize](x).wrapping_add(0)
 }
+
+// Thread-local state, exercising the TLS resolution paths (docs/15
+// mechanism (c)): `.tdata` (non-zero const init → initialized template
+// bytes) and `.tbss` (zero init). `tl_step` is the edit site for the
+// "reference unchanged base TLS" scenario; editing the *initializer*
+// of TL_ACC exercises re-emission into the GRAFT_TLS_SLACK hole; the
+// new-thread-local scenario adds a third variable in an edit. TP
+// offsets are linker-computed (TPOFF relocs against graft's SHF_TLS
+// map sections) — no graft-side tpoff arithmetic anywhere.
+use core::cell::Cell;
+
+thread_local! {
+    static TL_ACC: Cell<u32> = const { Cell::new(40) };
+    static TL_ZERO: Cell<u32> = const { Cell::new(0) };
+}
+
+pub fn tl_step(n: u32) -> (u32, u32) {
+    let a = TL_ACC.with(|c| {
+        c.set(c.get().wrapping_add(n));
+        c.get()
+    });
+    let z = TL_ZERO.with(|c| {
+        c.set(c.get().wrapping_add(1));
+        c.get()
+    });
+    (a, z)
+}

@@ -10,12 +10,16 @@
 //!     symbol indexes). Every other target is dispatched through the
 //!     `DisposeFn` callback (see `resolve.rs`), which answers with
 //!     either a UND symbol (overlay re-emits the target / weak-undef
-//!     mirror) or a SHN_ABS anchor (`__graft_assumed_<vaddr>`,
-//!     st_value = base address, deduped by address; the reloc's own
-//!     addend rides along so `S + A = vaddr + addend`). Anchors work
-//!     uniformly for PC-relative, absolute, AND GOT-relative relocs
-//!     because the linker resolves them like any defined absolute
-//!     symbol. No PROVIDE() or symbol-name plumbing.
+//!     mirror) or an anchor (`__graft_assumed_<vaddr>`, deduped by
+//!     address; the reloc's own addend rides along so
+//!     `S + A = vaddr + addend`). Anchors are emitted as *UND
+//!     references*; the overlay run synthesizes one base-map object
+//!     that defines every anchor — as a section symbol inside a map
+//!     section placed at base's layout, or SHN_ABS for vaddrs outside
+//!     base's image (ROM constants). Section-defined anchors work
+//!     uniformly for PC-relative, absolute, GOT-relative AND
+//!     TLS-flavored relocs, because to the linker they are ordinary
+//!     defined symbols at known addresses.
 //!
 //! Prune deliberately contains NO name-resolution logic — that lives in
 //! one place (`resolve::Resolver`), shared with the closure walk, so
@@ -43,16 +47,20 @@ use crate::resolve::{DisposeFn, RelocDisposition, RelocQuery};
 pub struct Pruned {
     pub bytes: Vec<u8>,
     pub kept_sections: usize,
-    /// Count of relocations rewritten to a per-target SHN_ABS anchor
+    /// Count of relocations rewritten to a per-target anchor
     /// (`__graft_assumed_<hex>`). Reported in the overlay summary;
     /// useful for diagnosing whether a closure leans heavily on
     /// base-bound resolution vs internal kept-section refs.
-    pub abs_rewrites: usize,
+    pub anchor_rewrites: usize,
     /// (name, assumed_address) for every reloc target this pruned
     /// `.o` resolved through base's symtab snapshot. Overlay collects
     /// these across all pruned objects and verifies post-link that
     /// overlay's symtab agrees on the address.
     pub assumed_names: Vec<(String, u64)>,
+    /// Every anchor this object references: `(vaddr, tls)`, sorted +
+    /// deduped. The overlay run unions these across pruned objects and
+    /// synthesizes the base-map object that defines them.
+    pub anchors: Vec<(u64, bool)>,
 }
 
 /// Prune `source_bytes` (a single `.o` file) against `keep`, the set of
@@ -143,9 +151,10 @@ pub fn prune_object(
         sym_map.insert(src_sym.index(), out.add_symbol(wsym));
     }
 
-    // Per-address SHN_ABS anchors for base-bound relocs. Every reloc that
-    // resolves to base address `vaddr` shares one symbol
-    // (`__graft_assumed_<vaddr>`, st_value = vaddr), deduped by address.
+    // Per-address anchor references for base-bound relocs. Every reloc
+    // that resolves to base address `vaddr` shares one UND symbol
+    // (`__graft_assumed_<vaddr>`), deduped by address; the overlay
+    // run's base-map object defines it at that address.
     //
     // Why one-symbol-per-target instead of a single `__graft_const
     // + (vaddr+A)`: GOTPCREL/GOTPCRELX populate the GOT slot with
@@ -153,13 +162,13 @@ pub fn prune_object(
     // holds the target's address; with S=0 the slot would hold 0
     // and the addend would miscombine into the instruction's disp.
     // PC32/ABS-style relocs are unaffected — they fold S+A directly.
-    // See `docs/11-anon-provide.md`.
-    let mut addr_syms: HashMap<u64, SymbolId> = HashMap::new();
+    // See `docs/11-anon-provide.md` and docs/15.
+    let mut addr_syms: HashMap<u64, (SymbolId, bool)> = HashMap::new();
     // UND symbols emitted on request, deduped by (name, weak).
     let mut und_syms: HashMap<(String, bool), SymbolId> = HashMap::new();
     // (name, vaddr) pairs for every verify-carrying anchor.
     let mut assumed_names: Vec<(String, u64)> = Vec::new();
-    let mut abs_rewrites: usize = 0;
+    let mut anchor_rewrites: usize = 0;
 
     // Pass 3: relocations from kept sections. Internal wiring (targets
     // in this object's own kept sections) passes through; everything
@@ -246,13 +255,15 @@ pub fn prune_object(
 
             let sym_id = match disposition {
                 Ok(internal) => internal,
-                Err(RelocDisposition::Und { name, weak }) => {
+                Err(RelocDisposition::Und { name, weak, tls }) => {
                     *und_syms.entry((name.clone(), weak)).or_insert_with(|| {
                         out.add_symbol(WSymbol {
                             name: name.into_bytes(),
                             value: 0,
                             size: 0,
-                            kind: SymbolKind::Unknown,
+                            // ld rejects a TLS definition bound from a
+                            // non-TLS reference — mirror the type.
+                            kind: if tls { SymbolKind::Tls } else { SymbolKind::Unknown },
                             scope: write::SymbolScope::Dynamic,
                             weak,
                             section: WSymbolSection::Undefined,
@@ -260,26 +271,37 @@ pub fn prune_object(
                         })
                     })
                 }
-                Err(RelocDisposition::Anchor { vaddr, verify_name }) => {
-                    abs_rewrites += 1;
+                Err(RelocDisposition::Anchor { vaddr, tls, verify_name }) => {
+                    anchor_rewrites += 1;
                     if let Some(name) = verify_name {
                         assumed_names.push((name, vaddr));
                     }
                     // Anchors dedup by target address: every reloc to the
-                    // same vaddr shares one SHN_ABS symbol (the reloc's own
-                    // addend rides along, so S + A = vaddr + addend).
-                    *addr_syms.entry(vaddr).or_insert_with(|| {
-                        out.add_symbol(WSymbol {
+                    // same vaddr shares one UND symbol (the reloc's own
+                    // addend rides along, so S + A = vaddr + addend). The
+                    // base-map object defines the name; STT_TLS on the
+                    // reference so ld accepts TLS-flavored relocs against
+                    // it (everything else is STT_NOTYPE).
+                    let entry = addr_syms.entry(vaddr).or_insert_with(|| {
+                        let id = out.add_symbol(WSymbol {
                             name: format!("__graft_assumed_{vaddr:016x}").into_bytes(),
-                            value: vaddr,
+                            value: 0,
                             size: 0,
-                            kind: SymbolKind::Label, // STT_NOTYPE
-                            scope: write::SymbolScope::Compilation, // STB_LOCAL
+                            kind: if tls { SymbolKind::Tls } else { SymbolKind::Unknown },
+                            scope: write::SymbolScope::Linkage, // hidden: defined in-link
                             weak: false,
-                            section: WSymbolSection::Absolute,
+                            section: WSymbolSection::Undefined,
                             flags: write::SymbolFlags::None,
-                        })
-                    })
+                        });
+                        (id, tls)
+                    });
+                    if entry.1 != tls {
+                        bail!(
+                            "anchor {vaddr:#x} classified both TLS and non-TLS across \
+                             relocs — resolver tls_range inconsistency"
+                        );
+                    }
+                    entry.0
                 }
             };
 
@@ -302,12 +324,18 @@ pub fn prune_object(
     // (they will, since a single overlay run uses a single resolution).
     assumed_names.sort();
     assumed_names.dedup();
+    let mut anchors: Vec<(u64, bool)> = addr_syms
+        .into_iter()
+        .map(|(vaddr, (_, tls))| (vaddr, tls))
+        .collect();
+    anchors.sort_unstable();
 
     Ok(Pruned {
         bytes,
         kept_sections: sec_map.len(),
-        abs_rewrites,
+        anchor_rewrites,
         assumed_names,
+        anchors,
     })
 }
 

@@ -25,7 +25,7 @@ fn first_rcgu_o(dir: &std::path::Path) -> Option<PathBuf> {
 /// Shape tests don't care where external refs land — anchor them all at
 /// a fixed dummy address.
 fn dummy_dispose(_q: &RelocQuery<'_>) -> anyhow::Result<RelocDisposition> {
-    Ok(RelocDisposition::Anchor { vaddr: 0x1000, verify_name: None })
+    Ok(RelocDisposition::Anchor { tls: false, vaddr: 0x1000, verify_name: None })
 }
 
 #[test]
@@ -79,8 +79,9 @@ fn prune_keep_none_still_parses() {
         prune::Pruned {
             bytes: Vec::new(),
             kept_sections: 0,
-            abs_rewrites: 0,
+            anchor_rewrites: 0,
             assumed_names: Vec::new(),
+            anchors: Vec::new(),
         }
     });
     if !result.bytes.is_empty() {

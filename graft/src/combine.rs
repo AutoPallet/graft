@@ -187,7 +187,7 @@ fn combine_splice(
         .with_context(|| format!("parse {}", overlay_path.display()))?;
     let base_obj_for_slack = object::File::parse(base_bytes)
         .with_context(|| format!("parse {}", base_path.display()))?;
-    let slack_regions = read_slack_regions(&base_obj_for_slack)?;
+    let slack_regions = read_slack_regions(&base_obj_for_slack, base_bytes)?;
 
     let mut total_spliced: u64 = 0;
     let mut overlay_vaddr_first: u64 = 0;
@@ -208,6 +208,15 @@ fn combine_splice(
         let v_start = sec.address();
         let v_end = v_start + sec_size;
         let sec_name = sec.name().unwrap_or("?");
+        // Base-map sections are address-space declarations for the
+        // overlay link (anchor definitions over base's own content) —
+        // never content to splice. The NOBITS ones are skipped by the
+        // file_range check already; the PROGBITS TLS map (zero-filled
+        // stand-in for base's .tdata span, needed because PROGBITS
+        // can't follow NOBITS inside PT_TLS) must be skipped by name.
+        if sec_name.starts_with(".graft.map.") {
+            continue;
+        }
 
         let in_slack = slack_regions
             .iter()
@@ -284,6 +293,10 @@ fn combine_splice(
             // They can't clobber base because no bytes get written.
             // Skip them when classifying the enclosing PT_LOAD.
             if sec.file_range().is_none() {
+                continue;
+            }
+            // Base-map sections are never content (see the splice pass).
+            if sec.name().unwrap_or("").starts_with(".graft.map.") {
                 continue;
             }
             let s = sec.address();
@@ -487,17 +500,21 @@ impl std::fmt::Debug for SlackRegion {
     }
 }
 
-fn read_slack_regions(base: &object::File) -> Result<Vec<SlackRegion>> {
+fn read_slack_regions(base: &object::File, base_bytes: &[u8]) -> Result<Vec<SlackRegion>> {
     use object::ObjectSymbol;
     let mut text: Option<(u64, u64)> = None;
     let mut rodata: Option<(u64, u64)> = None;
     let mut data: Option<(u64, u64)> = None;
+    let mut tls: Option<(u64, u64)> = None;
     for sym in base.symbols() {
         let Ok(name) = sym.name() else { continue };
         match name {
             crate::slack::TEXT_SYMBOL => text = Some((sym.address(), sym.size())),
             crate::slack::RODATA_SYMBOL => rodata = Some((sym.address(), sym.size())),
             crate::slack::DATA_SYMBOL => data = Some((sym.address(), sym.size())),
+            // STT_TLS: address() is a template-relative offset, not a
+            // vaddr — translated below once PT_TLS is known.
+            crate::slack::TLS_SYMBOL => tls = Some((sym.address(), sym.size())),
             _ => {}
         }
     }
@@ -510,6 +527,11 @@ fn read_slack_regions(base: &object::File) -> Result<Vec<SlackRegion>> {
     }
     if let Some((s, l)) = data {
         regions.push(SlackRegion { name: "data", start: s, len: l });
+    }
+    if let Some((off, l)) = tls
+        && let Some(t) = pt_tls(base_bytes)?
+    {
+        regions.push(SlackRegion { name: "tls", start: t.vaddr + off, len: l });
     }
     if regions.is_empty() {
         bail!(
@@ -593,6 +615,45 @@ impl Phdr {
             }
         }
     }
+}
+
+/// The output ELF's PT_TLS geometry, shared by base (TLS symbol
+/// address recovery), overlay (TLS map synthesis + geometry verify),
+/// and combine. TLS symbols' st_values in a linked ELF are
+/// *template-relative offsets*; `vaddr + st_value` is the template
+/// byte's virtual address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtTls {
+    pub vaddr: u64,
+    pub filesz: u64,
+    pub memsz: u64,
+    pub align: u64,
+}
+
+/// Read the PT_TLS program header from a linked ELF, if present.
+pub fn pt_tls(elf_bytes: &[u8]) -> Result<Option<PtTls>> {
+    let class = ElfClass::from_bytes(elf_bytes)?;
+    let tls = read_program_headers(elf_bytes, class)?
+        .into_iter()
+        .find(|p| p.p_type == object::elf::PT_TLS)
+        .map(|p| PtTls {
+            vaddr: p.p_vaddr,
+            filesz: p.p_filesz,
+            memsz: p.p_memsz,
+            align: p.p_align.max(1),
+        });
+    Ok(tls)
+}
+
+/// `(p_vaddr, p_memsz)` of every PT_LOAD in a linked ELF. memsz, not
+/// filesz: anchors into `.bss` vaddrs are inside memsz only.
+pub fn pt_load_spans(elf_bytes: &[u8]) -> Result<Vec<(u64, u64)>> {
+    let class = ElfClass::from_bytes(elf_bytes)?;
+    Ok(read_program_headers(elf_bytes, class)?
+        .into_iter()
+        .filter(|p| p.p_type == PT_LOAD && p.p_memsz > 0)
+        .map(|p| (p.p_vaddr, p.p_memsz))
+        .collect())
 }
 
 fn read_program_headers(elf: &[u8], class: ElfClass) -> Result<Vec<Phdr>> {

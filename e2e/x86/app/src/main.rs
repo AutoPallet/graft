@@ -14,6 +14,15 @@ fn main() {
     let (t2, c2) = base::tick(black_box(1));
     let cyc_even = base::cycle_run(black_box(4)); // step_a recurses through the table
     let cyc_odd = base::cycle_run(black_box(7)); // step_b: 7*3
+    // Main-thread TLS plus a spawned thread: the spawned thread must
+    // see a FRESH template copy (proves TP offsets land on the real
+    // thread-locals, and that initializer edits reach the template
+    // bytes every thread copies — not just one thread's instance).
+    let (a1, z1) = base::tl_step(black_box(2));
+    let (a2, z2) = base::tl_step(black_box(2));
+    let (ta, tz) = std::thread::spawn(|| base::tl_step(black_box(5)))
+        .join()
+        .expect("tls thread");
 
     println!("{msg}");
     println!("sum = {sum}");
@@ -22,4 +31,5 @@ fn main() {
     println!("cshim = {cshim}");
     println!("ticks = {t1},{c1},{t2},{c2}");
     println!("cycle = {cyc_even},{cyc_odd}");
+    println!("tls = {a1},{z1},{a2},{z2},{ta},{tz}");
 }

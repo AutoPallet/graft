@@ -224,6 +224,7 @@ fn full_cycle() {
     assert!(base_out.contains("mixed = 14280"), "baseline: {base_out}");
     assert!(base_out.contains("ticks = 1,1,2,2"), "baseline: {base_out}");
     assert!(base_out.contains("cycle = 10,21"), "baseline: {base_out}");
+    assert!(base_out.contains("tls = 42,1,44,2,45,1"), "baseline: {base_out}");
 
     let base_env = base_elf.to_string_lossy().into_owned();
     let log_path = fx.graft_log_path();
@@ -312,6 +313,66 @@ fn full_cycle() {
     assert!(out.contains("cycle = 110,121"), "G (cycle members must stay distinct): {out}");
     assert!(out.contains("ticks = 1,1,2,2"), "G: {out}");
     fx.edit("base/src/lib.rs", ".wrapping_add(100)", ".wrapping_add(0)");
+
+    // H. TLS reference (docs/15 mechanism (c)): re-emit `tl_step` while
+    //    TL_ACC / TL_ZERO stay base-resident. The re-emitted code's
+    //    TPOFF relocs anchor into graft's SHF_TLS map sections and ld
+    //    recomputes the SAME TP offsets from the reproduced template
+    //    geometry — wrong offsets would scramble both counters, and a
+    //    geometry mismatch fails the overlay link.
+    fx.edit("base/src/lib.rs", "wrapping_add(n));", "wrapping_add(n.wrapping_mul(3)));");
+    fx.cargo_build(&overlay_env);
+    assert_eq!(fx.combine_stats().trampolines, 1, "H: trampoline count");
+    let out = run_combined(&fx.app_bin());
+    assert!(out.contains("tls = 46,1,52,2,55,1"), "H (TLS refs must keep offsets): {out}");
+    assert!(out.contains("ticks = 1,1,2,2"), "H: {out}");
+    fx.edit("base/src/lib.rs", "wrapping_add(n.wrapping_mul(3)));", "wrapping_add(n));");
+
+    // I. TLS initializer edit: TL_ACC's `.tdata` content changes → the
+    //    section re-emits into the GRAFT_TLS_SLACK hole (a NEW template
+    //    offset), and `tl_step` re-emits with it (its hash changes
+    //    transitively). The spawned thread proves the new initializer
+    //    landed in the template bytes every thread copies — splice
+    //    wrote it into base's in-template slack file range.
+    fx.edit("base/src/lib.rs", "Cell::new(40)", "Cell::new(60)");
+    fx.cargo_build(&overlay_env);
+    assert_eq!(fx.combine_stats().trampolines, 1, "I: trampoline count");
+    let out = run_combined(&fx.app_bin());
+    assert!(out.contains("tls = 62,1,64,2,65,1"), "I (initializer must reach template): {out}");
+    fx.edit("base/src/lib.rs", "Cell::new(60)", "Cell::new(40)");
+
+    // J. NEW thread-local in an edit, used alongside base-resident
+    //    ones: TL_NEW (non-zero init → .tdata) lands in the slack
+    //    hole at an ld-assigned offset while TL_ACC/TL_ZERO references
+    //    still anchor into the TLS maps — one function mixing both
+    //    resolution paths. k: 7→8 (call 1), →9 (call 2); fresh thread
+    //    sees the template's 7 again.
+    fx.edit(
+        "base/src/lib.rs",
+        "static TL_ZERO: Cell<u32> = const { Cell::new(0) };",
+        "static TL_ZERO: Cell<u32> = const { Cell::new(0) };\n    \
+         static TL_NEW: Cell<u32> = const { Cell::new(7) };",
+    );
+    fx.edit(
+        "base/src/lib.rs",
+        "c.set(c.get().wrapping_add(1));",
+        "c.set(c.get().wrapping_add(TL_NEW.with(|k| { k.set(k.get().wrapping_add(1)); k.get() })));",
+    );
+    fx.cargo_build(&overlay_env);
+    assert_eq!(fx.combine_stats().trampolines, 1, "J: trampoline count");
+    let out = run_combined(&fx.app_bin());
+    assert!(out.contains("tls = 42,8,44,17,45,8"), "J (new thread-local in slack): {out}");
+    fx.edit(
+        "base/src/lib.rs",
+        "c.set(c.get().wrapping_add(TL_NEW.with(|k| { k.set(k.get().wrapping_add(1)); k.get() })));",
+        "c.set(c.get().wrapping_add(1));",
+    );
+    fx.edit(
+        "base/src/lib.rs",
+        "static TL_ZERO: Cell<u32> = const { Cell::new(0) };\n    \
+         static TL_NEW: Cell<u32> = const { Cell::new(7) };",
+        "static TL_ZERO: Cell<u32> = const { Cell::new(0) };",
+    );
 }
 
 /// The single-trampoline cut, x86 edition (no hardware): with the entry

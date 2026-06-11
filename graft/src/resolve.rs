@@ -15,7 +15,7 @@
 //! The cascade (see `CLAUDE.md` § "prune's resolution channels"):
 //!   1. target node is in the closure → UND; ld binds overlay's
 //!      re-emitted copy.
-//!   2. target node's trans_hash is in base's table → SHN_ABS anchor at
+//!   2. target node's trans_hash is in base's table → anchor at
 //!      `by_section[th] + value` (positional, no verify).
 //!      2a. ambiguous hash + name uniquely in base.symtab → pin that
 //!          copy + verify; unpinnable + mutable → bail; unpinnable +
@@ -39,12 +39,23 @@ use crate::hash::TransHash;
 pub enum RelocDisposition {
     /// Emit (or reuse) an UND symbol of this name; ld binds it to
     /// overlay's re-emitted copy (strong) or to 0 (weak undef mirror).
-    Und { name: String, weak: bool },
-    /// SHN_ABS anchor at `vaddr` (`__graft_assumed_<hex>`); the reloc's
-    /// own addend rides along. `verify_name = Some` for resolutions
-    /// that assume base.elf's symtab address — overlay post-link
-    /// verifies the name landed there.
-    Anchor { vaddr: u64, verify_name: Option<String> },
+    /// `tls` mirrors the target node's SHF_TLS — ld rejects
+    /// TLS-definition-vs-non-TLS-reference binds, so a re-emitted
+    /// thread-local referenced cross-object needs an STT_TLS UND.
+    Und { name: String, weak: bool, tls: bool },
+    /// Anchor at `vaddr`: prune emits an UND reference to
+    /// `__graft_assumed_<hex>`, and the overlay run's synthetic base-map
+    /// object defines that name — as a section symbol inside a map
+    /// section placed at base's layout (positional content), or SHN_ABS
+    /// when the vaddr lies outside every base PT_LOAD (true constants:
+    /// ROM/PROVIDE addresses). The reloc's own addend rides along.
+    /// `tls` marks vaddrs inside base's PT_TLS template: their map
+    /// sections carry SHF_TLS and the UND reference must be STT_TLS so
+    /// ld accepts TLS-flavored relocs and recomputes TP offsets from
+    /// the (identical) template geometry. `verify_name = Some` for
+    /// resolutions that assume base.elf's symtab address — overlay
+    /// post-link verifies the name landed there.
+    Anchor { vaddr: u64, tls: bool, verify_name: Option<String> },
 }
 
 /// One reloc prune couldn't satisfy internally, described for
@@ -94,9 +105,20 @@ pub struct Resolver<'a> {
     pub by_name: &'a HashMap<String, u64>,
     /// Names base defined at multiple distinct addresses.
     pub by_name_ambiguous: &'a HashSet<String>,
+    /// Base's PT_TLS template span `[start, end)`, if base has one.
+    /// Anchors whose vaddr falls inside are TLS anchors (template
+    /// vaddrs — see `build_section_table`'s translation).
+    pub tls_range: Option<(u64, u64)>,
+    /// Nodes backed by SHF_TLS sections — channel 1's UND emissions
+    /// need the symbol type to match the (TLS) definition.
+    pub tls_nids: &'a HashSet<NodeId>,
 }
 
 impl<'a> Resolver<'a> {
+    fn is_tls(&self, vaddr: u64) -> bool {
+        self.tls_range.is_some_and(|(s, e)| vaddr >= s && vaddr < e)
+    }
+
     /// Dispose one reloc from object `obj`. See module docs for the
     /// cascade.
     pub fn dispose(&self, obj: u32, q: &RelocQuery<'_>) -> Result<RelocDisposition> {
@@ -147,7 +169,11 @@ impl<'a> Resolver<'a> {
                      not kept in this object — closure bookkeeping bug"
                 );
             };
-            return Ok(RelocDisposition::Und { name: name.to_string(), weak: false });
+            return Ok(RelocDisposition::Und {
+                name: name.to_string(),
+                weak: false,
+                tls: self.tls_nids.contains(&nid),
+            });
         }
         if let Some(&sec_addr) = self.by_section.get(&th) {
             if self.ambiguous_sections.contains(&th) {
@@ -158,6 +184,7 @@ impl<'a> Resolver<'a> {
                     // base's exact one. Verify post-link.
                     return Ok(RelocDisposition::Anchor {
                         vaddr: addr,
+                        tls: self.is_tls(addr),
                         verify_name: Some(name.to_string()),
                     });
                 }
@@ -172,11 +199,16 @@ impl<'a> Resolver<'a> {
                 // Read-only/exec interchangeable copies → representative.
                 return Ok(RelocDisposition::Anchor {
                     vaddr: sec_addr + value,
+                    tls: self.is_tls(sec_addr + value),
                     verify_name: None,
                 });
             }
             // (2) clean positional content match.
-            return Ok(RelocDisposition::Anchor { vaddr: sec_addr + value, verify_name: None });
+            return Ok(RelocDisposition::Anchor {
+                vaddr: sec_addr + value,
+                tls: self.is_tls(sec_addr + value),
+                verify_name: None,
+            });
         }
         // (3) overlay has a definition whose content is NOT in base and
         // the closure didn't re-emit it — binding to any base address
@@ -206,6 +238,7 @@ impl<'a> Resolver<'a> {
             // aggregator bracket, prebuilt-lib symbol) → anchor + verify.
             return Ok(RelocDisposition::Anchor {
                 vaddr: addr,
+                tls: self.is_tls(addr),
                 verify_name: Some(lookup_name.to_string()),
             });
         }
@@ -219,7 +252,11 @@ impl<'a> Resolver<'a> {
         // Weak undef: base resolved it to 0 (it's absent from
         // base.symtab) — mirror with a weak UND so ld writes 0 here too.
         if weak_ref {
-            return Ok(RelocDisposition::Und { name: lookup_name.to_string(), weak: true });
+            return Ok(RelocDisposition::Und {
+                name: lookup_name.to_string(),
+                weak: true,
+                tls: false,
+            });
         }
         bail!(
             "reloc in {from_section}: can't resolve {lookup_name} — not in overlay \

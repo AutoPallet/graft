@@ -105,6 +105,7 @@ fn run(argv: Vec<String>) -> Result<()> {
     // `resolve.rs` for the channel cascade.
     let closure_nids: HashSet<NodeId> = closure.closure.iter().copied().collect();
     let mutable_ths = mutable_trans_hashes(&scan);
+    let tls_nids = tls_node_ids(&scan);
     let resolver_wrapped: HashSet<String> = link_args.wrapped.iter().cloned().collect();
     let resolver = crate::resolve::Resolver {
         trans_hash: &scan.trans_hash,
@@ -116,13 +117,15 @@ fn run(argv: Vec<String>) -> Result<()> {
         ambiguous_sections: &base.ambiguous_sections,
         by_name: &base.by_name,
         by_name_ambiguous: &base.by_name_ambiguous,
+        tls_range: base.tls.map(|t| (t.vaddr, t.vaddr + t.memsz)),
+        tls_nids: &tls_nids,
     };
 
     // Prune each source object; collect the pruned-.o paths.
     let t_prune_start = std::time::Instant::now();
     let pruned = prune_all(&scan, &closure, &resolver, &work_dir)?;
     let t_prune = t_prune_start.elapsed();
-    let abs_rewrites_total: usize = pruned.iter().map(|p| p.abs_rewrites).sum();
+    let anchor_rewrites_total: usize = pruned.iter().map(|p| p.anchor_rewrites).sum();
     let kept_sec_total: usize = pruned.iter().map(|p| p.kept_sections).sum();
 
     // Compute the set of `-l<name>` flags the link argv should drop:
@@ -178,13 +181,78 @@ fn run(argv: Vec<String>) -> Result<()> {
     //   - xtensa: empty stub; layout comes from linkall.x + memory.x.
     //   - x86 (and other hosted): SECTIONS placing .text/.rodata at the
     //     base-reserved slack vaddrs.
+    // Base-map object: defines every `__graft_assumed_<vaddr>` the
+    // pruned objects reference — section symbols in map sections
+    // placed at base's layout (positional), SHF_TLS map sections for
+    // template vaddrs, SHN_ABS for out-of-image constants (ROM). See
+    // `basemap.rs` / docs/15.
+    let slack = compute_slack(&base_bytes_for_layout)?;
+    let mut anchors: Vec<(u64, bool)> = pruned
+        .iter()
+        .flat_map(|p| p.anchors.iter().copied())
+        .collect();
+    anchors.sort_unstable();
+    anchors.dedup();
+    let closure_has_tls = closure.closure.iter().any(|&nid| {
+        scan.graph.nodes[nid as usize].segments.iter().any(|seg| {
+            scan.objects[seg.object as usize].sections[seg.section as usize].sh_flags
+                & u64::from(object::elf::SHF_TLS)
+                != 0
+        })
+    });
+    let need_tls_maps = closure_has_tls || anchors.iter().any(|&(_, tls)| tls);
+    let tls_spec = if need_tls_maps {
+        let Some(t) = base.tls else {
+            bail!(
+                "overlay touches thread-local storage but base has no PT_TLS \
+                 template — nothing to anchor TLS against"
+            );
+        };
+        let Some((hole_start, hole_len)) = slack.tls else {
+            bail!(
+                "overlay touches thread-local storage but base has no \
+                 GRAFT_TLS_SLACK (rebuild base with this graft)"
+            );
+        };
+        Some(crate::basemap::TlsMapSpec {
+            start: t.vaddr,
+            end: t.vaddr + t.memsz,
+            hole_start,
+            hole_end: hole_start + hole_len,
+            align: t.align,
+        })
+    } else {
+        None
+    };
+    let base_map = if anchors.is_empty() && tls_spec.is_none() {
+        None
+    } else {
+        // Carve-outs: every slack region (overlay content is placed
+        // there) plus the PT_TLS span (covered by the TLS maps).
+        let mut carve: Vec<(u64, u64)> = vec![
+            (slack.text_start, slack.text_len),
+            (slack.rodata_start, slack.rodata_len),
+            (slack.data_start, slack.data_len),
+        ];
+        if let Some(t) = base.tls {
+            carve.push((t.vaddr, t.memsz));
+        }
+        let arch = crate::slack::architecture_from_e_machine(e_machine)?;
+        let map = crate::basemap::synthesize(arch, &anchors, &base.load_spans, &carve, tls_spec)?;
+        let map_path = work_dir.join("graft_base_map.o");
+        std::fs::write(&map_path, &map.object_bytes)
+            .with_context(|| format!("write {}", map_path.display()))?;
+        Some((map_path, map.sections))
+    };
+
     let layout_script = work_dir.join("overlay_layout.ld");
+    let map_sections: &[crate::basemap::MapSection] =
+        base_map.as_ref().map(|(_, s)| s.as_slice()).unwrap_or(&[]);
     if xtensa_layout.is_some() {
         std::fs::write(&layout_script, b"/* xtensa: linkall.x carries the layout. */\n")
             .with_context(|| format!("write {}", layout_script.display()))?;
     } else {
-        let slack = compute_slack(&base_bytes_for_layout)?;
-        write_overlay_layout_ld_splice(&layout_script, &slack)?;
+        write_overlay_layout_ld_splice(&layout_script, &slack, map_sections, tls_spec)?;
     }
 
     let overlay_elf = work_dir.join("overlay.elf");
@@ -235,6 +303,8 @@ fn run(argv: Vec<String>) -> Result<()> {
             &stripped_libs,
             base.manifest.entry_symbol.as_str(),
             &assumed_names,
+            base_map.as_ref().map(|(p, _)| p.as_path()),
+            map_sections,
         )?;
         if !ld_status.success() {
             bail!(
@@ -242,7 +312,12 @@ fn run(argv: Vec<String>) -> Result<()> {
                 work_dir.display()
             );
         }
-        verify_assumed_names(&overlay_elf, &assumed_names)?;
+        let overlay_bytes = std::fs::read(&overlay_elf)
+            .with_context(|| format!("read overlay {}", overlay_elf.display()))?;
+        verify_assumed_names(&overlay_bytes, &assumed_names)?;
+        if let Some(spec) = tls_spec {
+            verify_tls_geometry(&overlay_bytes, &spec, base.tls.unwrap())?;
+        }
     }
     let t_link = t_link_start.elapsed();
 
@@ -275,7 +350,7 @@ fn run(argv: Vec<String>) -> Result<()> {
     let summary = format!(
         "graft overlay: base {} sections · overlay {} objs / {} sections · \
          closure {} sections · \
-         pruned {} objs / {} sections / {} abs-rewrites / {} base-assumed (ch3) · \
+         pruned {} objs / {} sections / {} anchor-rewrites ({} anchors) / {} base-assumed (ch3) · \
          combined {} bytes (overlay payload {} @ {:#x}, {} trampolines) · \
          scan {:.1?} · closure {:.1?} · prune {:.1?} · link {:.1?} · combine {:.1?} · \
          total {:.1?}\n\
@@ -286,7 +361,8 @@ fn run(argv: Vec<String>) -> Result<()> {
         closure.closure.len(),
         pruned.len(),
         kept_sec_total,
-        abs_rewrites_total,
+        anchor_rewrites_total,
+        anchors.len(),
         assumed_names.len(),
         combine_stats.combined_size,
         combine_stats.overlay_load_size,
@@ -353,11 +429,14 @@ fn work_dir_for(output: &Path) -> PathBuf {
 struct PrunedEntry {
     path: PathBuf,
     kept_sections: usize,
-    abs_rewrites: usize,
+    anchor_rewrites: usize,
     /// (name, assumed_address) for every reloc this prune resolved
     /// through `base_symtab` (the channel-of-last-resort). Aggregated
     /// across all entries and used for post-link verify.
     assumed_names: Vec<(String, u64)>,
+    /// `(vaddr, tls)` anchors this entry references; unioned across
+    /// entries to synthesize the base-map object.
+    anchors: Vec<(u64, bool)>,
     /// If true, this entry is a filtered archive (`.a` file) graft
     /// emitted from pruned members. Wrap with
     /// `-Wl,--whole-archive .. -Wl,--no-whole-archive` when invoking
@@ -391,16 +470,18 @@ fn prune_all(
     struct LooseEntry {
         path: PathBuf,
         kept_sections: usize,
-        abs_rewrites: usize,
+        anchor_rewrites: usize,
         assumed_names: Vec<(String, u64)>,
+        anchors: Vec<(u64, bool)>,
         is_archive: bool,
     }
     struct ArchiveMember {
         member_name: String,
         bytes: Vec<u8>,
         kept_sections: usize,
-        abs_rewrites: usize,
+        anchor_rewrites: usize,
         assumed_names: Vec<(String, u64)>,
+        anchors: Vec<(u64, bool)>,
     }
     let mut loose: Vec<LooseEntry> = Vec::new();
     let mut archives: HashMap<PathBuf, Vec<ArchiveMember>> = HashMap::new();
@@ -425,8 +506,9 @@ fn prune_all(
                 loose.push(LooseEntry {
                     path,
                     kept_sections: p.kept_sections,
-                    abs_rewrites: p.abs_rewrites,
+                    anchor_rewrites: p.anchor_rewrites,
                     assumed_names: p.assumed_names,
+                    anchors: p.anchors,
                     is_archive: false,
                 });
             }
@@ -439,8 +521,9 @@ fn prune_all(
                         member_name: member_name.replace('/', "_"),
                         bytes: p.bytes,
                         kept_sections: p.kept_sections,
-                        abs_rewrites: p.abs_rewrites,
+                        anchor_rewrites: p.anchor_rewrites,
                         assumed_names: p.assumed_names,
+                        anchors: p.anchors,
                     });
             }
         }
@@ -459,8 +542,9 @@ fn prune_all(
         out.push(PrunedEntry {
             path: entry.path,
             kept_sections: entry.kept_sections,
-            abs_rewrites: entry.abs_rewrites,
+            anchor_rewrites: entry.anchor_rewrites,
             assumed_names: entry.assumed_names,
+            anchors: entry.anchors,
             is_archive: entry.is_archive,
         });
     }
@@ -471,10 +555,14 @@ fn prune_all(
             .unwrap_or("filtered");
         let path = work_dir.join(basename);
         let kept_sections: usize = members.iter().map(|m| m.kept_sections).sum();
-        let abs_rewrites: usize = members.iter().map(|m| m.abs_rewrites).sum();
+        let anchor_rewrites: usize = members.iter().map(|m| m.anchor_rewrites).sum();
         let assumed_names: Vec<(String, u64)> = members
             .iter()
             .flat_map(|m| m.assumed_names.iter().cloned())
+            .collect();
+        let anchors: Vec<(u64, bool)> = members
+            .iter()
+            .flat_map(|m| m.anchors.iter().copied())
             .collect();
         let payload: Vec<(&str, &[u8])> = members
             .iter()
@@ -485,8 +573,9 @@ fn prune_all(
         out.push(PrunedEntry {
             path,
             kept_sections,
-            abs_rewrites,
+            anchor_rewrites,
             assumed_names,
+            anchors,
             is_archive: true,
         });
     }
@@ -553,38 +642,91 @@ fn write_empty_relocatable_for(path: &Path, e_machine: u16) -> Result<()> {
 }
 
 /// Splice-mode layout for non-xtensa hosted targets (x86_64 today).
-/// Places overlay's `.text*` at the slack `.text` vaddr and overlay's
-/// `.rodata*` / `.data.rel.ro*` at the slack `.rodata` vaddr. Discards
-/// any non-text/rodata alloc sections — splice mode covers only the
-/// two slack-reserved regions, so anything else (`.data`, `.bss`,
+/// Places overlay's `.text*` at the slack `.text` vaddr, overlay's
+/// `.rodata*` / `.data.rel.ro*` at the slack `.rodata` vaddr,
+/// re-emitted `.tdata`/`.tbss` in the in-template TLS slack hole, and
+/// every base-map section at the base address span it mirrors.
+/// Discards any other alloc sections — splice mode covers only the
+/// slack-reserved regions, so anything else (`.data`, `.bss`,
 /// `.eh_frame_hdr`, …) must come from base. ASSERTs guard against
 /// silent slack overflow at link time.
-fn write_overlay_layout_ld_splice(path: &Path, slack: &Slack) -> Result<()> {
-    // ASSERT-on-overflow lives at the top level (outside SECTIONS) so
-    // it sees the placement-final symbols `_graft_text_end` /
-    // `_graft_rodata_end`. Inside SECTIONS, top-level ASSERTs get
-    // rejected by some ld versions.
-    let script = format!(
-        "/* graft overlay layout (splice): place .text/.rodata at \
-         base's reserved slack vaddrs. */\n\
-         SECTIONS {{\n\
-         \x20  . = {text_start:#x};\n\
-         \x20  .text : {{ *(.text .text.*) }}\n\
-         \x20  _graft_text_end = .;\n\
-         \x20  . = {rodata_start:#x};\n\
-         \x20  .rodata : {{ *(.rodata .rodata.* .rodata..L*) }}\n\
-         \x20  .data.rel.ro : {{ *(.data.rel.ro .data.rel.ro.* .data.rel.ro..L*) }}\n\
-         \x20  _graft_rodata_end = .;\n\
-         \x20  /DISCARD/ : {{ *(.eh_frame .eh_frame_hdr .gcc_except_table* \
-         .data .data.* .bss .bss.* COMMON .note.* .comment .gnu_debuglink) }}\n\
-         }}\n\
-         ASSERT(_graft_text_end <= {text_end:#x}, \"overlay .text overflows GRAFT_TEXT_SLACK\")\n\
-         ASSERT(_graft_rodata_end <= {rodata_end:#x}, \"overlay .rodata overflows GRAFT_RODATA_SLACK\")\n",
-        text_start = slack.text_start,
-        text_end = slack.text_start + slack.text_len,
-        rodata_start = slack.rodata_start,
-        rodata_end = slack.rodata_start + slack.rodata_len,
+///
+/// All placements are emitted in ascending address order: ld refuses
+/// to move the location counter backwards, and map sections (which
+/// mirror base content *around* the slack carve-outs) interleave with
+/// the slack-placed content blocks.
+fn write_overlay_layout_ld_splice(
+    path: &Path,
+    slack: &Slack,
+    maps: &[crate::basemap::MapSection],
+    tls: Option<crate::basemap::TlsMapSpec>,
+) -> Result<()> {
+    let mut stanzas: Vec<(u64, String)> = Vec::new();
+    stanzas.push((
+        slack.text_start,
+        format!(
+            "  . = {:#x};\n  .text : {{ *(.text .text.*) }}\n  _graft_text_end = .;\n",
+            slack.text_start
+        ),
+    ));
+    stanzas.push((
+        slack.rodata_start,
+        format!(
+            "  . = {:#x};\n  .rodata : {{ *(.rodata .rodata.* .rodata..L*) }}\n  \
+             .data.rel.ro : {{ *(.data.rel.ro .data.rel.ro.* .data.rel.ro..L*) }}\n  \
+             _graft_rodata_end = .;\n",
+            slack.rodata_start
+        ),
+    ));
+    if let Some(t) = tls {
+        stanzas.push((
+            t.hole_start,
+            format!(
+                "  . = {:#x};\n  .tdata : {{ *(.tdata .tdata.*) }}\n  \
+                 .tbss : {{ *(.tbss .tbss.*) }}\n  _graft_tls_end = .;\n",
+                t.hole_start
+            ),
+        ));
+    }
+    for ms in maps {
+        stanzas.push((
+            ms.vaddr,
+            format!("  . = {:#x};\n  {} : {{ *({}) }}\n", ms.vaddr, ms.name, ms.name),
+        ));
+    }
+    stanzas.sort_by_key(|&(addr, _)| addr);
+
+    let mut script = String::from(
+        "/* graft overlay layout (splice): slack-placed overlay content \
+         interleaved with base-map sections, ascending by address. */\n\
+         SECTIONS {\n",
     );
+    for (_, s) in &stanzas {
+        script.push_str(s);
+    }
+    script.push_str(
+        "  /DISCARD/ : { *(.eh_frame .eh_frame_hdr .gcc_except_table* \
+         .data .data.* .bss .bss.* COMMON .note.* .comment .gnu_debuglink) }\n}\n",
+    );
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        script,
+        "ASSERT(_graft_text_end <= {:#x}, \"overlay .text overflows GRAFT_TEXT_SLACK\")",
+        slack.text_start + slack.text_len
+    );
+    let _ = writeln!(
+        script,
+        "ASSERT(_graft_rodata_end <= {:#x}, \"overlay .rodata overflows GRAFT_RODATA_SLACK\")",
+        slack.rodata_start + slack.rodata_len
+    );
+    if let Some(t) = tls {
+        let _ = writeln!(
+            script,
+            "ASSERT(_graft_tls_end <= {:#x}, \"overlay thread-locals overflow \
+             GRAFT_TLS_SLACK (bump GRAFT_TLS_SLACK_LEN and rebuild base)\")",
+            t.hole_end
+        );
+    }
     std::fs::write(path, script).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
@@ -604,14 +746,17 @@ fn write_overlay_layout_ld_splice(path: &Path, slack: &Slack) -> Result<()> {
 /// linker-script `_*_end = .;` whose value depends on overlay's
 /// distinct layout). Bail loudly — the rewritten relocs would be
 /// pointing at the wrong address.
-fn verify_assumed_names(overlay_elf: &Path, assumed: &HashMap<String, u64>) -> Result<()> {
+fn verify_assumed_names(overlay_bytes: &[u8], assumed: &HashMap<String, u64>) -> Result<()> {
     use object::{Object, ObjectSymbol};
     if assumed.is_empty() {
         return Ok(());
     }
-    let bytes = std::fs::read(overlay_elf)
-        .with_context(|| format!("read overlay {}", overlay_elf.display()))?;
-    let elf = object::File::parse(&*bytes).context("parse overlay ELF for verify")?;
+    let elf = object::File::parse(overlay_bytes).context("parse overlay ELF for verify")?;
+    // TLS symbols in the linked overlay carry template-relative
+    // offsets; assumed addresses are template vaddrs — translate via
+    // the overlay's PT_TLS (placed at base's template vaddr by the
+    // TLS maps, so the spaces coincide).
+    let overlay_tls_vaddr = crate::combine::pt_tls(overlay_bytes)?.map(|t| t.vaddr);
     let mut overlay_addrs: HashMap<String, u64> = HashMap::new();
     for sym in elf.symbols() {
         if sym.is_undefined() {
@@ -621,10 +766,16 @@ fn verify_assumed_names(overlay_elf: &Path, assumed: &HashMap<String, u64>) -> R
         if name.is_empty() {
             continue;
         }
+        let addr = if matches!(sym.kind(), object::SymbolKind::Tls) {
+            let Some(tv) = overlay_tls_vaddr else { continue };
+            tv + sym.address()
+        } else {
+            sym.address()
+        };
         // First-write-wins: overlay symtab can repeat names across
-        // SHN_ABS anchors and real defs; the real def comes from the
+        // graft anchors and real defs; the real def comes from the
         // ELF's own symtab walk and is what we want to compare.
-        overlay_addrs.entry(name.to_string()).or_insert(sym.address());
+        overlay_addrs.entry(name.to_string()).or_insert(addr);
     }
     let mut mismatches: Vec<(String, u64, Option<u64>)> = Vec::new();
     for (name, &assumed_addr) in assumed {
@@ -700,6 +851,41 @@ fn verify_assumed_names(overlay_elf: &Path, assumed: &HashMap<String, u64>) -> R
     Ok(())
 }
 
+/// TP offsets are functions of (offset-in-template, memsz, align). The
+/// TLS maps reproduce base's template geometry so ld's recomputed
+/// offsets equal base's — this check makes that assumption loud. A
+/// mismatch means a re-emitted/new thread-local spilled the slack hole
+/// or demanded a bigger alignment than base's template.
+fn verify_tls_geometry(
+    overlay_bytes: &[u8],
+    spec: &crate::basemap::TlsMapSpec,
+    base_tls: crate::combine::PtTls,
+) -> Result<()> {
+    let Some(ov) = crate::combine::pt_tls(overlay_bytes)? else {
+        bail!(
+            "overlay link involved TLS (maps at {:#x}..{:#x}) but produced no \
+             PT_TLS — layout script regression?",
+            spec.start,
+            spec.end
+        );
+    };
+    if ov.vaddr != base_tls.vaddr || ov.memsz != base_tls.memsz || ov.align != base_tls.align {
+        bail!(
+            "overlay PT_TLS geometry diverged from base's — TP offsets would \
+             not match.\n  base:    vaddr {:#x} memsz {:#x} align {:#x}\n  \
+             overlay: vaddr {:#x} memsz {:#x} align {:#x}\n\
+             (a new thread-local needing align > base's template align, or \
+             slack-hole overflow, causes this)",
+            base_tls.vaddr,
+            base_tls.memsz,
+            base_tls.align,
+            ov.vaddr,
+            ov.memsz,
+            ov.align,
+        );
+    }
+    Ok(())
+}
 
 fn run_real_linker(
     pruned: &[PrunedEntry],
@@ -710,6 +896,8 @@ fn run_real_linker(
     stripped_libs: &HashSet<String>,
     entry_symbol: &str,
     assumed_names: &HashMap<String, u64>,
+    base_map: Option<&Path>,
+    map_sections: &[crate::basemap::MapSection],
 ) -> Result<std::process::ExitStatus> {
     // Invoke the gcc-style driver rustc gave us (gcc handles `-Wl,…`,
     // `-l<lib>`, default-library suppression, etc. for both
@@ -769,9 +957,26 @@ fn run_real_linker(
         // command-line `-T` (script ordering puts that before
         // memory.x).
         cmd.arg("-L").arg(&x.work_dir);
+        // Base-map sections are orphans to linkall.x; pin each at its
+        // base address. (On x86 the graft-generated layout script
+        // places them instead.)
+        for ms in map_sections {
+            cmd.arg(format!("-Wl,--section-start={}={:#x}", ms.name, ms.vaddr));
+        }
     } else {
         // x86 path: layout script bumps everything from OVERLAY_BASE_ADDR.
         cmd.arg("-T").arg(layout);
+    }
+
+    // The base-map object defines every __graft_assumed_* anchor the
+    // pruned objects reference. Each map section carries a keep-symbol
+    // GC root: TLS maps define PT_TLS geometry and must survive
+    // --gc-sections even with zero live references into them.
+    if let Some(p) = base_map {
+        cmd.arg(p);
+        for ms in map_sections {
+            cmd.arg(format!("-Wl,--undefined={}", ms.keep_symbol));
+        }
     }
 
     // Forward rustc's link args (sans inputs, `-o`, walked-`-l`s and
@@ -831,6 +1036,12 @@ pub struct BaseMetadata {
     /// Channel 3 refuses to resolve these and errors with a precise
     /// diagnostic rather than guessing.
     pub by_name_ambiguous: HashSet<String>,
+    /// Base's PT_TLS geometry, if it has a TLS template. Section-table
+    /// TLS entries and `by_name` TLS values are template *vaddrs*
+    /// (`tls.vaddr + offset`).
+    pub tls: Option<crate::combine::PtTls>,
+    /// Base's PT_LOAD spans `(vaddr, memsz)` — the map-object intervals.
+    pub load_spans: Vec<(u64, u64)>,
 }
 
 fn load_base_metadata(path: &std::path::Path) -> Result<BaseMetadata> {
@@ -870,6 +1081,8 @@ fn load_base_metadata(path: &std::path::Path) -> Result<BaseMetadata> {
     // ended up with at link time.
     let elf = object::File::parse(&*bytes)
         .with_context(|| format!("parse {} for symtab snapshot", path.display()))?;
+    let tls = crate::combine::pt_tls(&bytes)?;
+    let load_spans = crate::combine::pt_load_spans(&bytes)?;
     let mut by_name: HashMap<String, u64> = HashMap::new();
     let mut by_name_ambiguous: HashSet<String> = HashSet::new();
     for sym in elf.symbols() {
@@ -882,7 +1095,15 @@ fn load_base_metadata(path: &std::path::Path) -> Result<BaseMetadata> {
         ) {
             continue;
         }
-        let addr = sym.address();
+        // TLS symbols carry template-relative offsets; translate to
+        // template vaddrs so they live in the same address space as
+        // everything else (mirrors build_section_table).
+        let addr = if matches!(sym.kind(), object::SymbolKind::Tls) {
+            let Some(t) = tls else { continue };
+            t.vaddr + sym.address()
+        } else {
+            sym.address()
+        };
         match by_name.entry(name.to_string()) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert(addr);
@@ -904,7 +1125,15 @@ fn load_base_metadata(path: &std::path::Path) -> Result<BaseMetadata> {
         by_name.remove(n);
     }
 
-    Ok(BaseMetadata { manifest, by_section, ambiguous_sections, by_name, by_name_ambiguous })
+    Ok(BaseMetadata {
+        manifest,
+        by_section,
+        ambiguous_sections,
+        by_name,
+        by_name_ambiguous,
+        tls,
+        load_spans,
+    })
 }
 
 pub(crate) struct Closure {
@@ -932,6 +1161,23 @@ fn mutable_trans_hashes(scan: &ScanResult) -> HashSet<TransHash> {
         });
         if mutable {
             out.insert(scan.trans_hash[nid as usize]);
+        }
+    }
+    out
+}
+
+/// Nodes backed by SHF_TLS sections — channel-1 UND emissions for these
+/// must be STT_TLS (ld rejects TLS-def-vs-non-TLS-ref binds).
+fn tls_node_ids(scan: &ScanResult) -> HashSet<NodeId> {
+    let mut out = HashSet::new();
+    for (nid, nm) in scan.graph.nodes.iter().enumerate() {
+        let tls = nm.segments.iter().any(|seg| {
+            scan.objects[seg.object as usize].sections[seg.section as usize].sh_flags
+                & u64::from(object::elf::SHF_TLS)
+                != 0
+        });
+        if tls {
+            out.insert(nid as NodeId);
         }
     }
     out
@@ -1072,6 +1318,10 @@ pub struct Slack {
     pub data_start: u64,
     /// Length of `GRAFT_DATA_SLACK` in bytes.
     pub data_len: u64,
+    /// `(template vaddr, len)` of `GRAFT_TLS_SLACK` — the in-template
+    /// hole re-emitted/new thread-locals land in. `None` when base has
+    /// no TLS slack (no PT_TLS, or a pre-v6 base).
+    pub tls: Option<(u64, u64)>,
 }
 
 /// Look up `GRAFT_TEXT_SLACK` and `GRAFT_RODATA_SLACK` in base.elf's
@@ -1088,15 +1338,24 @@ fn compute_slack(base_bytes: &[u8]) -> Result<Slack> {
     let mut text: Option<(u64, u64)> = None;
     let mut rodata: Option<(u64, u64)> = None;
     let mut data: Option<(u64, u64)> = None;
+    let mut tls: Option<(u64, u64)> = None;
     for sym in elf.symbols() {
         let Ok(name) = sym.name() else { continue };
         match name {
             "GRAFT_TEXT_SLACK" => text = Some((sym.address(), sym.size())),
             "GRAFT_RODATA_SLACK" => rodata = Some((sym.address(), sym.size())),
             "GRAFT_DATA_SLACK" => data = Some((sym.address(), sym.size())),
+            // STT_TLS: address() is a template-relative offset;
+            // translated to a template vaddr below.
+            "GRAFT_TLS_SLACK" => tls = Some((sym.address(), sym.size())),
             _ => {}
         }
     }
+    let tls = match tls {
+        Some((off, len)) => crate::combine::pt_tls(base_bytes)?
+            .map(|t| (t.vaddr + off, len)),
+        None => None,
+    };
     let (text_start, text_len) = text.ok_or_else(|| {
         anyhow!(
             "base ELF: GRAFT_TEXT_SLACK symbol not found \
@@ -1128,6 +1387,7 @@ fn compute_slack(base_bytes: &[u8]) -> Result<Slack> {
         rodata_len,
         data_start,
         data_len,
+        tls,
     })
 }
 
@@ -1584,6 +1844,7 @@ MEMORY
             rodata_len: 0x10000,
             data_start: 0x3FC8_A000,
             data_len: 0x1000,
+            tls: None,
         };
         let out = mutate_memory_x(input, &slack).unwrap();
         assert!(out.contains("irom_seg ( RX ) : ORIGIN = 0x42017000"));
@@ -1603,6 +1864,7 @@ MEMORY
             rodata_len: 0x10000,
             data_start: 0,
             data_len: 0x1000,
+            tls: None,
         };
         assert!(mutate_memory_x(input, &slack).is_err());
     }

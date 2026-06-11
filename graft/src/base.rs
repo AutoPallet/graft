@@ -189,6 +189,7 @@ fn inject_slack(
     argv.push(format!("-Wl,--undefined={}", crate::slack::TEXT_SYMBOL));
     argv.push(format!("-Wl,--undefined={}", crate::slack::RODATA_SYMBOL));
     argv.push(format!("-Wl,--undefined={}", crate::slack::DATA_SYMBOL));
+    argv.push(format!("-Wl,--undefined={}", crate::slack::TLS_SYMBOL));
     Ok(argv)
 }
 
@@ -234,6 +235,15 @@ fn build_section_table(
     use std::collections::hash_map::Entry;
     let elf = object::File::parse(elf_bytes).context("parse output ELF")?;
 
+    // TLS symbols' st_value in a linked ELF is a template-relative
+    // offset, not a vaddr (the map oracle caught std's .tbss statics
+    // "recovered" at 0x20 when this was treated as an address). The
+    // template itself lives at PT_TLS.p_vaddr, so the symbol's byte is
+    // at `p_vaddr + st_value` — translate here so TLS sections join
+    // the same vaddr-keyed table as everything else, and overlay-side
+    // anchors land inside the TLS map sections.
+    let tls_vaddr: Option<u64> = crate::combine::pt_tls(elf_bytes)?.map(|t| t.vaddr);
+
     // (name, key_tu) → unique final address, or `None` once the name is
     // seen at two distinct addresses (then it's a poor surrogate and we
     // skip it for voting). key_tu = None for globals/weaks, Some(tu) for
@@ -249,15 +259,21 @@ fn build_section_table(
         if s.is_undefined() { continue; }
         if matches!(s.kind(), object::SymbolKind::Section) { continue; }
         if name_raw.is_empty() { continue; }
+        let addr = if matches!(s.kind(), object::SymbolKind::Tls) {
+            let Some(tv) = tls_vaddr else { continue };
+            tv + s.address()
+        } else {
+            s.address()
+        };
         let is_global = matches!(s.scope(), SymbolScope::Linkage | SymbolScope::Dynamic);
         let key_tu = if is_global { None } else { current_tu };
         match final_addr.entry((name_raw.to_string(), key_tu)) {
             Entry::Vacant(v) => {
-                v.insert(Some(s.address()));
+                v.insert(Some(addr));
             }
             Entry::Occupied(mut o) => {
                 if let Some(a) = *o.get()
-                    && a != s.address()
+                    && a != addr
                 {
                     o.insert(None); // same (name, tu) at two addresses → unusable surrogate
                 }
@@ -295,18 +311,13 @@ fn build_section_table(
         for sym in &obj.symbols {
             let Some(sec_idx) = sym.defining_section else { continue };
             if sym.name.is_empty() { continue; }
-            // TLS symbols' st_value in the final symtab is an offset
-            // into the TLS template, NOT a virtual address — back-
-            // computing `final − st_value` yields garbage (the map
-            // oracle caught std's .tbss statics "recovered" at 0x20).
-            // TLS sections get no table entry, so a positional
-            // reference to one bails loudly instead of binding to a
-            // nonsense address. (TLS-aware resolution is unsupported;
-            // TPOFF-style relocs need TLS-segment arithmetic, not an
-            // SHN_ABS anchor.)
-            if obj.sections[sec_idx].sh_flags & u64::from(object::elf::SHF_TLS) != 0 {
-                continue;
-            }
+            // TLS sections vote like everything else — their final
+            // symtab values were translated to template *vaddrs* above
+            // (PT_TLS.p_vaddr + st_value), so `final − input_offset`
+            // recovers the section's template vaddr. Overlay-side, a
+            // reference to one anchors inside the SHF_TLS map sections
+            // and ld recomputes the TP offset from the identical
+            // template geometry. See docs/15 mechanism (c).
             let Some(&nid) = node_of.get(&(obj_idx as u32, sec_idx as u32)) else { continue };
             let (key_tu, is_local) = match sym.bind {
                 SymbolBind::Global | SymbolBind::Weak => (None, false),

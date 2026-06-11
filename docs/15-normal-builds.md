@@ -6,13 +6,26 @@ Status: design. Rev 2: the overlay link runs in PIC mode with
 SHF_TLS map sections (see mechanism (c)).
 
 SUSPENSION NOTE (2026-06-10): PIE, dynamic linking, and the
-rust-analyzer bench are suspended. Current focus: (1) the
-section-anchor / map-object encoding implemented against the existing
-ET_EXEC targets (x86 musl-static e2e + xtensa hw loop) with all tests
-solid; (2) TLS map sections implemented and tested in the same pass
-(references to unchanged base TLS resolve; changed/new TLS sections
-bail until TLS slack exists). The `-pie` flip, RELATIVE merge, dynamic
-machinery, and the bench resume from here later.
+rust-analyzer bench are suspended. The `-pie` flip, RELATIVE merge,
+dynamic machinery, and the bench resume from here later.
+
+IMPLEMENTED (2026-06-11), against the existing ET_EXEC targets: the
+section-anchor / map-object encoding (`basemap.rs` — prune emits UND
+anchors, one synthetic map object defines them; section symbols for
+positional content, SHF_TLS maps for TLS, ABS only for out-of-image
+ROM constants) and TLS end-to-end including `GRAFT_TLS_SLACK`
+(in-template hole; thread-local-defining and initializer-modifying
+edits both work — e2e scenarios H/I/J: refs to unchanged base TLS, a
+re-emitted initializer reaching the per-thread template via splice,
+and a brand-new thread-local mixed with base TLS refs). Schema v6.
+Lesson banked during bring-up: map sections are *geometry*, not just
+anchor carriers — `--gc-sections` dropped the TLS maps when every TLS
+reference resolved to a re-emitted copy, collapsing PT_TLS memsz and
+shifting every end-anchored TP offset (caught by `verify_tls_geometry`,
+not by luck); every map section now carries a `__graft_map_keep_*`
+GC-root passed via `--undefined=`. x86 e2e fully green; xtensa
+base+overlay+invariants+`espflash save-image` green in-container,
+on-device flash pending board reconnection.
 
 The question: today graft requires `x86_64-unknown-linux-musl` +
 `crt-static` + `relocation-model=static`. What does it take to support

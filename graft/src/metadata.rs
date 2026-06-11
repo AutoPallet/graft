@@ -14,7 +14,11 @@ pub const GRAFT_MAGIC: [u8; 4] = *b"GRFT";
 // v5: edge resolution unified with reloc disposition — edges now apply
 // `--wrap` renaming and the cross-TU local fallback, changing the hash
 // domain again. Each bump makes stale bases fail loud.
-pub const SCHEMA_VERSION: u16 = 5;
+// v6: TLS sections join the table (addresses are template vaddrs,
+// PT_TLS.p_vaddr + offset) and base reserves GRAFT_TLS_SLACK inside
+// its template. A v5 base has neither: TLS refs would mis-resolve and
+// TLS re-emission would have nowhere to land.
+pub const SCHEMA_VERSION: u16 = 6;
 
 pub const SECTION_MANIFEST: &str = ".graft.manifest";
 pub const SECTION_SECTIONS: &str = ".graft.sections";

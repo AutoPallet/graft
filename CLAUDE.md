@@ -105,13 +105,14 @@ resolve disagree" bugs happen. The ordering is load-bearing, not
 cosmetic:
 
 1. overlay saw it AND its node's trans_hash is in the closure → UND
-   (ld resolves to overlay's re-emitted copy).
+   (ld resolves to overlay's re-emitted copy). STT_TLS when the target
+   node is SHF_TLS — ld rejects TLS-def-vs-non-TLS-ref binds.
 2. overlay saw it AND its trans_hash is in base's section table →
-   SHN_ABS anchor at `by_section[th] + offset` (positional,
-   content-keyed, no verify). Ambiguous hashes (base placed identical
-   content at several addresses): unique name in base.symtab → pin
-   that copy + verify; no pin and the content is MUTABLE → bail
-   (aliasing distinct variables); read-only/exec → representative.
+   anchor at `by_section[th] + offset` (positional, content-keyed, no
+   verify). Ambiguous hashes (base placed identical content at several
+   addresses): unique name in base.symtab → pin that copy + verify; no
+   pin and the content is MUTABLE → bail (aliasing distinct
+   variables); read-only/exec → representative.
 3. **overlay saw it but neither of the above** → BAIL. The symbol's
    content differs from base and it wasn't re-emitted; binding to
    base's address would silently call base's stale code. This check
@@ -119,10 +120,26 @@ cosmetic:
    came after and was shadowed — channel 3 silently bound drifted
    content to base).
 4. overlay never saw it AND base_symtab has a unique address →
-   SHN_ABS anchor + post-link verify. This is the
-   channel-of-last-resort, ONLY for names not in overlay's inputs
-   (crt/startup, linker-script absolutes, ROM/PROVIDE, prebuilt libs).
-   Ambiguous base names (multiple distinct addresses) bail.
+   anchor + post-link verify. This is the channel-of-last-resort, ONLY
+   for names not in overlay's inputs (crt/startup, linker-script
+   absolutes, ROM/PROVIDE, prebuilt libs). Ambiguous base names
+   (multiple distinct addresses) bail.
+
+Anchor encoding (docs/15, `basemap.rs`): prune emits anchors as UND
+`__graft_assumed_<vaddr>` references; ONE synthetic base-map object
+defines them — as section symbols inside NOBITS map sections placed at
+base's layout (positional content; PIE-compatible), in SHF_TLS map
+sections reproducing base's PT_TLS geometry (ld computes all TP
+offsets — graft owns zero tpoff arithmetic), or SHN_ABS *only* for
+vaddrs outside every PT_LOAD (true constants: esp32 ROM). Map sections
+carry `__graft_map_keep_*` GC-root symbols passed via `--undefined=` —
+the TLS maps define PT_TLS geometry (memsz/align, which TP offsets are
+end-anchored against) and must survive `--gc-sections` even with zero
+live references into them. Re-emitted/new thread-locals land in
+`GRAFT_TLS_SLACK`, an in-template hole reserved at base link (the
+template can NEVER grow at combine time); post-link, overlay PT_TLS
+geometry must equal base's exactly — `verify_tls_geometry` bails
+otherwise.
 
 The invariant: a name overlay's scan saw with differing content never
 reaches base_symtab resolution. If you reorder these, you can

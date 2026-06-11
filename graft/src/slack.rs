@@ -38,10 +38,21 @@ const DEFAULT_RODATA_LEN: u32 = 64 * 1024;
 // common churn with room to spare; bumpable via env if a fixture
 // needs more.
 const DEFAULT_DATA_LEN: u32 = 4 * 1024;
+// In-template TLS slack for thread-locals an overlay defines or
+// re-emits (changed initializer). Deliberately tiny: every thread
+// copies the template's filesz bytes at spawn, so this is a per-thread
+// RAM cost. Bumpable via GRAFT_TLS_SLACK_LEN.
+const DEFAULT_TLS_LEN: u32 = 64;
+// TLS slack alignment — also a floor for the section's contribution
+// to PT_TLS p_align. New thread-locals needing more than this trip
+// the overlay's PT_TLS geometry check (loudly) rather than silently
+// shifting every TP offset.
+pub const TLS_SLACK_ALIGN: u64 = 16;
 
 pub const TEXT_SYMBOL: &str = "GRAFT_TEXT_SLACK";
 pub const RODATA_SYMBOL: &str = "GRAFT_RODATA_SLACK";
 pub const DATA_SYMBOL: &str = "GRAFT_DATA_SLACK";
+pub const TLS_SYMBOL: &str = "GRAFT_TLS_SLACK";
 
 /// Validate the `GRAFT_OVERLAY_MODE` env var. Splice is the only overlay
 /// layout strategy now: overlay's `.text` / `.rodata` are placed at
@@ -74,6 +85,7 @@ pub struct SlackParams {
     pub text_len: u32,
     pub rodata_len: u32,
     pub data_len: u32,
+    pub tls_len: u32,
 }
 
 impl SlackParams {
@@ -82,6 +94,7 @@ impl SlackParams {
             text_len: env_u32("GRAFT_TEXT_SLACK_LEN")?.unwrap_or(DEFAULT_TEXT_LEN),
             rodata_len: env_u32("GRAFT_RODATA_SLACK_LEN")?.unwrap_or(DEFAULT_RODATA_LEN),
             data_len: env_u32("GRAFT_DATA_SLACK_LEN")?.unwrap_or(DEFAULT_DATA_LEN),
+            tls_len: env_u32("GRAFT_TLS_SLACK_LEN")?.unwrap_or(DEFAULT_TLS_LEN),
         })
     }
 }
@@ -181,6 +194,36 @@ pub fn synthesize(architecture: Architecture, params: &SlackParams) -> Result<Ve
         section: SymbolSection::Section(data_id),
         flags: SymbolFlags::None,
     });
+
+    // In-template TLS slack. Lands inside base's `.tdata` output via the
+    // standard `*(.tdata .tdata.*)` wildcard, i.e. *inside the PT_TLS
+    // template and inside its filesz* — both load-bearing: TP offsets
+    // are end-anchored (variant 2), so the template can never grow at
+    // combine time; slack must be reserved here, at base link, so
+    // base's own offsets are computed with it present. filesz placement
+    // gives splice file bytes to write initializers of overlay-defined
+    // thread-locals into. ZERO-filled (not 0xFF like the other slacks):
+    // these bytes are the per-thread initial image of whatever lands
+    // there, and zero keeps un-spliced zero-init thread-locals correct
+    // without any splice write.
+    if params.tls_len > 0 {
+        let tls_id = obj.add_section(
+            Vec::new(),
+            b".tdata.graft_slack".to_vec(),
+            SectionKind::Tls,
+        );
+        obj.set_section_data(tls_id, vec![0u8; params.tls_len as usize], TLS_SLACK_ALIGN);
+        obj.add_symbol(Symbol {
+            name: TLS_SYMBOL.as_bytes().to_vec(),
+            value: 0,
+            size: u64::from(params.tls_len),
+            kind: SymbolKind::Tls,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(tls_id),
+            flags: SymbolFlags::None,
+        });
+    }
 
     obj.write().context("emit synthetic slack ELF")
 }
