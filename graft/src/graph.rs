@@ -6,7 +6,7 @@
 //! they're tracked per-section so the hash pass can fold them in as
 //! sentinel hashes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::elf::{ParsedObject, SymbolBind};
 use object::elf::SHF_ALLOC;
@@ -15,26 +15,60 @@ pub type NodeId = u32;
 
 /// Identifies a symbol across all objects. Globals key on `name`; locals
 /// on `(name, tu_id)` because the same mangled local-symbol name can
-/// appear in multiple TUs.
+/// appear in multiple TUs. Values carry `(defining node, st_value)` —
+/// the symbol's section-relative offset, which positional resolution
+/// adds to the node's recovered base address.
 #[derive(Debug, Default)]
 pub struct SymbolIndex {
-    globals: HashMap<String, NodeId>,
-    locals: HashMap<(String, [u8; 8]), NodeId>,
+    globals: HashMap<String, (NodeId, u64)>,
+    locals: HashMap<(String, [u8; 8]), (NodeId, u64)>,
+    /// First-write-wins across TUs — fallback for STB_LOCAL names
+    /// referenced from a different TU than the defining one (rust
+    /// internal-linkage symbols accessed cross-CGU). Safe because
+    /// identical content → identical trans_hash → an interchangeable
+    /// copy.
+    locals_any_tu: HashMap<String, (NodeId, u64)>,
 }
 
 impl SymbolIndex {
-    pub fn resolve_global(&self, name: &str) -> Option<NodeId> {
+    pub fn resolve_global(&self, name: &str) -> Option<(NodeId, u64)> {
         self.globals.get(name).copied()
     }
-    pub fn resolve_local(&self, name: &str, tu_id: [u8; 8]) -> Option<NodeId> {
+    pub fn resolve_local(&self, name: &str, tu_id: [u8; 8]) -> Option<(NodeId, u64)> {
         self.locals.get(&(name.to_string(), tu_id)).copied()
     }
+    pub fn resolve_local_any_tu(&self, name: &str) -> Option<(NodeId, u64)> {
+        self.locals_any_tu.get(name).copied()
+    }
+    /// One unified resolution order for *every* consumer (edge building,
+    /// reloc disposition): global → local-in-TU → local-any-TU. A single
+    /// code path means hashing and resolution cannot disagree about what
+    /// a name refers to.
+    pub fn resolve(&self, name: &str, tu_id: [u8; 8]) -> Option<(NodeId, u64)> {
+        self.resolve_global(name)
+            .or_else(|| self.resolve_local(name, tu_id))
+            .or_else(|| self.resolve_local_any_tu(name))
+    }
     pub fn globals_iter(&self) -> impl Iterator<Item = (&String, NodeId)> {
-        self.globals.iter().map(|(n, &v)| (n, v))
+        self.globals.iter().map(|(n, &(v, _))| (n, v))
     }
-    pub fn locals_iter(&self) -> impl Iterator<Item = (&String, [u8; 8], NodeId)> {
-        self.locals.iter().map(|((n, t), &v)| (n, *t, v))
-    }
+}
+
+/// Where one relocation points, resolved once at scan time and reused
+/// by every downstream consumer (hash canonicalization sees the same
+/// world via `ContentResolver`; prune receives dispositions derived
+/// from these). See `docs/14-identity-granularity.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedTarget {
+    /// Symbol-targeted reloc: the defining node plus the symbol's
+    /// section-relative value (the `S` in `S + A`).
+    Symbol { nid: NodeId, value: u64 },
+    /// Section-targeted reloc (`<section:…>`): the section's node (the
+    /// first per-string node for SHF_MERGE pools); the reloc's addend
+    /// carries the in-section offset.
+    Section { nid: NodeId },
+    /// Not defined by any scan input (crt/script/ROM/prebuilt names).
+    External,
 }
 
 #[derive(Debug)]
@@ -52,6 +86,12 @@ pub struct Graph {
     /// node. The hash pass folds these in as `[0u8; 16]` sentinels.
     pub external_edge_counts: Vec<u32>,
     pub symbols: SymbolIndex,
+    /// Per-section reloc resolutions: `(object, section) → (reloc
+    /// offset, r_type) → target`. Wrap renaming (`--wrap`) is already
+    /// applied. Overlay derives prune's reloc dispositions from this —
+    /// the same resolution that built `edges` — so inclusion (closure)
+    /// and resolution can't drift.
+    pub reloc_targets: HashMap<(u32, u32), HashMap<(u64, u32), ResolvedTarget>>,
 }
 
 /// A LogicalNode is the unit of inclusion: closure, hashing, and SCC
@@ -86,6 +126,8 @@ pub struct DefinedSymbol {
     /// section (carries the defining object's `tu_id` for STB_LOCAL
     /// disambiguation). `None` for synthesized bracket symbols.
     pub tu_id: Option<[u8; 8]>,
+    /// Section-relative st_value (0 for synthesized bracket symbols).
+    pub value: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -145,7 +187,16 @@ impl NodeMeta {
 /// entry instead has different bytes, which `bytes_hash`/`mih` already
 /// capture, so the cut hides nothing real. See
 /// `docs/14-identity-granularity.md`.
-pub fn build(objects: &[ParsedObject], entry_symbol: Option<&str>) -> Graph {
+///
+/// `wrapped` is the `--wrap=<sym>` set: a reloc to `<sym>` is resolved
+/// as `__wrap_<sym>` — both for edges (the semantic dependency is on
+/// the wrapper's content) and for the recorded `reloc_targets`, exactly
+/// as ld redirects the reference at link time.
+pub fn build(
+    objects: &[ParsedObject],
+    entry_symbol: Option<&str>,
+    wrapped: &HashSet<String>,
+) -> Graph {
     // First, classify each allocated input section into one of three
     // shapes:
     //   - Aggregator contributor (`.init_array.NN`, etc.): folded into
@@ -259,6 +310,7 @@ pub fn build(objects: &[ParsedObject], entry_symbol: Option<&str>) -> Graph {
                 name: (*name).to_string(),
                 bind: SymbolBind::Global,
                 tu_id: None,
+                value: 0,
             })
             .collect();
         nodes.push(NodeMeta {
@@ -289,6 +341,7 @@ pub fn build(objects: &[ParsedObject], entry_symbol: Option<&str>) -> Graph {
                 name: sym.name.clone(),
                 bind: sym.bind,
                 tu_id: Some(obj.tu_id),
+                value: sym.value,
             });
         }
     }
@@ -341,77 +394,97 @@ pub fn build(objects: &[ParsedObject], entry_symbol: Option<&str>) -> Graph {
                     let new_h = bytes_hash_of[nid as usize];
                     match symbols.globals.entry(sym.name.clone()) {
                         std::collections::hash_map::Entry::Vacant(v) => {
-                            v.insert(nid);
+                            v.insert((nid, sym.value));
                         }
                         std::collections::hash_map::Entry::Occupied(mut o) => {
-                            let existing = *o.get();
+                            let existing = o.get().0;
                             let existing_h = bytes_hash_of[existing as usize];
                             if new_h < existing_h {
-                                o.insert(nid);
+                                o.insert((nid, sym.value));
                             }
                         }
                     }
                 }
                 SymbolBind::Local => {
                     let tu_id = sym.tu_id.expect("local symbol must carry tu_id");
-                    symbols.locals.insert((sym.name.clone(), tu_id), nid);
+                    symbols
+                        .locals
+                        .insert((sym.name.clone(), tu_id), (nid, sym.value));
+                    symbols
+                        .locals_any_tu
+                        .entry(sym.name.clone())
+                        .or_insert((nid, sym.value));
                 }
             }
         }
     }
 
-    // Per-object section-name → local section index. Used to resolve
-    // `<section:...>` reloc targets (STT_SECTION / RelocationTarget::
-    // Section) to the right NodeId within the same .o.
-    let section_by_name_per_obj: Vec<HashMap<&str, u32>> = objects
-        .iter()
-        .map(|obj| {
-            obj.sections
-                .iter()
-                .enumerate()
-                .map(|(i, s)| (s.name.as_str(), i as u32))
-                .collect()
-        })
-        .collect();
-
     // The trampoline target node (if the entry symbol resolves). Edges
     // into it are cut to external sentinels below.
-    let entry_node = entry_symbol.and_then(|n| symbols.resolve_global(n));
+    let entry_node = entry_symbol.and_then(|n| symbols.resolve_global(n)).map(|(n, _)| n);
 
-    // Edges + external counts. Outgoing edges come from each segment's
-    // relocs; aggregator nodes naturally accumulate edges from all
-    // contributor segments because their (obj, sec) → NodeId mappings
-    // all point at the aggregator.
+    // Edges + external counts + per-reloc resolutions. Outgoing edges
+    // come from each segment's relocs; aggregator nodes naturally
+    // accumulate edges from all contributor segments because their
+    // (obj, sec) → NodeId mappings all point at the aggregator. Every
+    // reloc's resolution is also RECORDED (`reloc_targets`) so prune's
+    // dispositions derive from the exact same answer the hash graph
+    // used — resolve once, consume everywhere.
     let mut edges: Vec<Vec<NodeId>> = vec![Vec::new(); nodes.len()];
     let mut external_counts: Vec<u32> = vec![0; nodes.len()];
+    let mut reloc_targets: HashMap<(u32, u32), HashMap<(u64, u32), ResolvedTarget>> =
+        HashMap::new();
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
             let Some(&nid) = node_of.get(&(oi as u32, si as u32)) else {
                 continue; // section was filtered (non-allocated)
             };
+            let mut recorded: HashMap<(u64, u32), ResolvedTarget> = HashMap::new();
             for r in &sec.relocs {
-                // STT_SECTION / direct-section targets are encoded as
-                // `<section:name>` by elf::parse. Resolve those within
-                // the current object's sections; everything else goes
-                // through the flat symbol index. A target that resolves
-                // to a filtered section becomes an external sentinel.
-                let target = if let Some(sec_name) = strip_section_marker(&r.target) {
-                    section_by_name_per_obj[oi].get(sec_name).and_then(|&s_i| {
-                        let key = (oi as u32, s_i);
-                        if let Some(strings) = string_pool_strings.get(&key) {
-                            // String-pool ref: pick the per-string
-                            // node whose range contains the addend.
-                            find_string_node(strings, &string_node_of, key, r.addend as u32)
-                        } else {
-                            node_of.get(&key).copied()
-                        }
-                    })
+                // Section-target relocs carry the physical target index
+                // (`target_section`) — section names legally repeat
+                // within one object, so resolution must NOT go through
+                // names. Symbol targets go through the flat symbol
+                // index (with `--wrap` renaming applied — ld redirects
+                // the reference, so both the semantic dependency and
+                // the resolution are on the wrapper). A target in a
+                // filtered (non-alloc) section becomes an external
+                // sentinel.
+                let (resolved, edge_target) = if let Some(si0) = r.target_section {
+                    let key = (oi as u32, si0);
+                    // Edge precision: a string-pool ref depends on the
+                    // specific string the addend lands in. The recorded
+                    // Section target keeps the section's first node —
+                    // the disposition path anchors at the section's
+                    // recovered base with the addend riding along.
+                    let edge = if let Some(strings) = string_pool_strings.get(&key) {
+                        find_string_node(strings, &string_node_of, key, r.addend as u32)
+                    } else {
+                        node_of.get(&key).copied()
+                    };
+                    match node_of.get(&key) {
+                        Some(&sec_nid) => (ResolvedTarget::Section { nid: sec_nid }, edge),
+                        None => (ResolvedTarget::External, None),
+                    }
+                } else if r.target.starts_with("<section:") {
+                    // Section ref whose physical index parse() couldn't
+                    // determine — nothing to resolve against.
+                    (ResolvedTarget::External, None)
                 } else {
-                    symbols
-                        .resolve_global(&r.target)
-                        .or_else(|| symbols.resolve_local(&r.target, obj.tu_id))
+                    let wrap_name;
+                    let lookup: &str = if wrapped.contains(&r.target) {
+                        wrap_name = format!("__wrap_{}", r.target);
+                        &wrap_name
+                    } else {
+                        &r.target
+                    };
+                    match symbols.resolve(lookup, obj.tu_id) {
+                        Some((t, value)) => (ResolvedTarget::Symbol { nid: t, value }, Some(t)),
+                        None => (ResolvedTarget::External, None),
+                    }
                 };
-                match target {
+                recorded.insert((r.offset, r.r_type), resolved);
+                match edge_target {
                     Some(t) if t == nid => {
                         // self-edge — ignored for SCC; section already
                         // depends on itself trivially via its own bytes.
@@ -427,6 +500,9 @@ pub fn build(objects: &[ParsedObject], entry_symbol: Option<&str>) -> Graph {
                     None => external_counts[nid as usize] += 1,
                 }
             }
+            if !recorded.is_empty() {
+                reloc_targets.insert((oi as u32, si as u32), recorded);
+            }
             // Dedup outgoing edges — multiple relocs to the same target
             // section shouldn't multiply-contribute to the hash input.
             edges[nid as usize].sort();
@@ -439,6 +515,7 @@ pub fn build(objects: &[ParsedObject], entry_symbol: Option<&str>) -> Graph {
         edges,
         external_edge_counts: external_counts,
         symbols,
+        reloc_targets,
     }
 }
 
@@ -559,10 +636,6 @@ pub fn tarjan_scc(graph: &Graph) -> SccResult {
     SccResult { scc_of_node, members }
 }
 
-fn strip_section_marker(s: &str) -> Option<&str> {
-    s.strip_prefix("<section:").and_then(|t| t.strip_suffix('>'))
-}
-
 pub struct SccResult {
     pub scc_of_node: Vec<u32>,
     /// SCCs in reverse-topological order: `members[0]` is a leaf of the
@@ -583,6 +656,7 @@ mod tests {
             external_edge_counts: vec![0; edges.len()],
             edges,
             symbols: SymbolIndex::default(),
+            reloc_targets: HashMap::new(),
         }
     }
 

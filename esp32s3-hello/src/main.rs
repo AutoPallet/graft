@@ -24,6 +24,17 @@ static ATOMIC_TICK: AtomicU32 = AtomicU32::new(0);
 // (3) Read-only static — a constant table.
 static GREETING_TABLE: [&str; 3] = ["Hello", "Howdy", "Hola"];
 
+// The greeting index comes from the GREETING_IDX env var at compile
+// time (default 0 = "Hello"). The hardware loop's overlay edit is just
+// `GREETING_IDX=1` — no source mutation; cargo tracks the env through
+// rustc's dep-info, so the change reliably triggers a rebuild.
+const GREETING_IDX: usize = match option_env!("GREETING_IDX") {
+    // (str equality isn't const-stable on the esp toolchain; first
+    // digit's byte value works the same.)
+    Some(s) => (s.as_bytes()[0] - b'0') as usize % GREETING_TABLE.len(),
+    None => 0,
+};
+
 // (4) RAM-tagged code (IRAM-resident). `#[link_section = ".rwtext"]`
 // places the function in IRAM (loaded from flash to RAM at boot)
 // instead of XIP'd from flash. Useful for ISRs that must run with
@@ -53,7 +64,17 @@ fn main() -> ! {
 #[unsafe(no_mangle)]
 #[inline(never)]
 fn graft_entry() -> ! {
+    // GE probes: one-time boot prints that bisect exactly how far the
+    // (possibly overlaid) entry gets — printer/lock health (GE1),
+    // Delay construction (GE2), the IRAM call (GE3), the rodata table
+    // load (GE4). The hardware loop asserts on them.
+    println!("GE1: entered overlay graft_entry");
     let delay = Delay::new();
+    println!("GE2: delay created");
+    let ram_tick0 = ram_resident_step(41);
+    println!("GE3: ram_resident_step ok = {ram_tick0}");
+    let greeting0 = GREETING_TABLE[GREETING_IDX];
+    println!("GE4: greeting load ok = {greeting0}");
     loop {
         let mut_tick = unsafe {
             TICK_COUNTER = TICK_COUNTER.wrapping_add(1);
@@ -61,7 +82,7 @@ fn graft_entry() -> ! {
         };
         let atomic_tick = ATOMIC_TICK.fetch_add(1, Ordering::Relaxed) + 1;
         let ram_tick = ram_resident_step(mut_tick);
-        let greeting = GREETING_TABLE[0];
+        let greeting = GREETING_TABLE[GREETING_IDX];
         println!(
             "{greeting} from ESP32-S3! mut={mut_tick} atomic={atomic_tick} ram={ram_tick}"
         );

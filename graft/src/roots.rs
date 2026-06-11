@@ -117,7 +117,7 @@ pub fn find_roots(
 
     // (1) Entry symbol.
     let entry = base.manifest.entry_symbol.as_str();
-    if let Some(nid) = scan.graph.symbols.resolve_global(entry) {
+    if let Some((nid, _)) = scan.graph.symbols.resolve_global(entry) {
         roots.insert(nid);
     }
     // Note: it's valid for the entry to not resolve in overlay's inputs
@@ -126,7 +126,7 @@ pub fn find_roots(
 
     // (2) -u / --undefined from argv.
     for sym in &link_args.undefined {
-        if let Some(nid) = scan.graph.symbols.resolve_global(sym) {
+        if let Some((nid, _)) = scan.graph.symbols.resolve_global(sym) {
             roots.insert(nid);
         }
     }

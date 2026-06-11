@@ -10,9 +10,11 @@ use serde::{Deserialize, Serialize};
 
 pub const GRAFT_MAGIC: [u8; 4] = *b"GRFT";
 // v4: trans_hash domain gained the nominal salt for non-content-
-// addressable (mutable/byte-less) sections — v3 tables would silently
-// mismatch every salted hash, so bases must be rebuilt.
-pub const SCHEMA_VERSION: u16 = 4;
+// addressable (mutable/byte-less) sections.
+// v5: edge resolution unified with reloc disposition — edges now apply
+// `--wrap` renaming and the cross-TU local fallback, changing the hash
+// domain again. Each bump makes stale bases fail loud.
+pub const SCHEMA_VERSION: u16 = 5;
 
 pub const SECTION_MANIFEST: &str = ".graft.manifest";
 pub const SECTION_SECTIONS: &str = ".graft.sections";

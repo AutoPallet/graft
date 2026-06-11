@@ -195,7 +195,8 @@ pub fn run<P: AsRef<Path>>(
         }
     }
 
-    let graph = graph::build(&objects, entry_symbol);
+    let wrap_names: HashSet<String> = wrapped.iter().cloned().collect();
+    let graph = graph::build(&objects, entry_symbol, &wrap_names);
     let scc = graph::tarjan_scc(&graph);
     let trans_hash = hash::compute(&objects, &graph, &scc);
 

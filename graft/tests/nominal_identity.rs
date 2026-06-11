@@ -59,7 +59,7 @@ fn defining_symbol(name: &str, section: usize, value: u64) -> SymbolInfo {
 
 fn trans_hashes(obj: ParsedObject) -> Vec<hash::TransHash> {
     let objects = vec![obj];
-    let g = graph::build(&objects, None);
+    let g = graph::build(&objects, None, &Default::default());
     let scc = graph::tarjan_scc(&g);
     hash::compute(&objects, &g, &scc)
 }
@@ -138,7 +138,7 @@ fn scc_members_get_distinct_trans_hashes() {
     // bug that resolved `ram_resident_step` into the middle of the
     // literal pool. Each member's hash must mix in its own content.
     use graft::elf::CanonicalReloc;
-    let mk_text = |name: &str, bytes: &[u8], target: &str| SectionInfo {
+    let mk_text = |name: &str, bytes: &[u8], target: (u32, &str)| SectionInfo {
         name: name.into(),
         kind: SectionKind::Text,
         alloc: true,
@@ -146,20 +146,21 @@ fn scc_members_get_distinct_trans_hashes() {
         bytes: bytes.to_vec(),
         relocs: vec![CanonicalReloc {
             offset: 0,
-            target: format!("<section:{target}>"),
+            target: format!("<section:{}>", target.1),
             r_type: 1,
             addend: 0,
+            target_section: Some(target.0),
         }],
     };
     let obj = obj_with_sections(
         vec![
-            mk_text(".text.code", &[0x90, 0x90, 0x90, 0x90], ".text.pool"),
-            mk_text(".text.pool", &[0x00, 0x00, 0x00, 0x00], ".text.code"),
+            mk_text(".text.code", &[0x90, 0x90, 0x90, 0x90], (1, ".text.pool")),
+            mk_text(".text.pool", &[0x00, 0x00, 0x00, 0x00], (0, ".text.code")),
         ],
         vec![],
     );
     let objects = vec![obj];
-    let g = graph::build(&objects, None);
+    let g = graph::build(&objects, None, &Default::default());
     let scc = graph::tarjan_scc(&g);
     assert_eq!(
         scc.members.len(),

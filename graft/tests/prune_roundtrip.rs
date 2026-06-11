@@ -2,11 +2,11 @@
 //! e2e/x86 fixture's built objects; self-skips if the fixture hasn't been
 //! built yet.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
-use graft::hash::TransHash;
 use graft::prune;
+use graft::resolve::{RelocDisposition, RelocQuery};
 
 fn fixture_deps() -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -22,38 +22,10 @@ fn first_rcgu_o(dir: &std::path::Path) -> Option<PathBuf> {
     })
 }
 
-/// Empty resolver tables — every reference is unresolvable, which is what
-/// these shape tests want (keep-all has no cross-section base refs;
-/// keep-none is allowed to error cleanly).
-#[derive(Default)]
-struct Tables {
-    by_section: HashMap<TransHash, u64>,
-    ambiguous_sections: HashSet<TransHash>,
-    globals: HashMap<String, (TransHash, u64)>,
-    locals: HashMap<(String, [u8; 8]), (TransHash, u64)>,
-    locals_any_tu: HashMap<String, (TransHash, u64)>,
-    wrapped: HashSet<String>,
-    base_symtab: HashMap<String, u64>,
-    base_symtab_ambiguous: HashSet<String>,
-    closure_trans_hashes: HashSet<TransHash>,
-    mutable_trans_hashes: HashSet<TransHash>,
-}
-
-impl Tables {
-    fn resolver(&self) -> prune::BaseResolver<'_> {
-        prune::BaseResolver {
-            by_section: &self.by_section,
-            ambiguous_sections: &self.ambiguous_sections,
-            overlay_globals: &self.globals,
-            overlay_locals: &self.locals,
-            overlay_locals_any_tu: &self.locals_any_tu,
-            wrapped: &self.wrapped,
-            base_symtab: &self.base_symtab,
-            base_symtab_ambiguous: &self.base_symtab_ambiguous,
-            closure_trans_hashes: &self.closure_trans_hashes,
-            mutable_trans_hashes: &self.mutable_trans_hashes,
-        }
-    }
+/// Shape tests don't care where external refs land — anchor them all at
+/// a fixed dummy address.
+fn dummy_dispose(_q: &RelocQuery<'_>) -> anyhow::Result<RelocDisposition> {
+    Ok(RelocDisposition::Anchor { vaddr: 0x1000, verify_name: None })
 }
 
 #[test]
@@ -78,9 +50,7 @@ fn prune_keep_all_preserves_shape() {
         keep.insert(idx0);
     }
 
-    let t = Tables::default();
-    let sec_ths: HashMap<u32, TransHash> = HashMap::new();
-    let result = prune::prune_object(&bytes, [0; 8], &keep, &t.resolver(), &sec_ths)
+    let result = prune::prune_object(&bytes, &keep, &dummy_dispose)
         .unwrap_or_else(|e| panic!("prune {}: {e:#}", path.display()));
     // Re-parse.
     let _ = object::File::parse(&*result.bytes)
@@ -102,20 +72,17 @@ fn prune_keep_none_still_parses() {
 
     // Drop every section.
     let keep: HashSet<u32> = HashSet::new();
-    let t = Tables::default();
-    let sec_ths: HashMap<u32, TransHash> = HashMap::new();
-    let result = prune::prune_object(&bytes, [0xAB; 8], &keep, &t.resolver(), &sec_ths)
-        .unwrap_or_else(|e| {
-            // If there are relocs into sections we dropped, we expect an error.
-            // That's OK — just make sure we fail cleanly, not panic.
-            eprintln!("(expected) keep-none errored: {e:#}");
-            prune::Pruned {
-                bytes: Vec::new(),
-                kept_sections: 0,
-                abs_rewrites: 0,
-                assumed_names: Vec::new(),
-            }
-        });
+    let result = prune::prune_object(&bytes, &keep, &dummy_dispose).unwrap_or_else(|e| {
+        // If there are relocs into sections we dropped, we expect an error.
+        // That's OK — just make sure we fail cleanly, not panic.
+        eprintln!("(expected) keep-none errored: {e:#}");
+        prune::Pruned {
+            bytes: Vec::new(),
+            kept_sections: 0,
+            abs_rewrites: 0,
+            assumed_names: Vec::new(),
+        }
+    });
     if !result.bytes.is_empty() {
         let _ = object::File::parse(&*result.bytes).unwrap();
     }

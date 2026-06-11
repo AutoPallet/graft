@@ -102,6 +102,15 @@ pub struct CanonicalReloc {
     pub target: String,
     pub r_type: u32,
     pub addend: i64,
+    /// For section-target relocs: the target's 0-based section index.
+    /// Section NAMES legally repeat within one object (the esp32s3
+    /// rcgu carries two `.rwtext` inputs), so name-keyed lookup can
+    /// pick the wrong section — the index is the physical truth and
+    /// is what edge building and reloc resolution key on.
+    /// `hash::encode_relocs` clears this before hashing (indexes shift
+    /// under CGU repartition; the canonicalized `target` fingerprint
+    /// is the hash-stable identity).
+    pub target_section: Option<u32>,
 }
 
 pub fn parse(bytes: &[u8]) -> Result<ParsedObject> {
@@ -182,30 +191,33 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedObject> {
             };
             // Skip R_*_NONE — they're padding/annotation, no runtime effect.
             if r_type == R_X86_64_NONE { continue; }
-            let target_name = match r.target() {
+            // 1-based object::read index → our 0-based section index,
+            // with name kept for the hash-stable canonical form.
+            let section_target = |s_i: usize| -> Result<(String, Option<u32>)> {
+                let sec = obj.section_by_index(SectionIndex(s_i))
+                    .map_err(|e| anyhow::anyhow!("reloc target section: {e}"))?;
+                Ok((
+                    format!("<section:{}>", sec.name().unwrap_or("")),
+                    Some(s_i.saturating_sub(1) as u32),
+                ))
+            };
+            let (target_name, target_section) = match r.target() {
                 RelocationTarget::Symbol(sidx) => {
                     let sym = obj.symbol_by_index(sidx)
                         .map_err(|e| anyhow::anyhow!("resolve reloc target {sidx:?}: {e}"))?;
                     if matches!(sym.kind(), SymbolKind::Section) {
-                        // STT_SECTION: the symbol's name is empty; use the section's name.
+                        // STT_SECTION: the symbol's name is empty; key
+                        // on its defining section.
                         match sym.section_index() {
-                            Some(SectionIndex(s_i)) => {
-                                let sec = obj.section_by_index(SectionIndex(s_i))
-                                    .map_err(|e| anyhow::anyhow!("reloc target section: {e}"))?;
-                                format!("<section:{}>", sec.name().unwrap_or(""))
-                            }
-                            None => "<section:?>".into(),
+                            Some(SectionIndex(s_i)) => section_target(s_i)?,
+                            None => ("<section:?>".into(), None),
                         }
                     } else {
-                        sym.name().unwrap_or("").to_string()
+                        (sym.name().unwrap_or("").to_string(), None)
                     }
                 }
-                RelocationTarget::Section(SectionIndex(s_i)) => {
-                    let sec = obj.section_by_index(SectionIndex(s_i))
-                        .map_err(|e| anyhow::anyhow!("reloc target section: {e}"))?;
-                    format!("<section:{}>", sec.name().unwrap_or(""))
-                }
-                RelocationTarget::Absolute => "<absolute>".into(),
+                RelocationTarget::Section(SectionIndex(s_i)) => section_target(s_i)?,
+                RelocationTarget::Absolute => ("<absolute>".into(), None),
                 other => bail!("unsupported reloc target: {other:?}"),
             };
             relocs.push(CanonicalReloc {
@@ -213,6 +225,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedObject> {
                 target: target_name,
                 r_type,
                 addend: r.addend(),
+                target_section,
             });
         }
         relocs.sort();

@@ -17,6 +17,7 @@ pub mod mapcheck;
 pub mod metadata;
 pub mod overlay;
 pub mod prune;
+pub mod resolve;
 pub mod roots;
 pub mod scan;
 pub mod slack;

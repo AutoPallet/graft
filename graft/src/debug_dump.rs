@@ -162,9 +162,15 @@ pub fn dump_graph(path: &Path, scan: &ScanResult) -> std::io::Result<()> {
                     .relocs
                     .iter()
                     .map(|r| {
-                        let (target, addend) = resolver
-                            .canonicalize_target_with_addend(&r.target, r.addend, seg.object, obj.tu_id);
-                        crate::elf::CanonicalReloc { offset: r.offset, target, r_type: r.r_type, addend }
+                        let (target, addend) =
+                            resolver.canonicalize_reloc(r, seg.object, obj.tu_id);
+                        crate::elf::CanonicalReloc {
+                            offset: r.offset,
+                            target,
+                            r_type: r.r_type,
+                            addend,
+                            target_section: None,
+                        }
                     })
                     .collect();
                 postcard::to_allocvec(&rebuilt).unwrap_or_default()
