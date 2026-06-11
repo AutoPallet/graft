@@ -93,10 +93,16 @@ instruction bytes (mov→lea, etc.), step back and check whether
 content-keyed per-target symbols would handle it uniformly without
 any byte patching. They usually do.
 
-## prune's resolution channels are ordered for a reason
+## The resolution channels are ordered for a reason
 
-`prune_object`'s reloc resolution is a cascade. The ordering is load-
-bearing, not cosmetic:
+Reloc resolution is a cascade, and it lives in ONE place:
+`resolve::Resolver::dispose` (prune is a dumb rewriter that only wires
+intra-object internal targets and emits what dispose tells it). The
+scan records every reloc's resolution once (`graph.reloc_targets`);
+hashing edges, the closure walk, and disposition all consume that same
+answer — never re-resolve a name elsewhere, that's how "classify vs
+resolve disagree" bugs happen. The ordering is load-bearing, not
+cosmetic:
 
 1. overlay saw it AND its node's trans_hash is in the closure → UND
    (ld resolves to overlay's re-emitted copy).
@@ -187,3 +193,16 @@ refactor uncommitted, a stray `git stash` wiped every in-flight
 change mid-session (recovered via `git stash pop`). Never put git
 state commands in container scripts; run them deliberately on the
 host only.
+
+## Section names are not unique within an object
+
+The esp32s3 rcgu carries TWO `.rwtext` input sections; ELF allows any
+number of same-named sections per object. Any name-keyed lookup of a
+section ((obj, name) → index/hash/node) silently picks an arbitrary
+one — the resolve-once refactor's first cut did this and anchored
+`ram_resident_step`'s literal into the wrong `.rwtext` (caught by the
+hardware loop, now also impossible per `CanonicalReloc::target_section`).
+Section identity within an object is the PHYSICAL INDEX; names are for
+diagnostics. The index is cleared before hashing (indexes shift under
+CGU repartition) — the canonicalized content fingerprint is the
+hash-stable identity.

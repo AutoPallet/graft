@@ -219,7 +219,43 @@ members of one cycle map to distinct table entries with well-defined
 addresses. After this, "ambiguous" really does mean byte-identical
 interchangeable copies.
 
-## Status (2026-06-10, rev 4 — hardware-validated)
+## Resolve once (rev 5)
+
+The scan resolves every reloc exactly once (`graph::build` records
+`reloc_targets`, with `--wrap` renaming and the cross-TU local fallback
+applied) and one cascade — `resolve::Resolver::dispose` — turns those
+resolutions into prune emissions. Prune is a dumb rewriter: it wires
+intra-object internal targets (only it sees the object's symbol
+indexes) and emits what dispose says. Hash edges, the closure walk, and
+disposition consume the SAME resolution, structurally eliminating the
+"classify vs resolve disagree" bug class. Channel 1 is node-keyed (a
+content twin in the closure can't fool it).
+
+Corollary fixed on the way (hardware caught it): section NAMES repeat
+within one object (two `.rwtext`s in the esp32s3 rcgu), so any
+name-keyed section lookup picks an arbitrary copy. `CanonicalReloc`
+now carries the physical `target_section` index and every consumer
+keys on it; the index is cleared before hashing (it shifts under CGU
+repartition) — the canonical content fingerprint remains the
+hash-stable identity. Schema v5.
+
+## Base-time invariant checks
+
+- **STB_LOCAL unanimity**: a node's locals are ground truth (ld never
+  cross-resolves them); any disagreement on the back-computed section
+  base fails the base build with per-symbol evidence.
+- **`-Map` oracle** (`GRAFT_MAP_ORACLE=1`, on in the e2e suite and the
+  hardware loop): base asks ld for its map and verifies every
+  recovered per-node address against it; mismatch fails the base
+  build. First run caught the TLS bug (st_value is a TLS-template
+  offset, not a vaddr) — TLS sections are now excluded from the table
+  and a positional ref to one bails.
+- **e2e shape coverage** (x86, no hardware): mutable-static aliasing
+  (scenario F), section-cycle resolution (G), entry-cut /
+  caller-not-re-emitted (`entry_cut_keeps_caller_in_base`), plus the
+  unit-level pins in `nominal_identity.rs` (salt, SCC distinctness).
+
+## Status (2026-06-10, rev 5 — hardware-validated)
 
 Implemented and validated end to end: x86 `e2e_cycle` (full cycle + all
 five payload edits), `prune_channels` (19 tests incl. the
