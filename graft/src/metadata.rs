@@ -18,7 +18,12 @@ pub const GRAFT_MAGIC: [u8; 4] = *b"GRFT";
 // PT_TLS.p_vaddr + offset) and base reserves GRAFT_TLS_SLACK inside
 // its template. A v5 base has neither: TLS refs would mis-resolve and
 // TLS re-emission would have nowhere to land.
-pub const SCHEMA_VERSION: u16 = 6;
+// v7: SHF_MERGE sections (.rodata.cstN) split into per-entry nodes
+// like string pools — changes the node set, edges, and hash domain.
+// Also: GRAFT_DATA_SLACK is zero-filled (re-emitted .bss lands there
+// and must read zero; a 0xFF-filled v6 data slack would silently
+// corrupt overlay statics).
+pub const SCHEMA_VERSION: u16 = 7;
 
 pub const SECTION_MANIFEST: &str = ".graft.manifest";
 pub const SECTION_SECTIONS: &str = ".graft.sections";

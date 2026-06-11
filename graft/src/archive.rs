@@ -65,38 +65,59 @@ pub struct CollectResult {
 /// Eagerly scan loose `.o` and `.rlib` paths into parsed inputs.
 /// `.a` archives go through `open_deferred` instead — see module docs.
 /// Non-object-bearing paths are silently skipped.
-pub fn collect_eager<P: AsRef<Path>>(paths: &[P]) -> Result<CollectResult> {
-    let mut result = CollectResult::default();
-    for p in paths {
-        let p = p.as_ref();
-        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
-        match ext {
-            "o" => {
-                let bytes = std::fs::read(p).with_context(|| format!("read {}", p.display()))?;
-                result.inputs.push(ObjectInput {
-                    source_path: p.to_path_buf(),
-                    member_name: None,
-                    bytes,
-                });
-            }
-            "rlib" => {
-                let bytes = std::fs::read(p).with_context(|| format!("read {}", p.display()))?;
-                if !is_ar_magic(&bytes) {
-                    // An `.rlib` is always an `ar` archive. A non-archive
-                    // here means a truncated / corrupt artifact — skipping
-                    // it would silently drop a whole crate's objects from
-                    // the scan and produce a wrong closure. Fail loud.
-                    anyhow::bail!(
-                        "{}: .rlib is not an `ar` archive (truncated or corrupt?)",
-                        p.display()
-                    );
+pub fn collect_eager<P: AsRef<Path> + Sync>(paths: &[P]) -> Result<CollectResult> {
+    use rayon::prelude::*;
+    // Per-path collection fans out across cores (file reads + ar
+    // member extraction are a top scan cost at rust-analyzer scale).
+    // Results are concatenated IN INPUT ORDER below — ld's
+    // left-to-right input semantics must be preserved exactly.
+    let per_path: Vec<(Vec<ObjectInput>, Option<PathBuf>)> = paths
+        .par_iter()
+        .map(|p| {
+            let p = p.as_ref();
+            let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
+            match ext {
+                "o" => {
+                    let bytes =
+                        std::fs::read(p).with_context(|| format!("read {}", p.display()))?;
+                    Ok((
+                        vec![ObjectInput {
+                            source_path: p.to_path_buf(),
+                            member_name: None,
+                            bytes,
+                        }],
+                        None,
+                    ))
                 }
-                scan_archive_bytes(p, &bytes, &mut result.inputs)
-                    .with_context(|| format!("scan archive {}", p.display()))?;
-                let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-                result.walked_archives.insert(canon);
+                "rlib" => {
+                    let bytes =
+                        std::fs::read(p).with_context(|| format!("read {}", p.display()))?;
+                    if !is_ar_magic(&bytes) {
+                        // An `.rlib` is always an `ar` archive. A non-archive
+                        // here means a truncated / corrupt artifact — skipping
+                        // it would silently drop a whole crate's objects from
+                        // the scan and produce a wrong closure. Fail loud.
+                        anyhow::bail!(
+                            "{}: .rlib is not an `ar` archive (truncated or corrupt?)",
+                            p.display()
+                        );
+                    }
+                    let mut inputs = Vec::new();
+                    scan_archive_bytes(p, &bytes, &mut inputs)
+                        .with_context(|| format!("scan archive {}", p.display()))?;
+                    let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                    Ok((inputs, Some(canon)))
+                }
+                _ => Ok((Vec::new(), None)),
             }
-            _ => {}
+        })
+        .collect::<Result<_>>()?;
+
+    let mut result = CollectResult::default();
+    for (inputs, walked) in per_path {
+        result.inputs.extend(inputs);
+        if let Some(canon) = walked {
+            result.walked_archives.insert(canon);
         }
     }
     Ok(result)

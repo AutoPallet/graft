@@ -32,6 +32,12 @@ pub struct SectionInfo {
     /// Raw ELF `sh_flags`. Used by root-finding to detect SHF_GNU_RETAIN
     /// (`R` flag) and anything else ld treats as "always keep."
     pub sh_flags: u64,
+    /// Raw ELF `sh_entsize`. For SHF_MERGE sections this is the merge
+    /// unit: ld deduplicates and reorders *entries* of this size across
+    /// all inputs (`.rodata.cst8/16/32`), exactly like it does
+    /// NUL-terminated strings for SHF_MERGE|SHF_STRINGS pools. The
+    /// graph splits such sections into per-entry nodes.
+    pub sh_entsize: u64,
     /// Section contents, or empty for NOBITS sections (.bss).
     pub bytes: Vec<u8>,
     /// Forward relocations from this section, canonicalized and sorted by
@@ -173,16 +179,41 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedObject> {
             ObjSectionKind::UninitializedData => SectionKind::Bss,
             _ => SectionKind::Other,
         };
-        let bytes = match sec.data() {
-            Ok(d) => d.to_vec(),
-            Err(_) => Vec::new(),
-        };
         let sh_flags = match sec.flags() {
             SectionFlags::Elf { sh_flags } => sh_flags,
             _ => 0,
         };
+        let sh_entsize = elf_entsize(&obj, sec.index());
 
-        // Canonical relocs.
+        // Sections without SHF_ALLOC (debug info, notes, …) keep their
+        // *slot* in the section vec — indexes must stay stable for
+        // `defining_section` / `keep`-set arithmetic — but carry no
+        // bytes and no relocs: the graph builds nodes only from
+        // SHF_ALLOC sections (its predicate is sh_flags, NOT the
+        // kind-derived `alloc` field — `.fini_array`/`.eh_frame` are
+        // allocatable by flags but not by kind), and prune re-reads
+        // the raw object. In dev-profile builds debug sections
+        // dominate byte volume by an order of magnitude (rust-analyzer
+        // scan: multi-GB of copies and most of the
+        // reloc-canonicalization time).
+        if sh_flags & u64::from(object::elf::SHF_ALLOC) == 0 {
+            sections.push(SectionInfo {
+                name,
+                kind,
+                alloc,
+                sh_flags,
+                sh_entsize,
+                bytes: Vec::new(),
+                relocs: Vec::new(),
+            });
+            continue;
+        }
+        let bytes = match sec.data() {
+            Ok(d) => d.to_vec(),
+            Err(_) => Vec::new(),
+        };
+
+        // Canonical relocs (SHF_ALLOC sections only — see above).
         let mut relocs: Vec<CanonicalReloc> = Vec::new();
         for (offset, r) in sec.relocations() {
             let r_type = match r.flags() {
@@ -236,12 +267,32 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedObject> {
             kind,
             alloc,
             sh_flags,
+            sh_entsize,
             bytes,
             relocs,
         });
     }
 
     Ok(ParsedObject { tu_id, tu_name, sections, symbols })
+}
+
+/// `sh_entsize` for a section — the generic `object::Section` API
+/// doesn't expose it, so go through the class-specific section table.
+fn elf_entsize(obj: &object::File<'_>, idx: SectionIndex) -> u64 {
+    use object::read::elf::SectionHeader as _;
+    match obj {
+        object::File::Elf32(f) => f
+            .elf_section_table()
+            .section(idx)
+            .map(|h| u64::from(h.sh_entsize(f.endian())))
+            .unwrap_or(0),
+        object::File::Elf64(f) => f
+            .elf_section_table()
+            .section(idx)
+            .map(|h| h.sh_entsize(f.endian()))
+            .unwrap_or(0),
+        _ => 0,
+    }
 }
 
 fn classify_bind<'data, 'file>(sym: &object::Symbol<'data, 'file, &'data [u8]>) -> SymbolBind {

@@ -7,6 +7,7 @@
 //! sentinel hashes.
 
 use std::collections::{HashMap, HashSet};
+use rustc_hash::FxHashMap;
 
 use crate::elf::{ParsedObject, SymbolBind};
 use object::elf::SHF_ALLOC;
@@ -20,14 +21,14 @@ pub type NodeId = u32;
 /// adds to the node's recovered base address.
 #[derive(Debug, Default)]
 pub struct SymbolIndex {
-    globals: HashMap<String, (NodeId, u64)>,
-    locals: HashMap<(String, [u8; 8]), (NodeId, u64)>,
+    globals: FxHashMap<String, (NodeId, u64)>,
+    locals: FxHashMap<(String, [u8; 8]), (NodeId, u64)>,
     /// First-write-wins across TUs — fallback for STB_LOCAL names
     /// referenced from a different TU than the defining one (rust
     /// internal-linkage symbols accessed cross-CGU). Safe because
     /// identical content → identical trans_hash → an interchangeable
     /// copy.
-    locals_any_tu: HashMap<String, (NodeId, u64)>,
+    locals_any_tu: FxHashMap<String, (NodeId, u64)>,
 }
 
 impl SymbolIndex {
@@ -225,14 +226,35 @@ pub fn build(
                 }
             }
             if is_contributor { continue; }
-            // String-pool classification: SHF_MERGE | SHF_STRINGS.
-            // Assume sh_entsize = 1 (NUL-terminated byte strings); this
-            // is universally true for rust-emitted `.rodata.str1.1`.
+            // Merge-pool classification. ld deduplicates and reorders
+            // these at *entry* granularity across all inputs, so a
+            // whole-section identity (and a whole-section base address)
+            // doesn't exist post-link — the map oracle caught
+            // `.rodata.cstN` sections "recovered" at one symbol's idea
+            // of the base while the map disagreed. Split into one node
+            // per entry, mirroring the merge unit ld actually uses:
+            //   - SHF_MERGE|SHF_STRINGS → NUL-terminated strings
+            //     (sh_entsize = 1, universally true for rust-emitted
+            //     `.rodata.str1.1`).
+            //   - SHF_MERGE alone → fixed sh_entsize chunks
+            //     (`.rodata.cst8/16/32`). Sections whose size isn't a
+            //     multiple of the entsize are treated as ordinary —
+            //     ld refuses to merge those too.
             if sec.sh_flags & (SHF_MERGE | SHF_STRINGS) == (SHF_MERGE | SHF_STRINGS) {
                 let strings = split_nul_terminated(&sec.bytes);
                 if !strings.is_empty() {
                     string_pool_strings.insert((oi as u32, si as u32), strings);
                 }
+            } else if sec.sh_flags & u64::from(SHF_MERGE) != 0
+                && sec.sh_entsize > 0
+                && !sec.bytes.is_empty()
+                && sec.bytes.len() as u64 % sec.sh_entsize == 0
+            {
+                let n = sec.sh_entsize as u32;
+                let entries: Vec<(u32, u32)> = (0..sec.bytes.len() as u32 / n)
+                    .map(|i| (i * n, n))
+                    .collect();
+                string_pool_strings.insert((oi as u32, si as u32), entries);
             }
         }
     }

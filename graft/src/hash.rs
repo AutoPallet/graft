@@ -76,9 +76,10 @@ fn node_identity_hashes_with(
     objects: &[ParsedObject],
     salts: &HashMap<(u32, u32), Vec<u8>>,
 ) -> Vec<blake3::Hash> {
+    use rayon::prelude::*;
     graph
         .nodes
-        .iter()
+        .par_iter()
         .map(|nm| {
             let mut h = blake3::Hasher::new();
             for seg in &nm.segments {
@@ -162,9 +163,11 @@ pub fn compute(
     let identity_hashes = node_identity_hashes_with(graph, objects, &salts);
     let resolver = ContentResolver::build(objects, graph, &identity_hashes);
 
-    let member_input_hash: Vec<blake3::Hash> = graph
+    let member_input_hash: Vec<blake3::Hash> = {
+        use rayon::prelude::*;
+        graph
         .nodes
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(_nid, nm)| {
             let mut h = blake3::Hasher::new();
@@ -187,7 +190,8 @@ pub fn compute(
             }
             h.finalize()
         })
-        .collect();
+        .collect()
+    };
 
     // Per-SCC trans_hash, in topological order (leaves first).
     let mut scc_hash: Vec<TransHash> = vec![[0u8; 16]; scc.members.len()];

@@ -644,11 +644,12 @@ fn write_empty_relocatable_for(path: &Path, e_machine: u16) -> Result<()> {
 /// Splice-mode layout for non-xtensa hosted targets (x86_64 today).
 /// Places overlay's `.text*` at the slack `.text` vaddr, overlay's
 /// `.rodata*` / `.data.rel.ro*` at the slack `.rodata` vaddr,
-/// re-emitted `.tdata`/`.tbss` in the in-template TLS slack hole, and
-/// every base-map section at the base address span it mirrors.
-/// Discards any other alloc sections — splice mode covers only the
-/// slack-reserved regions, so anything else (`.data`, `.bss`,
-/// `.eh_frame_hdr`, …) must come from base. ASSERTs guard against
+/// re-emitted `.data*`/`.bss*` at the slack `.data` vaddr (zero-filled
+/// at base link — NOBITS `.bss` gets no splice write and reads the
+/// fill as its initial value), re-emitted `.tdata`/`.tbss` in the
+/// in-template TLS slack hole, and every base-map section at the base
+/// address span it mirrors. Unwind/metadata sections are discarded
+/// (overlay unwind is a known deferred gap). ASSERTs guard against
 /// silent slack overflow at link time.
 ///
 /// All placements are emitted in ascending address order: ld refuses
@@ -676,6 +677,18 @@ fn write_overlay_layout_ld_splice(
              .data.rel.ro : {{ *(.data.rel.ro .data.rel.ro.* .data.rel.ro..L*) }}\n  \
              _graft_rodata_end = .;\n",
             slack.rodata_start
+        ),
+    ));
+    // Re-emitted mutable statics land in the data slack. `.data`
+    // (PROGBITS) splices its initializer bytes; `.bss` (NOBITS, placed
+    // after — file-offset rules) gets no splice write and reads the
+    // slack's own zero fill as its initial value.
+    stanzas.push((
+        slack.data_start,
+        format!(
+            "  . = {:#x};\n  .data : {{ *(.data .data.*) }}\n  \
+             .bss : {{ *(.bss .bss.* COMMON) }}\n  _graft_data_end = .;\n",
+            slack.data_start
         ),
     ));
     if let Some(t) = tls {
@@ -706,13 +719,19 @@ fn write_overlay_layout_ld_splice(
     }
     script.push_str(
         "  /DISCARD/ : { *(.eh_frame .eh_frame_hdr .gcc_except_table* \
-         .data .data.* .bss .bss.* COMMON .note.* .comment .gnu_debuglink) }\n}\n",
+         .note.* .comment .gnu_debuglink) }\n}\n",
     );
     use std::fmt::Write as _;
     let _ = writeln!(
         script,
         "ASSERT(_graft_text_end <= {:#x}, \"overlay .text overflows GRAFT_TEXT_SLACK\")",
         slack.text_start + slack.text_len
+    );
+    let _ = writeln!(
+        script,
+        "ASSERT(_graft_data_end <= {:#x}, \"overlay .data/.bss overflows GRAFT_DATA_SLACK \
+         (bump GRAFT_DATA_SLACK_LEN and rebuild base)\")",
+        slack.data_start + slack.data_len
     );
     let _ = writeln!(
         script,
@@ -1000,7 +1019,31 @@ fn run_real_linker(
             cmd.arg(&p.path);
         }
     }
-    let status = cmd.status().with_context(|| format!("exec {real}"))?;
+
+    // The accumulated argv (forwarded rustc args + pruned inputs +
+    // per-anchor `--undefined=` flags) exceeds the OS arg limit on
+    // large closures (rust-analyzer deep edit: E2BIG). Hand everything
+    // to the driver via a response file — gcc expands `@file` itself,
+    // with backslash escaping inside double quotes.
+    let rsp_path = output.with_extension("link-args.rsp");
+    let mut rsp = String::new();
+    for a in cmd.get_args() {
+        let s = a.to_string_lossy();
+        rsp.push('"');
+        for ch in s.chars() {
+            if ch == '"' || ch == '\\' {
+                rsp.push('\\');
+            }
+            rsp.push(ch);
+        }
+        rsp.push_str("\"\n");
+    }
+    std::fs::write(&rsp_path, &rsp)
+        .with_context(|| format!("write {}", rsp_path.display()))?;
+    let status = Command::new(&real)
+        .arg(format!("@{}", rsp_path.display()))
+        .status()
+        .with_context(|| format!("exec {real}"))?;
     Ok(status)
 }
 

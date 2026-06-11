@@ -318,6 +318,16 @@ fn build_section_table(
             // reference to one anchors inside the SHF_TLS map sections
             // and ld recomputes the TP offset from the identical
             // template geometry. See docs/15 mechanism (c).
+            //
+            // SHF_MERGE sections never vote: ld deduplicates/reorders
+            // their *entries* across inputs, so `final − st_value` is
+            // valid only for the one entry carrying the symbol and is
+            // NOT the section's base (the map oracle caught salsa's
+            // `.rodata.cstN` recovered this way). Their per-entry
+            // nodes resolve by re-emission, never positionally.
+            if obj.sections[sec_idx].sh_flags & u64::from(object::elf::SHF_MERGE) != 0 {
+                continue;
+            }
             let Some(&nid) = node_of.get(&(obj_idx as u32, sec_idx as u32)) else { continue };
             let (key_tu, is_local) = match sym.bind {
                 SymbolBind::Global | SymbolBind::Weak => (None, false),

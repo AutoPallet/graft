@@ -18,6 +18,8 @@ ar = "0.9"
 blake3.workspace = true
 object.workspace = true
 postcard.workspace = true
+rayon = "1.12.0"
+rustc-hash = "2.1.2"
 serde.workspace = true
 
 [dev-dependencies]

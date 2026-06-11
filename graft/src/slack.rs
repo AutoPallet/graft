@@ -153,16 +153,18 @@ pub fn synthesize(architecture: Architecture, params: &SlackParams) -> Result<Ve
     // `.data` later splices into the slack vaddr; the only cost vs
     // an unloaded section is N bytes of flash plus N bytes of RAM
     // permanently reserved.
+    //
+    // ZERO-filled, unlike text/rodata (0xFF for NOR-flash delta
+    // friendliness): re-emitted `.bss` sections are placed in this
+    // region too, and NOBITS content gets no splice write — the
+    // slack's own bytes ARE the statics' initial values, which must
+    // read zero.
     let data_id = obj.add_section(
         Vec::new(),
         b".data.graft_slack".to_vec(),
         SectionKind::Data,
     );
-    obj.set_section_data(
-        data_id,
-        vec![SLACK_FILL_BYTE; params.data_len as usize],
-        4,
-    );
+    obj.set_section_data(data_id, vec![0u8; params.data_len as usize], 4);
 
     obj.add_symbol(Symbol {
         name: TEXT_SYMBOL.as_bytes().to_vec(),

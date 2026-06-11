@@ -30,6 +30,7 @@ fn bss_section(name: &str) -> SectionInfo {
         kind: SectionKind::Bss,
         alloc: true,
         sh_flags: u64::from(SHF_ALLOC | SHF_WRITE),
+        sh_entsize: 0,
         bytes: Vec::new(), // NOBITS: no bytes
         relocs: Vec::new(),
     }
@@ -41,6 +42,7 @@ fn rodata_section(name: &str, bytes: &[u8]) -> SectionInfo {
         kind: SectionKind::Rodata,
         alloc: true,
         sh_flags: u64::from(SHF_ALLOC),
+        sh_entsize: 0,
         bytes: bytes.to_vec(),
         relocs: Vec::new(),
     }
@@ -143,6 +145,7 @@ fn scc_members_get_distinct_trans_hashes() {
         kind: SectionKind::Text,
         alloc: true,
         sh_flags: u64::from(SHF_ALLOC | SHF_EXECINSTR),
+        sh_entsize: 0,
         bytes: bytes.to_vec(),
         relocs: vec![CanonicalReloc {
             offset: 0,
@@ -185,6 +188,7 @@ fn ram_resident_code_stays_content_addressable() {
         kind: SectionKind::Text,
         alloc: true,
         sh_flags: u64::from(SHF_ALLOC | SHF_WRITE | SHF_EXECINSTR),
+        sh_entsize: 0,
         bytes: vec![0x90; 16],
         relocs: Vec::new(),
     };
@@ -193,4 +197,49 @@ fn ram_resident_code_stays_content_addressable() {
     assert!(rodata_section(".rodata.c", b"hi").content_addressable());
     // Zero-size sections are byte-degenerate too.
     assert!(!rodata_section(".rodata.empty", b"").content_addressable());
+}
+
+#[test]
+fn merge_cst_sections_split_per_entry() {
+    // `.rodata.cstN` (SHF_MERGE, fixed entsize): ld deduplicates and
+    // reorders *entries* across all inputs, so a whole-section identity
+    // (and a whole-section base address) doesn't exist post-link — the
+    // rust-analyzer map oracle caught salsa's cst sections "recovered"
+    // at one symbol's idea of the base while the map disagreed. The
+    // graph must split them per entry, like string pools.
+    use object::elf::SHF_MERGE;
+    let sec = SectionInfo {
+        name: ".rodata.cst8".into(),
+        kind: SectionKind::Rodata,
+        alloc: true,
+        sh_flags: u64::from(SHF_ALLOC | SHF_MERGE),
+        sh_entsize: 8,
+        bytes: vec![1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0],
+        relocs: Vec::new(),
+    };
+    let objects = vec![obj_with_sections(vec![sec], vec![])];
+    let g = graph::build(&objects, None, &Default::default());
+    assert_eq!(g.nodes.len(), 2, "two 8-byte entries → two per-entry nodes");
+    let scc = graph::tarjan_scc(&g);
+    let ths = hash::compute(&objects, &g, &scc);
+    assert_ne!(ths[0], ths[1], "entries carry their own content identity");
+}
+
+#[test]
+fn merge_section_with_ragged_size_stays_whole() {
+    // Size not a multiple of entsize → ld won't merge it either;
+    // treat as an ordinary whole-section node.
+    use object::elf::SHF_MERGE;
+    let sec = SectionInfo {
+        name: ".rodata.cst8".into(),
+        kind: SectionKind::Rodata,
+        alloc: true,
+        sh_flags: u64::from(SHF_ALLOC | SHF_MERGE),
+        sh_entsize: 8,
+        bytes: vec![0u8; 12],
+        relocs: Vec::new(),
+    };
+    let objects = vec![obj_with_sections(vec![sec], vec![])];
+    let g = graph::build(&objects, None, &Default::default());
+    assert_eq!(g.nodes.len(), 1, "ragged merge section stays one node");
 }

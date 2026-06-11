@@ -47,7 +47,7 @@ pub struct ScanResult {
 /// (otherwise base.elf's `__wrap_<sym>` would be missing from our
 /// scan/symhash machinery and prune would fail to resolve refs to
 /// wrap targets).
-pub fn run<P: AsRef<Path>>(
+pub fn run<P: AsRef<Path> + Sync>(
     eager_paths: &[P],
     deferred_paths: &[P],
     extra_roots: &[String],
@@ -58,18 +58,29 @@ pub fn run<P: AsRef<Path>>(
     // the same name for their trans_hashes to match.
     entry_symbol: Option<&str>,
 ) -> Result<ScanResult> {
+    // Optional phase-timing dump (GRAFT_SCAN_TIMINGS=<path>) — rustc
+    // swallows linker stderr on success, so a file is the only way to
+    // see this from a cargo build.
+    let t0 = std::time::Instant::now();
+    let mut marks: Vec<(&'static str, std::time::Duration)> = Vec::new();
+
     let collected = archive::collect_eager(eager_paths)?;
     let mut inputs = collected.inputs;
     let mut walked_archives = collected.walked_archives;
+    marks.push(("collect_eager", t0.elapsed()));
 
-    // Parse the eager objects.
+    // Parse the eager objects — the scan's dominant cost at scale
+    // (rust-analyzer: ~6.5k rlib members), and each parse is
+    // independent: fan out across cores.
+    use rayon::prelude::*;
     let mut objects: Vec<ParsedObject> = inputs
-        .iter()
+        .par_iter()
         .map(|inp| {
             elf::parse(&inp.bytes)
                 .map_err(|e| anyhow::anyhow!("{}: {e}", inp.label()))
         })
         .collect::<Result<_>>()?;
+    marks.push(("parse_eager", t0.elapsed()));
 
     // Open each deferred archive once. Read its symbol-index into
     // `symbol_index`: name → (archive_idx, member_offset). First
@@ -195,10 +206,26 @@ pub fn run<P: AsRef<Path>>(
         }
     }
 
+    marks.push(("parse+demand", t0.elapsed()));
     let wrap_names: HashSet<String> = wrapped.iter().cloned().collect();
     let graph = graph::build(&objects, entry_symbol, &wrap_names);
+    marks.push(("graph_build", t0.elapsed()));
     let scc = graph::tarjan_scc(&graph);
+    marks.push(("tarjan", t0.elapsed()));
     let trans_hash = hash::compute(&objects, &graph, &scc);
+    marks.push(("hash_compute", t0.elapsed()));
+    if let Ok(p) = std::env::var("GRAFT_SCAN_TIMINGS")
+        && !p.is_empty()
+    {
+        let mut s = String::new();
+        let mut prev = std::time::Duration::ZERO;
+        for (name, at) in &marks {
+            use std::fmt::Write as _;
+            let _ = writeln!(s, "{name}: {:?} (cum {:?})", *at - prev, at);
+            prev = *at;
+        }
+        let _ = std::fs::write(&p, s);
+    }
 
     Ok(ScanResult {
         inputs,
