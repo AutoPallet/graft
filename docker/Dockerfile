@@ -35,6 +35,11 @@ ENV LIBCLANG_PATH="/home/esp/.rustup/toolchains/esp/xtensa-esp32-elf-clang/esp-2
 # pre-installed binary.
 RUN cargo install --locked --force espflash@4.4.0
 
+# uv runs the self-contained Python tooling (docker/flash-diff.py
+# declares its own deps inline; nothing touches the system python).
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/home/esp/.local/bin:${PATH}"
+
 # Make /workspace writable by esp.
 USER root
 RUN mkdir -p /workspace && chown esp:esp /workspace
