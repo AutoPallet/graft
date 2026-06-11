@@ -630,6 +630,25 @@ pub struct PtTls {
     pub align: u64,
 }
 
+/// A linked-ELF symtab value as a virtual address. STT_TLS symbols
+/// carry template-relative offsets (see [`PtTls`]); everything else
+/// already carries a vaddr. `None` for a TLS symbol in an ELF without
+/// PT_TLS — there is no template to be relative to, so the value is
+/// meaningless and the caller must skip the symbol. Every consumer of
+/// final symtab addresses goes through here; treating a TLS st_value
+/// as an address directly is the bug the map oracle caught twice.
+pub fn symbol_vaddr(
+    kind: object::SymbolKind,
+    st_value: u64,
+    tls_vaddr: Option<u64>,
+) -> Option<u64> {
+    if matches!(kind, object::SymbolKind::Tls) {
+        tls_vaddr.map(|tv| tv + st_value)
+    } else {
+        Some(st_value)
+    }
+}
+
 /// Read the PT_TLS program header from a linked ELF, if present.
 pub fn pt_tls(elf_bytes: &[u8]) -> Result<Option<PtTls>> {
     let class = ElfClass::from_bytes(elf_bytes)?;

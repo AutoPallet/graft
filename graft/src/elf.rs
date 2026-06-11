@@ -28,7 +28,6 @@ pub struct ParsedObject {
 pub struct SectionInfo {
     pub name: String,
     pub kind: SectionKind,
-    pub alloc: bool,
     /// Raw ELF `sh_flags`. Used by root-finding to detect SHF_GNU_RETAIN
     /// (`R` flag) and anything else ld treats as "always keep."
     pub sh_flags: u64,
@@ -168,10 +167,6 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedObject> {
     let mut sections: Vec<SectionInfo> = Vec::new();
     for sec in obj.sections() {
         let name = sec.name().unwrap_or("").to_string();
-        let alloc = matches!(sec.kind(),
-            ObjSectionKind::Text | ObjSectionKind::Data | ObjSectionKind::ReadOnlyData
-            | ObjSectionKind::UninitializedData | ObjSectionKind::ReadOnlyString
-            | ObjSectionKind::Tls | ObjSectionKind::UninitializedTls);
         let kind = match sec.kind() {
             ObjSectionKind::Text => SectionKind::Text,
             ObjSectionKind::Data => SectionKind::Data,
@@ -189,18 +184,16 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedObject> {
         // *slot* in the section vec — indexes must stay stable for
         // `defining_section` / `keep`-set arithmetic — but carry no
         // bytes and no relocs: the graph builds nodes only from
-        // SHF_ALLOC sections (its predicate is sh_flags, NOT the
-        // kind-derived `alloc` field — `.fini_array`/`.eh_frame` are
-        // allocatable by flags but not by kind), and prune re-reads
-        // the raw object. In dev-profile builds debug sections
-        // dominate byte volume by an order of magnitude (rust-analyzer
-        // scan: multi-GB of copies and most of the
-        // reloc-canonicalization time).
+        // SHF_ALLOC sections (the predicate is sh_flags; a kind-derived
+        // notion of "allocatable" disagrees on `.fini_array`/`.eh_frame`
+        // and once broke crtbegin.o), and prune re-reads the raw
+        // object. In dev-profile builds debug sections dominate byte
+        // volume by an order of magnitude (rust-analyzer scan: multi-GB
+        // of copies and most of the reloc-canonicalization time).
         if sh_flags & u64::from(object::elf::SHF_ALLOC) == 0 {
             sections.push(SectionInfo {
                 name,
                 kind,
-                alloc,
                 sh_flags,
                 sh_entsize,
                 bytes: Vec::new(),
@@ -265,7 +258,6 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedObject> {
         sections.push(SectionInfo {
             name,
             kind,
-            alloc,
             sh_flags,
             sh_entsize,
             bytes,

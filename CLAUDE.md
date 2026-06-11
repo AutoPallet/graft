@@ -169,6 +169,17 @@ the retired design (it never worked on xtensa — one IROM/DROM segment
 only — and carried the trickiest ELF surgery in the tree). Reserve
 more slack instead.
 
+Slack only works if the target's linker script *scoops* the slack
+input sections via wildcards (`*(.text.*)` etc.). A script with no
+matching rule makes ld orphan-place the section — it lands wherever ld
+guesses and can silently change segment layout: esp-hal's linkall.x
+has no `*(.tdata*)` rule, so the TLS slack joined the IROM LOAD,
+flipped it writable, and the ESP ROM bootloader crash-looped (no
+link-time symptom; found on hardware). `check_slack_scooped` in
+base.rs now fails the build on any orphaned `*.graft_slack` output
+section; bare-metal targets without a TLS runtime opt out via
+`GRAFT_TLS_SLACK_LEN=0` (the esp32s3-hello fixture does).
+
 ## Content identity is only sound for immutable content
 
 Two byte-identical sections are interchangeable ONLY if they're

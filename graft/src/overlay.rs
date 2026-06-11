@@ -193,13 +193,7 @@ fn run(argv: Vec<String>) -> Result<()> {
         .collect();
     anchors.sort_unstable();
     anchors.dedup();
-    let closure_has_tls = closure.closure.iter().any(|&nid| {
-        scan.graph.nodes[nid as usize].segments.iter().any(|seg| {
-            scan.objects[seg.object as usize].sections[seg.section as usize].sh_flags
-                & u64::from(object::elf::SHF_TLS)
-                != 0
-        })
-    });
+    let closure_has_tls = closure.closure.iter().any(|nid| tls_nids.contains(nid));
     let need_tls_maps = closure_has_tls || anchors.iter().any(|&(_, tls)| tls);
     let tls_spec = if need_tls_maps {
         let Some(t) = base.tls else {
@@ -785,11 +779,10 @@ fn verify_assumed_names(overlay_bytes: &[u8], assumed: &HashMap<String, u64>) ->
         if name.is_empty() {
             continue;
         }
-        let addr = if matches!(sym.kind(), object::SymbolKind::Tls) {
-            let Some(tv) = overlay_tls_vaddr else { continue };
-            tv + sym.address()
-        } else {
-            sym.address()
+        let Some(addr) =
+            crate::combine::symbol_vaddr(sym.kind(), sym.address(), overlay_tls_vaddr)
+        else {
+            continue;
         };
         // First-write-wins: overlay symtab can repeat names across
         // graft anchors and real defs; the real def comes from the
@@ -1138,14 +1131,12 @@ fn load_base_metadata(path: &std::path::Path) -> Result<BaseMetadata> {
         ) {
             continue;
         }
-        // TLS symbols carry template-relative offsets; translate to
-        // template vaddrs so they live in the same address space as
-        // everything else (mirrors build_section_table).
-        let addr = if matches!(sym.kind(), object::SymbolKind::Tls) {
-            let Some(t) = tls else { continue };
-            t.vaddr + sym.address()
-        } else {
-            sym.address()
+        // TLS values translate to template vaddrs — same address space
+        // as the section table (mirrors build_section_table).
+        let Some(addr) =
+            crate::combine::symbol_vaddr(sym.kind(), sym.address(), tls.map(|t| t.vaddr))
+        else {
+            continue;
         };
         match by_name.entry(name.to_string()) {
             std::collections::hash_map::Entry::Vacant(v) => {

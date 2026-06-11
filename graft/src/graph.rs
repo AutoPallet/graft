@@ -211,7 +211,7 @@ pub fn build(
     //   - Ordinary: one LogicalNode per section.
     let mut contributor_to_agg: HashMap<(u32, u32), &'static crate::synthetic::Aggregator> =
         HashMap::new();
-    let mut string_pool_strings: HashMap<(u32, u32), Vec<(u32, u32)>> = HashMap::new();
+    let mut merge_pool_entries: HashMap<(u32, u32), Vec<(u32, u32)>> = HashMap::new();
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
             if sec.sh_flags & u64::from(SHF_ALLOC) == 0 { continue; }
@@ -243,7 +243,7 @@ pub fn build(
             if sec.sh_flags & (SHF_MERGE | SHF_STRINGS) == (SHF_MERGE | SHF_STRINGS) {
                 let strings = split_nul_terminated(&sec.bytes);
                 if !strings.is_empty() {
-                    string_pool_strings.insert((oi as u32, si as u32), strings);
+                    merge_pool_entries.insert((oi as u32, si as u32), strings);
                 }
             } else if sec.sh_flags & u64::from(SHF_MERGE) != 0
                 && sec.sh_entsize > 0
@@ -254,7 +254,7 @@ pub fn build(
                 let entries: Vec<(u32, u32)> = (0..sec.bytes.len() as u32 / n)
                     .map(|i| (i * n, n))
                     .collect();
-                string_pool_strings.insert((oi as u32, si as u32), entries);
+                merge_pool_entries.insert((oi as u32, si as u32), entries);
             }
         }
     }
@@ -278,7 +278,7 @@ pub fn build(
         for (si, sec) in obj.sections.iter().enumerate() {
             if sec.sh_flags & u64::from(SHF_ALLOC) == 0 { continue; }
             if contributor_to_agg.contains_key(&(oi as u32, si as u32)) { continue; }
-            if let Some(strings) = string_pool_strings.get(&(oi as u32, si as u32)) {
+            if let Some(strings) = merge_pool_entries.get(&(oi as u32, si as u32)) {
                 // One LogicalNode per string. All share the same
                 // underlying section but with distinct sub-ranges.
                 let mut first_nid: Option<NodeId> = None;
@@ -353,8 +353,8 @@ pub fn build(
             let Some(sec_idx) = sym.defining_section else { continue };
             if sym.name.is_empty() { continue; }
             let key = (oi as u32, sec_idx as u32);
-            let nid_opt = if let Some(strings) = string_pool_strings.get(&key) {
-                find_string_node(strings, &string_node_of, key, sym.value as u32)
+            let nid_opt = if let Some(entries) = merge_pool_entries.get(&key) {
+                find_pool_entry_node(entries, &string_node_of, key, sym.value as u32)
             } else {
                 node_of.get(&key).copied()
             };
@@ -479,8 +479,8 @@ pub fn build(
                     // Section target keeps the section's first node —
                     // the disposition path anchors at the section's
                     // recovered base with the addend riding along.
-                    let edge = if let Some(strings) = string_pool_strings.get(&key) {
-                        find_string_node(strings, &string_node_of, key, r.addend as u32)
+                    let edge = if let Some(entries) = merge_pool_entries.get(&key) {
+                        find_pool_entry_node(entries, &string_node_of, key, r.addend as u32)
                     } else {
                         node_of.get(&key).copied()
                     };
@@ -563,23 +563,22 @@ fn split_nul_terminated(bytes: &[u8]) -> Vec<(u32, u32)> {
     out
 }
 
-/// Look up the per-string LogicalNode whose byte range contains
-/// `addend` within the (object, section) string pool. `strings` is the
-/// list of (offset, len) tuples emitted by `split_nul_terminated`,
-/// sorted by offset (which is the natural traversal order). Falls back
-/// to `None` if `addend` lies past the last string (shouldn't happen
-/// for well-formed input).
-fn find_string_node(
-    strings: &[(u32, u32)],
+/// Look up the per-entry LogicalNode whose byte range contains `addend`
+/// within an (object, section) merge pool. `entries` is the list of
+/// (offset, len) tuples — NUL-terminated strings or fixed-entsize cst
+/// chunks — sorted by offset. Falls back to `None` if `addend` lies
+/// past the last entry (shouldn't happen for well-formed input).
+fn find_pool_entry_node(
+    entries: &[(u32, u32)],
     string_node_of: &HashMap<(u32, u32, u32), NodeId>,
     key: (u32, u32),
     addend: u32,
 ) -> Option<NodeId> {
-    // Strings are emitted in offset-ascending order; binary-search by
-    // the largest offset ≤ addend.
-    let idx = strings.partition_point(|&(off, _)| off <= addend);
+    // Entries are offset-ascending; binary-search by the largest
+    // offset ≤ addend.
+    let idx = entries.partition_point(|&(off, _)| off <= addend);
     if idx == 0 { return None; }
-    let (off, len) = strings[idx - 1];
+    let (off, len) = entries[idx - 1];
     if addend >= off + len { return None; }
     string_node_of.get(&(key.0, key.1, off)).copied()
 }

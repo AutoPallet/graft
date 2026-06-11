@@ -28,7 +28,6 @@ fn bss_section(name: &str) -> SectionInfo {
     SectionInfo {
         name: name.into(),
         kind: SectionKind::Bss,
-        alloc: true,
         sh_flags: u64::from(SHF_ALLOC | SHF_WRITE),
         sh_entsize: 0,
         bytes: Vec::new(), // NOBITS: no bytes
@@ -40,7 +39,6 @@ fn rodata_section(name: &str, bytes: &[u8]) -> SectionInfo {
     SectionInfo {
         name: name.into(),
         kind: SectionKind::Rodata,
-        alloc: true,
         sh_flags: u64::from(SHF_ALLOC),
         sh_entsize: 0,
         bytes: bytes.to_vec(),
@@ -143,7 +141,6 @@ fn scc_members_get_distinct_trans_hashes() {
     let mk_text = |name: &str, bytes: &[u8], target: (u32, &str)| SectionInfo {
         name: name.into(),
         kind: SectionKind::Text,
-        alloc: true,
         sh_flags: u64::from(SHF_ALLOC | SHF_EXECINSTR),
         sh_entsize: 0,
         bytes: bytes.to_vec(),
@@ -186,7 +183,6 @@ fn ram_resident_code_stays_content_addressable() {
     let sec = SectionInfo {
         name: ".rwtext".into(),
         kind: SectionKind::Text,
-        alloc: true,
         sh_flags: u64::from(SHF_ALLOC | SHF_WRITE | SHF_EXECINSTR),
         sh_entsize: 0,
         bytes: vec![0x90; 16],
@@ -211,7 +207,6 @@ fn merge_cst_sections_split_per_entry() {
     let sec = SectionInfo {
         name: ".rodata.cst8".into(),
         kind: SectionKind::Rodata,
-        alloc: true,
         sh_flags: u64::from(SHF_ALLOC | SHF_MERGE),
         sh_entsize: 8,
         bytes: vec![1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0],
@@ -233,7 +228,6 @@ fn merge_section_with_ragged_size_stays_whole() {
     let sec = SectionInfo {
         name: ".rodata.cst8".into(),
         kind: SectionKind::Rodata,
-        alloc: true,
         sh_flags: u64::from(SHF_ALLOC | SHF_MERGE),
         sh_entsize: 8,
         bytes: vec![0u8; 12],

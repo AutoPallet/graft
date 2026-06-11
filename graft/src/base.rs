@@ -112,6 +112,7 @@ fn run(argv: Vec<String>) -> Result<()> {
 
     let t_post = std::time::Instant::now();
     let elf_bytes = std::fs::read(&output).with_context(|| format!("read {}", output.display()))?;
+    check_slack_scooped(&elf_bytes)?;
     if let Ok(p) = std::env::var("GRAFT_DEBUG_DUMP_GRAPH")
         && !p.is_empty()
     {
@@ -193,6 +194,38 @@ fn inject_slack(
     Ok(argv)
 }
 
+/// The slack sections only work if the target's linker script scoops
+/// them into base's normal output sections via wildcards (`*(.text.*)`
+/// etc. — see `slack.rs` module docs). A script with no matching rule
+/// makes ld *orphan-place* the input section: it survives under its own
+/// name, lands wherever ld guesses, and can silently change segment
+/// layout (on esp32s3, an orphaned `.tdata.graft_slack` joined the IROM
+/// LOAD, flipped it writable, and the ROM bootloader rejected the image
+/// — a boot crash-loop with no link-time symptom). An output section
+/// still carrying a `.graft_slack` input name is exactly that signature;
+/// fail the base build instead of shipping the image.
+fn check_slack_scooped(elf_bytes: &[u8]) -> Result<()> {
+    use object::{Object, ObjectSection};
+    let elf = object::File::parse(elf_bytes).context("parse output ELF")?;
+    for sec in elf.sections() {
+        let name = sec.name().unwrap_or("");
+        if name.ends_with(".graft_slack") {
+            let hint = if name.starts_with(".tdata") {
+                "If this target has no TLS runtime, set GRAFT_TLS_SLACK_LEN=0; \
+                 otherwise add a `*(.tdata .tdata.*)` rule to the script."
+            } else {
+                "Splice mode needs this region — add the matching wildcard \
+                 rule to the linker script."
+            };
+            bail!(
+                "graft base self-check: the linker script did not scoop `{name}` — \
+                 ld orphan-placed it, which silently changes segment layout. {hint}"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn exec_real_linker(argv: &[String]) -> Result<std::process::ExitStatus> {
     let real = std::env::var("GRAFT_REAL_LD").unwrap_or_else(|_| "cc".into());
     let status = Command::new(&real)
@@ -235,13 +268,11 @@ fn build_section_table(
     use std::collections::hash_map::Entry;
     let elf = object::File::parse(elf_bytes).context("parse output ELF")?;
 
-    // TLS symbols' st_value in a linked ELF is a template-relative
-    // offset, not a vaddr (the map oracle caught std's .tbss statics
-    // "recovered" at 0x20 when this was treated as an address). The
-    // template itself lives at PT_TLS.p_vaddr, so the symbol's byte is
-    // at `p_vaddr + st_value` — translate here so TLS sections join
-    // the same vaddr-keyed table as everything else, and overlay-side
-    // anchors land inside the TLS map sections.
+    // TLS st_values are template-relative (the map oracle caught std's
+    // .tbss statics "recovered" at 0x20 when treated as addresses);
+    // `symbol_vaddr` translates them so TLS sections join the same
+    // vaddr-keyed table as everything else, and overlay-side anchors
+    // land inside the TLS map sections.
     let tls_vaddr: Option<u64> = crate::combine::pt_tls(elf_bytes)?.map(|t| t.vaddr);
 
     // (name, key_tu) → unique final address, or `None` once the name is
@@ -259,11 +290,8 @@ fn build_section_table(
         if s.is_undefined() { continue; }
         if matches!(s.kind(), object::SymbolKind::Section) { continue; }
         if name_raw.is_empty() { continue; }
-        let addr = if matches!(s.kind(), object::SymbolKind::Tls) {
-            let Some(tv) = tls_vaddr else { continue };
-            tv + s.address()
-        } else {
-            s.address()
+        let Some(addr) = crate::combine::symbol_vaddr(s.kind(), s.address(), tls_vaddr) else {
+            continue;
         };
         let is_global = matches!(s.scope(), SymbolScope::Linkage | SymbolScope::Dynamic);
         let key_tu = if is_global { None } else { current_tu };
