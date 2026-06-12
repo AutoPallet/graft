@@ -1,19 +1,27 @@
 //! Target-independent reconciliation engine: weighted shortest-path
 //! search over (input offset, output offset) states (docs/16 §5).
 //!
-//! Edge generation is dispatched on the region containing the input
-//! cursor; all ISA knowledge comes through [`Target`]. Costs order the
-//! parses: byte-true advances are free, known transforms cheap, the
-//! byte-granular fallback dearer, diagnostics and catch-alls dearest.
-//! A min-cost path that needs a catch-all yields [`Verdict::Dirty`]
-//! with the unexplained byte runs localized.
+//! Edge generation lives in ONE place ([`for_each_edge`]), dispatched
+//! on the region containing the input cursor; all ISA knowledge comes
+//! through [`Target`]. Costs order the parses: byte-true advances are
+//! free, known transforms cheap, the byte-granular fallback dearer,
+//! diagnostics and catch-alls dearest. A min-cost path that needs a
+//! catch-all yields [`Verdict::Dirty`] with the unexplained byte runs
+//! localized.
 //!
 //! The walk runs twice at most: pass 1 offers only source-grounded
 //! edges (fast, and the common case on a healthy corpus); only if no
 //! complete parse exists does pass 2 add diagnostic and catch-all
 //! edges to localize what the alphabet can't explain.
+//!
+//! [`translations`] is the DP-intersection layer (docs/16 §8): it
+//! enumerates ALL minimum-cost source-grounded parses and intersects
+//! their per-byte verdicts — an input offset is translatable only if
+//! every surviving parse maps it identically. This is what makes the
+//! loose matching rules safe in production: disagreement refuses the
+//! offset, never guesses.
 
-use super::{Census, DirtyRun, InputSection, RegionKind, Verdict};
+use super::{Census, DirtyRun, Fate, FateCell, InputSection, RegionKind, Verdict};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -94,26 +102,37 @@ fn key(i: usize, o: usize) -> u64 {
     (i as u64) << 32 | o as u64
 }
 
-/// Min-cost parse as forward edge list `(i, o, act)`; the final entry
-/// is a sentinel at the goal state. None = no complete parse with the
-/// offered edges (normal for pass 1) or state cap hit.
-fn walk<T: Target>(
-    inp: &InputSection,
-    out: &[u8],
-    t: &T,
-    catchall: bool,
-) -> Option<Vec<(usize, usize, Act)>> {
-    let inb = &inp.bytes;
-    let in_len = inb.len();
-    let out_len = out.len();
+fn unkey(k: u64) -> (usize, usize) {
+    ((k >> 32) as usize, (k & 0xFFFF_FFFF) as usize)
+}
 
-    // Per-byte region map: 0 code, 1 literal, 2 unreachable, 3 data;
-    // rend = end of the containing region. Section identity within the
-    // walk is positional, so a flat map beats interval search.
+/// Precomputed per-section context shared by every pass.
+struct Ctx<'a, T: Target> {
+    inp: &'a InputSection,
+    out: &'a [u8],
+    t: &'a T,
+    /// Per-byte region map: 0 code, 1 literal, 2 unreachable, 3 data.
+    /// Section identity within the walk is positional, so a flat map
+    /// beats interval search.
+    rkind: Vec<u8>,
+    /// End of the region containing each byte (literal word ops stop
+    /// at their pool's edge).
+    rend: Vec<u32>,
+    /// Literal-block boundaries: ta_fill compensation when section
+    /// alignment > 4 lands zeros at pool edges (docs/16 §5).
+    lit_edges: FxHashSet<usize>,
+    catchall: bool,
+}
+
+fn build_ctx<'a, T: Target>(
+    inp: &'a InputSection,
+    out: &'a [u8],
+    t: &'a T,
+    catchall: bool,
+) -> Ctx<'a, T> {
+    let in_len = inp.bytes.len();
     let mut rkind = vec![0u8; in_len];
     let mut rend = vec![0u32; in_len];
-    // Literal-block boundaries: ta_fill compensation when section
-    // alignment > 4 lands zeros at pool edges (docs/16 §5).
     let mut lit_edges: FxHashSet<usize> = FxHashSet::default();
     for (range, kind) in &inp.regions {
         let s = range.start.min(in_len);
@@ -132,8 +151,171 @@ fn walk<T: Target>(
             rend[b] = e as u32;
         }
     }
+    Ctx { inp, out, t, rkind, rend, lit_edges, catchall }
+}
 
+/// Enumerate every edge out of state (i, o) as `f(i2, o2, cost, act)`.
+/// The single edge-generator: the walk, the backward DP, and the fate
+/// intersection all consume exactly this set.
+fn for_each_edge<T: Target>(
+    cx: &Ctx<T>,
+    i: usize,
+    o: usize,
+    f: &mut dyn FnMut(usize, usize, u32, Act),
+) {
+    let inp = cx.inp;
+    let inb = &inp.bytes;
+    let out = cx.out;
+    let in_len = inb.len();
+    let out_len = out.len();
+
+    // --- input exhausted: output remainder must be zeros ⇒ ta_fill ---
+    if i == in_len {
+        if o < out_len {
+            if out[o] == 0 {
+                f(i, o + 1, 0, Act::FillZero);
+            }
+            if cx.catchall {
+                f(i, o + 1, COST_SKIP, Act::SkipOut);
+            }
+        }
+        return;
+    }
+
+    // Deletion-style edges stay available when the output is
+    // exhausted (a fully-folded pool is still word-wise lit-del);
+    // everything that reads out[o] is guarded.
+    match cx.rkind[i] {
+        // literal pool: word granularity
+        1 => {
+            let e = cx.rend[i] as usize;
+            if i + 4 <= e {
+                if o + 4 <= out_len && lit_word_ok(inp, i, &out[o..o + 4]) {
+                    f(i + 4, o + 4, 0, Act::LitKeep);
+                }
+                f(i + 4, o, COST_TRANSFORM, Act::LitDel);
+                if o + 4 <= out_len {
+                    // moved literal: value arbitrary (reloc-carried)
+                    f(i, o + 4, COST_LIT_ADD, Act::LitAdd);
+                }
+            } else if o < out_len && (inb[i] == out[o] || inp.mask[i]) {
+                // ragged sub-word pool tail
+                f(i + 1, o + 1, 0, Act::Data);
+            }
+        }
+        // unreachable: EBB-end flex region
+        2 => {
+            f(i + 1, o, 0, Act::UnreachDel);
+            if o < out_len {
+                if inb[i] == out[o] || inp.mask[i] {
+                    f(i + 1, o + 1, 0, Act::UnreachKeep);
+                }
+                if out[o] == 0 {
+                    f(i, o + 1, 0, Act::FillZero);
+                }
+            }
+        }
+        // raw data: byte-true only
+        3 => {
+            if o < out_len && (inb[i] == out[o] || inp.mask[i]) {
+                f(i + 1, o + 1, 0, Act::Data);
+            }
+        }
+        // instruction stream
+        _ if o == out_len => {
+            // input remainder: ta_fill deletion at the section-end EBB
+            f(i + 1, o, COST_TRANSFORM, Act::EndTrim);
+        }
+        _ => {
+            if let Some((ia, oa, conv)) = cx.t.longcall(&inb[i..], &out[o..]) {
+                let act = if conv { Act::LongcallConvert } else { Act::Longcall };
+                if i + ia <= in_len && o + oa <= out_len {
+                    f(i + ia, o + oa, COST_TRANSFORM, act);
+                }
+            }
+            if let Some(len) = cx.t.insn_len(inb[i])
+                && i + len <= in_len
+            {
+                let loose = inp.mask[i..i + len].iter().any(|&m| m);
+                if o + len <= out_len {
+                    let fb = cx.t.free_bits(&inb[i..i + len]);
+                    let mut clean = true;
+                    let mut ok = true;
+                    for x in 0..len {
+                        let (a, b) = (inb[i + x], out[o + x]);
+                        if a == b || inp.mask[i + x] {
+                            continue;
+                        }
+                        clean = false;
+                        if (a ^ b) & !fb[x] != 0 {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        let act = if clean { Act::Verbatim } else { Act::Retarget };
+                        f(i + len, o + len, 0, act);
+                    }
+                }
+                if len == 3
+                    && o + 2 <= out_len
+                    && cx.t.narrow_ok(&inb[i..i + 3], &out[o..o + 2], loose)
+                {
+                    f(i + 3, o + 2, COST_TRANSFORM, Act::Narrow);
+                }
+                if len == 2
+                    && o + 3 <= out_len
+                    && cx.t.widen_ok(&inb[i..i + 2], &out[o..o + 3], loose)
+                {
+                    f(i + 2, o + 3, COST_TRANSFORM, Act::Widen);
+                }
+            }
+            // ta_fill zero insertion at a flex point (size-0
+            // UNREACHABLE entry whose range is empty)
+            if o < out_len && inp.flex_points.contains(&i) && out[o] == 0 {
+                f(i, o + 1, COST_TRANSFORM, Act::FillZero);
+            }
+            // ld's copy loop is byte-oriented; equal bytes advance
+            // even across undecodable unmarked padding (docs/16 §2)
+            if o < out_len && (inb[i] == out[o] || inp.mask[i]) {
+                f(i + 1, o + 1, COST_BYTE_VERBATIM, Act::ByteVerbatim);
+            }
+            if cx.catchall && o < out_len {
+                if let Some(nl) = cx.t.nop_len(&out[o..]) {
+                    f(i, o + nl, COST_DIAG_NOP, Act::NopFill);
+                }
+                if let Some(nl) = cx.t.nop_len(&inb[i..]) {
+                    f(i + nl, o, COST_DIAG_NOP, Act::NopUnfill);
+                }
+            }
+        }
+    }
+    // compensating ta_fill at a literal-block edge (any region)
+    if o < out_len && cx.lit_edges.contains(&i) && out[o] == 0 {
+        f(i, o + 1, COST_TRANSFORM, Act::FillZero);
+    }
+    if cx.catchall {
+        f(i + 1, o, COST_SKIP, Act::SkipIn);
+        if o < out_len {
+            f(i + 1, o + 1, COST_REPLACE, Act::Replace);
+            f(i, o + 1, COST_SKIP, Act::SkipOut);
+        }
+    }
+}
+
+/// Min-cost parse as forward edge list `(i, o, act)`; the final entry
+/// is a sentinel at the goal state. None = no complete parse with the
+/// offered edges (normal for pass 1) or state cap hit.
+fn walk<T: Target>(
+    inp: &InputSection,
+    out: &[u8],
+    t: &T,
+    catchall: bool,
+) -> Option<Vec<(usize, usize, Act)>> {
+    let cx = build_ctx(inp, out, t, catchall);
+    let (in_len, out_len) = (inp.bytes.len(), out.len());
     let goal = key(in_len, out_len);
+
     let mut dist: FxHashMap<u64, u32> = FxHashMap::default();
     let mut prev: FxHashMap<u64, (u32, u32, Act)> = FxHashMap::default();
     let mut heap: BinaryHeap<(Reverse<u32>, u64)> = BinaryHeap::new();
@@ -158,149 +340,139 @@ fn walk<T: Target>(
         if dist.len() > STATE_CAP {
             return None;
         }
-        let (i, o) = ((k >> 32) as usize, (k & 0xFFFF_FFFF) as usize);
-
-        let mut push = |i2: usize, o2: usize, nd: u32, act: Act| {
+        let (i, o) = unkey(k);
+        for_each_edge(&cx, i, o, &mut |i2, o2, c, act| {
             let k2 = key(i2, o2);
+            let nd = d + c;
             if dist.get(&k2).is_none_or(|&dd| nd < dd) {
                 dist.insert(k2, nd);
                 prev.insert(k2, (i as u32, o as u32, act));
                 heap.push((Reverse(nd), k2));
             }
-        };
-
-        // --- input exhausted: output remainder must be zeros ⇒ ta_fill ---
-        if i == in_len {
-            if out[o] == 0 {
-                push(i, o + 1, d, Act::FillZero);
-            }
-            if catchall {
-                push(i, o + 1, d + COST_SKIP, Act::SkipOut);
-            }
-            continue;
-        }
-
-        // Deletion-style edges stay available when the output is
-        // exhausted (a fully-folded pool is still word-wise lit-del);
-        // everything that reads out[o] is guarded.
-        match rkind[i] {
-            // literal pool: word granularity
-            1 => {
-                let e = rend[i] as usize;
-                if i + 4 <= e {
-                    if o + 4 <= out_len && lit_word_ok(inp, i, &out[o..o + 4]) {
-                        push(i + 4, o + 4, d, Act::LitKeep);
-                    }
-                    push(i + 4, o, d + COST_TRANSFORM, Act::LitDel);
-                    if o + 4 <= out_len {
-                        // moved literal: value arbitrary (reloc-carried)
-                        push(i, o + 4, d + COST_LIT_ADD, Act::LitAdd);
-                    }
-                } else if o < out_len && (inb[i] == out[o] || inp.mask[i]) {
-                    // ragged sub-word pool tail
-                    push(i + 1, o + 1, d, Act::Data);
-                }
-            }
-            // unreachable: EBB-end flex region
-            2 => {
-                push(i + 1, o, d, Act::UnreachDel);
-                if o < out_len {
-                    if inb[i] == out[o] || inp.mask[i] {
-                        push(i + 1, o + 1, d, Act::UnreachKeep);
-                    }
-                    if out[o] == 0 {
-                        push(i, o + 1, d, Act::FillZero);
-                    }
-                }
-            }
-            // raw data: byte-true only
-            3 => {
-                if o < out_len && (inb[i] == out[o] || inp.mask[i]) {
-                    push(i + 1, o + 1, d, Act::Data);
-                }
-            }
-            // instruction stream
-            _ if o == out_len => {
-                // input remainder: ta_fill deletion at the section-end EBB
-                push(i + 1, o, d + COST_TRANSFORM, Act::EndTrim);
-            }
-            _ => {
-                if let Some((ia, oa, conv)) = t.longcall(&inb[i..], &out[o..]) {
-                    let act = if conv { Act::LongcallConvert } else { Act::Longcall };
-                    if i + ia <= in_len && o + oa <= out_len {
-                        push(i + ia, o + oa, d + COST_TRANSFORM, act);
-                    }
-                }
-                if let Some(len) = t.insn_len(inb[i])
-                    && i + len <= in_len
-                {
-                    let loose = inp.mask[i..i + len].iter().any(|&m| m);
-                    if o + len <= out_len {
-                        let fb = t.free_bits(&inb[i..i + len]);
-                        let mut clean = true;
-                        let mut ok = true;
-                        for x in 0..len {
-                            let (a, b) = (inb[i + x], out[o + x]);
-                            if a == b || inp.mask[i + x] {
-                                continue;
-                            }
-                            clean = false;
-                            if (a ^ b) & !fb[x] != 0 {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        if ok {
-                            let act = if clean { Act::Verbatim } else { Act::Retarget };
-                            push(i + len, o + len, d, act);
-                        }
-                    }
-                    if len == 3
-                        && o + 2 <= out_len
-                        && t.narrow_ok(&inb[i..i + 3], &out[o..o + 2], loose)
-                    {
-                        push(i + 3, o + 2, d + COST_TRANSFORM, Act::Narrow);
-                    }
-                    if len == 2
-                        && o + 3 <= out_len
-                        && t.widen_ok(&inb[i..i + 2], &out[o..o + 3], loose)
-                    {
-                        push(i + 2, o + 3, d + COST_TRANSFORM, Act::Widen);
-                    }
-                }
-                // ta_fill zero insertion at a flex point (size-0
-                // UNREACHABLE entry whose range is empty)
-                if inp.flex_points.contains(&i) && out[o] == 0 {
-                    push(i, o + 1, d + COST_TRANSFORM, Act::FillZero);
-                }
-                // ld's copy loop is byte-oriented; equal bytes advance
-                // even across undecodable unmarked padding (docs/16 §2)
-                if inb[i] == out[o] || inp.mask[i] {
-                    push(i + 1, o + 1, d + COST_BYTE_VERBATIM, Act::ByteVerbatim);
-                }
-                if catchall {
-                    if let Some(nl) = t.nop_len(&out[o..]) {
-                        push(i, o + nl, d + COST_DIAG_NOP, Act::NopFill);
-                    }
-                    if let Some(nl) = t.nop_len(&inb[i..]) {
-                        push(i + nl, o, d + COST_DIAG_NOP, Act::NopUnfill);
-                    }
-                }
-            }
-        }
-        // compensating ta_fill at a literal-block edge (any region)
-        if o < out_len && lit_edges.contains(&i) && out[o] == 0 {
-            push(i, o + 1, d + COST_TRANSFORM, Act::FillZero);
-        }
-        if catchall {
-            push(i + 1, o, d + COST_SKIP, Act::SkipIn);
-            if o < out_len {
-                push(i + 1, o + 1, d + COST_REPLACE, Act::Replace);
-                push(i, o + 1, d + COST_SKIP, Act::SkipOut);
-            }
-        }
+        });
     }
     None
+}
+
+/// DP-intersection (docs/16 §8): per-input-byte fate agreed by EVERY
+/// minimum-cost source-grounded parse, or [`FateCell::Ambiguous`]
+/// where parses disagree. None = no source-grounded parse exists (the
+/// section is dirty/refused; nothing is translatable).
+///
+/// Forward Dijkstra runs to exhaustion (no goal early-exit), a
+/// backward DP over the explored states (topological by decreasing
+/// i+o — every edge strictly advances at least one cursor) gives
+/// min-cost-to-goal, and an edge lies on some min-cost parse iff
+/// `dist[from] + cost + bdist[to] == dist[goal]`.
+pub fn translations<T: Target>(
+    inp: &InputSection,
+    out: &[u8],
+    t: &T,
+) -> Option<Vec<FateCell>> {
+    let cx = build_ctx(inp, out, t, false);
+    let (in_len, out_len) = (inp.bytes.len(), out.len());
+    let goal = key(in_len, out_len);
+
+    // forward, exhaustive
+    let mut dist: FxHashMap<u64, u32> = FxHashMap::default();
+    let mut heap: BinaryHeap<(Reverse<u32>, u64)> = BinaryHeap::new();
+    dist.insert(key(0, 0), 0);
+    heap.push((Reverse(0), key(0, 0)));
+    while let Some((Reverse(d), k)) = heap.pop() {
+        if dist.get(&k) != Some(&d) {
+            continue;
+        }
+        if dist.len() > STATE_CAP {
+            return None;
+        }
+        let (i, o) = unkey(k);
+        for_each_edge(&cx, i, o, &mut |i2, o2, c, _| {
+            let k2 = key(i2, o2);
+            let nd = d + c;
+            if dist.get(&k2).is_none_or(|&dd| nd < dd) {
+                dist.insert(k2, nd);
+                heap.push((Reverse(nd), k2));
+            }
+        });
+    }
+    let dstar = *dist.get(&goal)?;
+
+    // backward min-cost-to-goal
+    let mut states: Vec<u64> = dist.keys().copied().collect();
+    states.sort_by_key(|&k| Reverse((k >> 32) + (k & 0xFFFF_FFFF)));
+    let mut bdist: FxHashMap<u64, u32> = FxHashMap::default();
+    bdist.insert(goal, 0);
+    for &k in &states {
+        if k == goal {
+            continue;
+        }
+        let (i, o) = unkey(k);
+        let mut best: Option<u32> = None;
+        for_each_edge(&cx, i, o, &mut |i2, o2, c, _| {
+            if let Some(&b) = bdist.get(&key(i2, o2)) {
+                let v = c + b;
+                if best.is_none_or(|x| v < x) {
+                    best = Some(v);
+                }
+            }
+        });
+        if let Some(b) = best {
+            bdist.insert(k, b);
+        }
+    }
+
+    // intersect fates over every tight edge
+    let mut cells: Vec<Option<FateCell>> = vec![None; in_len];
+    let mut record = |k: usize, fate: Fate, cells: &mut Vec<Option<FateCell>>| {
+        cells[k] = match cells[k] {
+            None => Some(FateCell::Agreed(fate)),
+            Some(FateCell::Agreed(f)) if f == fate => Some(FateCell::Agreed(f)),
+            _ => Some(FateCell::Ambiguous),
+        };
+    };
+    for (&k, &df) in &dist {
+        let (i, o) = unkey(k);
+        for_each_edge(&cx, i, o, &mut |i2, o2, c, act| {
+            let Some(&b2) = bdist.get(&key(i2, o2)) else { return };
+            if df + c + b2 != dstar {
+                return; // not on any min-cost parse
+            }
+            match act {
+                // 1:1 byte correspondence
+                Act::Verbatim
+                | Act::Retarget
+                | Act::ByteVerbatim
+                | Act::Data
+                | Act::UnreachKeep
+                | Act::LitKeep => {
+                    for b in i..i2 {
+                        record(b, Fate::Kept((o + (b - i)) as u32), &mut cells);
+                    }
+                }
+                // reshaped instructions: only the start has a defined
+                // output offset (branch targets land on insn starts)
+                Act::Narrow | Act::Widen | Act::Longcall | Act::LongcallConvert => {
+                    record(i, Fate::Kept(o as u32), &mut cells);
+                    for b in i + 1..i2 {
+                        record(b, Fate::Interior, &mut cells);
+                    }
+                }
+                Act::LitDel | Act::UnreachDel | Act::EndTrim => {
+                    for b in i..i2 {
+                        record(b, Fate::Deleted, &mut cells);
+                    }
+                }
+                // output-only edges consume no input bytes
+                Act::FillZero | Act::LitAdd => {}
+                // catch-alls/diagnostics are not in the pass-1 edge set
+                _ => {}
+            }
+            let _ = o2;
+        });
+    }
+    // every input byte is consumed by every complete parse; an unset
+    // cell would mean the edge accounting is wrong — refuse it
+    Some(cells.into_iter().map(|c| c.unwrap_or(FateCell::Ambiguous)).collect())
 }
 
 fn lit_word_ok(inp: &InputSection, i: usize, out_word: &[u8]) -> bool {
@@ -475,5 +647,45 @@ mod tests {
             reconcile(&inp, &[1, 2, 0, 0, 0, 0, 0, 5, 6], &Null),
             Verdict::Reconciled(_)
         ));
+    }
+
+    #[test]
+    fn translations_agree_on_unique_parse() {
+        let inp = input(&[1, 2, 3, 4]);
+        let fates = translations(&inp, &[1, 2, 3, 4], &Null).unwrap();
+        for (k, f) in fates.iter().enumerate() {
+            assert_eq!(*f, FateCell::Agreed(Fate::Kept(k as u32)));
+        }
+    }
+
+    #[test]
+    fn translations_flag_twin_masked_literals() {
+        // two identical reloc-masked words, one survives: (del w0, keep
+        // w1) and (keep w0, del w1) tie at cost 1 — every byte of both
+        // words is ambiguous and must refuse
+        let mut inp = input(&[0xAA; 8]);
+        inp.mask.iter_mut().for_each(|m| *m = true);
+        inp.regions.push((0..8, crate::relax::RegionKind::Literal));
+        let fates = translations(&inp, &[0xAA; 4], &Null).unwrap();
+        assert!(fates.iter().all(|f| *f == FateCell::Ambiguous));
+    }
+
+    #[test]
+    fn translations_pin_resolves_twin_literals() {
+        // same shape, but the surviving word's value is known: only
+        // the parse keeping the pinned word is min-cost-compatible…
+        // for the word whose expected value matches the output
+        let mut inp = input(&[0xAA; 8]);
+        inp.mask.iter_mut().for_each(|m| *m = true);
+        inp.regions.push((0..8, crate::relax::RegionKind::Literal));
+        inp.lit_expect.insert(0, 0x11223344);
+        inp.lit_expect.insert(4, 0x55667788);
+        let fates = translations(&inp, &0x55667788u32.to_le_bytes(), &Null).unwrap();
+        for b in 0..4 {
+            assert_eq!(fates[b], FateCell::Agreed(Fate::Deleted));
+        }
+        for b in 4..8 {
+            assert_eq!(fates[b], FateCell::Agreed(Fate::Kept((b - 4) as u32)));
+        }
     }
 }

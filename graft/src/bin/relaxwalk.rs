@@ -23,7 +23,7 @@
 use graft::relax::engine;
 use graft::relax::x86;
 use graft::relax::xtensa::{self, Xtensa};
-use graft::relax::{Census, InputSection, Verdict};
+use graft::relax::{Census, Fate, FateCell, InputSection, RegionKind, Verdict};
 use object::{Object, ObjectSection, ObjectSymbol};
 use std::collections::HashMap;
 
@@ -156,6 +156,7 @@ fn main() {
     let mut elf_path = None;
     let mut path_maps: Vec<(String, String)> = Vec::new();
     let mut verbose = false;
+    let mut ambiguity = false;
     let mut arch = Arch::Xtensa;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -175,6 +176,7 @@ fn main() {
                 path_maps.push((from.to_string(), to.to_string()));
             }
             "-v" | "--verbose" => verbose = true,
+            "--ambiguity" => ambiguity = true,
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(2);
@@ -286,6 +288,7 @@ fn main() {
     let mut census = Census::default();
     let mut skips: HashMap<String, usize> = HashMap::new();
     let mut dirty: Vec<String> = Vec::new();
+    let mut amb = AmbStats::default();
 
     for e in &entries {
         let (path, member_name) = split_obj(&e.obj);
@@ -455,6 +458,9 @@ fn main() {
                     println!("DIAG {} {} ({})", e.in_name, e.obj, c.diagnostics());
                 }
                 census.absorb(&c);
+                if ambiguity {
+                    amb.add(&input, out_bytes, &format!("{} {}", e.in_name, e.obj));
+                }
             }
             Verdict::Dirty(c, runs) => {
                 let desc: Vec<String> = runs
@@ -493,8 +499,103 @@ fn main() {
     for (path, err) in &load_errors {
         println!("load-error: {path}: {err}");
     }
+    if ambiguity {
+        amb.report();
+    }
     if reconciled < attempted {
         std::process::exit(1);
+    }
+}
+
+/// Corpus-wide DP-intersection accounting (docs/16 §8): how often do
+/// equal-cost parses disagree about a byte's fate, and where.
+#[derive(Default)]
+struct AmbStats {
+    sections: usize,
+    sections_ambiguous: usize,
+    sections_code_ambiguous: usize,
+    kept: u64,
+    deleted: u64,
+    interior: u64,
+    /// ambiguous bytes by region: code, literal, unreachable, data
+    by_region: [u64; 4],
+    /// (ambiguous bytes, code-region share, description)
+    offenders: Vec<(u64, u64, String)>,
+    no_parse: usize,
+}
+
+impl AmbStats {
+    fn add(&mut self, input: &InputSection, out: &[u8], desc: &str) {
+        let Some(fates) = engine::translations(input, out, &Xtensa) else {
+            self.no_parse += 1;
+            return;
+        };
+        let mut kind = vec![0u8; input.bytes.len()];
+        for (r, k) in &input.regions {
+            let c = match k {
+                RegionKind::Literal => 1,
+                RegionKind::Unreachable => 2,
+                RegionKind::Data => 3,
+            };
+            for b in r.start.min(kind.len())..r.end.min(kind.len()) {
+                kind[b] = c;
+            }
+        }
+        let mut n_amb = 0u64;
+        let mut code_amb = 0u64;
+        let mut first: Vec<usize> = Vec::new();
+        for (b, f) in fates.iter().enumerate() {
+            match f {
+                FateCell::Agreed(Fate::Kept(_)) => self.kept += 1,
+                FateCell::Agreed(Fate::Deleted) => self.deleted += 1,
+                FateCell::Agreed(Fate::Interior) => self.interior += 1,
+                FateCell::Ambiguous => {
+                    n_amb += 1;
+                    self.by_region[kind[b] as usize] += 1;
+                    if kind[b] == 0 {
+                        code_amb += 1;
+                    }
+                    if first.len() < 4 {
+                        first.push(b);
+                    }
+                }
+            }
+        }
+        self.sections += 1;
+        if n_amb > 0 {
+            self.sections_ambiguous += 1;
+            if code_amb > 0 {
+                self.sections_code_ambiguous += 1;
+            }
+            self.offenders.push((n_amb, code_amb, format!("{desc} first@{first:?}")));
+        }
+    }
+
+    fn report(&mut self) {
+        println!("\n=== ambiguity (DP-intersection over min-cost parses) ===");
+        println!(
+            "sections analyzed: {} · with ambiguous bytes: {} · with ambiguous CODE bytes: {}{}",
+            self.sections,
+            self.sections_ambiguous,
+            self.sections_code_ambiguous,
+            if self.no_parse > 0 { format!(" · no-parse: {}", self.no_parse) } else { String::new() },
+        );
+        let amb: u64 = self.by_region.iter().sum();
+        println!(
+            "bytes: kept {} · deleted {} · interior {} · AMBIGUOUS {} (code {} / literal {} / unreachable {} / data {})",
+            self.kept,
+            self.deleted,
+            self.interior,
+            amb,
+            self.by_region[0],
+            self.by_region[1],
+            self.by_region[2],
+            self.by_region[3],
+        );
+        self.offenders.sort_by_key(|(n, c, _)| std::cmp::Reverse((*c, *n)));
+        for (n, c, desc) in self.offenders.iter().take(25) {
+            println!("  AMBIG bytes={n} code={c} {desc}");
+        }
     }
 }
 

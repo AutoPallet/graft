@@ -131,3 +131,26 @@ pub enum Verdict {
     /// Walk abandoned (state cap); treat as refuse.
     Refused(&'static str),
 }
+
+/// What happened to one input byte, as agreed by every minimum-cost
+/// parse (docs/16 §8).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fate {
+    /// Survives at this output offset.
+    Kept(u32),
+    /// Removed by the relaxation.
+    Deleted,
+    /// Interior byte of a re-encoded instruction (narrow/widen/
+    /// longcall): no output offset is defined — only instruction
+    /// starts are meaningful translation targets.
+    Interior,
+}
+
+/// One input byte's verdict from the DP-intersection
+/// ([`engine::translations`]): translate only `Agreed` offsets;
+/// `Ambiguous` means min-cost parses disagree — refuse, never guess.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FateCell {
+    Agreed(Fate),
+    Ambiguous,
+}

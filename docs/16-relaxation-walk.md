@@ -399,6 +399,23 @@ time was re-reading archives per section).
   the same edge set); a byte offset is translatable only if every
   surviving parse maps it identically; else that offset (not the whole
   section) is refused. This is what makes loose rules safe.
+
+  BUILT (`engine::translations`, measured via `relaxwalk
+  --ambiguity`): exhaustive forward Dijkstra over pass-1 edges,
+  backward min-cost-to-goal DP (topological by decreasing i+o — every
+  edge advances a cursor), per-byte fate intersection over every
+  tight edge (`dist[from] + cost + bdist[to] == D*`). Fates:
+  Kept(out_off) for 1:1 advances, start-only Kept + Interior for
+  reshaped insns (narrow/widen/longcall), Deleted. Corpus (2.8s
+  total): of 752,929 input bytes — kept 489,171 · deleted 153,958 ·
+  interior 68,613 · **ambiguous 41,187, of which only 92 are code
+  bytes in 10 sections** (all prebuilt esp blobs / hand-asm:
+  unmarked zero-pad runs where equal-cost parses shift which zeros
+  survive — refusing them is correct, nothing targets pad bytes).
+  The literal share (36,904 bytes ≈ 9,226 words) is the §4-predicted
+  residual: masked pool words without a value pin (section-symbol
+  targets). Unreachable-pad share 4,191. 2,364 sections carry some
+  ambiguity; translation refuses per-offset, not per-section.
 - **CI oracle**: symbol-saturate a fixture object (nameless locals
   every few bytes), link, harvest ld's st_value movements as ground
   truth for the walk's translations; plus fuzzing with random
