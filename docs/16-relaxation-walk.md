@@ -409,6 +409,22 @@ time was re-reading archives per section).
   resolution from trusted to verified), transform-walk, refuse ⇒
   pull/bail.
 
+  The verify-identity mode is built and proven standalone:
+  `relaxwalk --arch x86` (target `relax::x86`) verifies **every**
+  placed alloc input section of the rust-analyzer base against the
+  linked image — 470,558/470,558 clean in ~4s. x86 facts it encodes:
+  ld converts mov→lea for *plain* `R_X86_64_GOTPCREL` loads (not just
+  the X-suffixed forms), so GOTPCREL(X)/GOTTPOFF masks extend
+  backward over REX+opcode+modrm (`off−3..off+4`), TLSGD/TLSLD over
+  the full model sequence; non-alloc map "addresses" are offsets in
+  vma-0 output sections and can collide with real vaddrs (filter on
+  the input's SHF_ALLOC); `.eh_frame` is CIE-edited; same-named
+  `.init_array` clones within one rcgu.o are name-ambiguous and must
+  refuse (production identity = physical section index). The leaf
+  bin crate's `*.rcgu.o` are deleted by rustc after linking — only an
+  in-link verify (graft's own scan) can cover those ~10k sections
+  post-hoc.
+
 ## 9. Notes for the clean sheet
 
 What is irreducibly xtensa (target trait material, mostly *data*):

@@ -1,22 +1,37 @@
 //! relaxwalk — corpus harness for the relaxation reconciliation walk
 //! (docs/16-relaxation-walk.md §7).
 //!
-//! For every relaxed input section recorded in a GNU ld -Map file,
-//! reconcile the pristine archive-member bytes against the linked
-//! image via `graft::relax`. The bar: 100% of exec/literal sections
-//! reconciled-or-provably-refused, zero non-source rules on clean
-//! paths.
+//! Two modes, one engine:
+//!
+//! - `--arch xtensa` (default): for every *relaxed* input section in a
+//!   GNU ld -Map, reconcile pristine archive-member bytes against the
+//!   linked image through ld's transform alphabet. Bar: 100%
+//!   reconciled-or-provably-refused.
+//! - `--arch x86`: verify-identity mode (docs/16 §8) over *every*
+//!   placed input section — x86 ld never resizes sections, so the walk
+//!   degenerates to byte-compare modulo reloc masks. This is the
+//!   safety check that sections ended up where the map (and graft's
+//!   positional model) says.
 //!
 //! Run from the directory the map's relative archive paths resolve
-//! against (the esp-idf-sys out/build dir for the deploy corpus):
+//! against. Examples:
 //!
 //!   relaxwalk --map corpus.map --elf <linked-elf> \
 //!             --path-map /workspaces/roborack=/home/eric/roborack2
+//!   relaxwalk --arch x86 --map base.graft-map --elf <base-elf>
 
+use graft::relax::engine;
+use graft::relax::x86;
 use graft::relax::xtensa::{self, Xtensa};
-use graft::relax::{Census, Verdict, engine};
+use graft::relax::{Census, InputSection, Verdict};
 use object::{Object, ObjectSection, ObjectSymbol};
 use std::collections::HashMap;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Arch {
+    Xtensa,
+    X86,
+}
 
 // ---------- map parsing ----------
 
@@ -29,14 +44,16 @@ struct MapEntry {
     obj: String, // "path/lib.a(member.o)" or "path/file.o"
 }
 
-/// Relaxed input sections: an input-section line whose next line ends
-/// "(size before relaxing)". Long names wrap onto their own line.
+/// Input-section placements from a GNU ld -Map. With `relaxed_only`,
+/// keep only entries whose next line ends "(size before relaxing)"
+/// (xtensa corpus); otherwise keep every placed entry (x86 verify).
+/// Long names wrap onto their own line.
 ///
 /// The v1 prototype classified name lines with `!line.contains("0x")`,
 /// which silently dropped 796 sections whose Rust v0-mangled names
 /// contain a literal "0x" (`...10xtensa_cli...`); parse by token shape
 /// instead.
-fn parse_map(text: &str) -> Vec<MapEntry> {
+fn parse_map(text: &str, relaxed_only: bool) -> Vec<MapEntry> {
     let mut out = Vec::new();
     let mut pending_name: Option<String> = None;
     let mut last: Option<MapEntry> = None;
@@ -50,7 +67,9 @@ fn parse_map(text: &str) -> Vec<MapEntry> {
             pending_name = None;
             continue;
         }
-        last = None;
+        if relaxed_only {
+            last = None;
+        }
         // input-section lines: exactly one leading space, name starts '.'
         let named = line.starts_with(' ')
             && !line.starts_with("  ")
@@ -68,13 +87,18 @@ fn parse_map(text: &str) -> Vec<MapEntry> {
         if let (Some(name), [a, s, obj, ..]) = (name, rest)
             && let (Some(addr), Some(size)) = (hex(a), hex(s))
         {
-            last = Some(MapEntry {
+            let e = MapEntry {
                 in_name: name,
                 addr,
                 out_size: size,
-                in_size: 0,
+                in_size: size,
                 obj: obj.to_string(),
-            });
+            };
+            if relaxed_only {
+                last = Some(e); // confirmed by the annotation line
+            } else if addr != 0 && size != 0 {
+                out.push(e); // discarded/non-alloc sit at addr 0
+            }
         }
     }
     out
@@ -84,14 +108,7 @@ fn hex(s: &str) -> Option<u64> {
     u64::from_str_radix(s.strip_prefix("0x")?, 16).ok()
 }
 
-// ---------- archive cache ----------
-
-/// All referenced archives, read once and held in memory: the v1
-/// prototype re-read archives per section and spent 95% of its wall
-/// time in syscalls.
-struct Archives {
-    bytes: HashMap<String, Vec<u8>>,
-}
+// ---------- archive + member caches ----------
 
 /// (member name → byte ranges) per archive; duplicate member names are
 /// real in esp-idf (libmbedcrypto.a carries two bignum.c.obj).
@@ -115,16 +132,43 @@ fn index_members(data: &[u8]) -> Result<MemberIndex, String> {
     Ok(idx)
 }
 
+/// A parsed member with a name → sections index: at x86 scale (632k
+/// map entries over ~2k members) re-parsing and linear name scans per
+/// entry would dominate the run.
+struct Member<'a> {
+    file: object::File<'a>,
+    by_name: HashMap<String, Vec<(object::SectionIndex, u64)>>,
+}
+
+fn parse_member(data: &[u8]) -> Option<Member<'_>> {
+    let file = object::File::parse(data).ok()?;
+    let mut by_name: HashMap<String, Vec<(object::SectionIndex, u64)>> = HashMap::new();
+    for sec in file.sections() {
+        if let Ok(name) = sec.name() {
+            by_name.entry(name.to_string()).or_default().push((sec.index(), sec.size()));
+        }
+    }
+    Some(Member { file, by_name })
+}
+
 fn main() {
     let mut map_path = None;
     let mut elf_path = None;
     let mut path_maps: Vec<(String, String)> = Vec::new();
     let mut verbose = false;
+    let mut arch = Arch::Xtensa;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--map" => map_path = args.next(),
             "--elf" => elf_path = args.next(),
+            "--arch" => {
+                arch = match args.next().as_deref() {
+                    Some("xtensa") => Arch::Xtensa,
+                    Some("x86") => Arch::X86,
+                    other => panic!("--arch xtensa|x86, got {other:?}"),
+                }
+            }
             "--path-map" => {
                 let v = args.next().expect("--path-map A=B");
                 let (from, to) = v.split_once('=').expect("--path-map A=B");
@@ -141,9 +185,9 @@ fn main() {
     let elf_path = elf_path.expect("--elf <file> required");
 
     let map_text = std::fs::read_to_string(&map_path).expect("read map");
-    let entries = parse_map(&map_text);
-    let recovered = entries.iter().filter(|e| e.in_name.contains("0x")).count();
-    println!("{} relaxed sections in map ({} with 0x-bearing names)", entries.len(), recovered);
+    let entries = parse_map(&map_text, arch == Arch::Xtensa);
+    println!("{} input sections from map", entries.len());
+    drop(map_text);
 
     // linked image: section bytes by vaddr + unique-address symbol table
     let elf_bytes = std::fs::read(&elf_path).expect("read elf");
@@ -159,39 +203,43 @@ fn main() {
             out_secs.push((sec.address(), data));
         }
     }
+    // the symbol table only feeds xtensa literal-value resolution
     let mut out_syms: HashMap<String, u64> = HashMap::new();
-    let mut ambiguous: std::collections::HashSet<String> = Default::default();
-    for sym in elf.symbols() {
-        if sym.is_undefined()
-            || matches!(sym.kind(), object::SymbolKind::Section | object::SymbolKind::File)
-        {
-            continue;
-        }
-        let Ok(name) = sym.name() else { continue };
-        if name.is_empty() {
-            continue;
-        }
-        match out_syms.entry(name.to_string()) {
-            std::collections::hash_map::Entry::Occupied(e) => {
-                if *e.get() != sym.address() {
-                    ambiguous.insert(name.to_string());
+    if arch == Arch::Xtensa {
+        let mut ambiguous: std::collections::HashSet<String> = Default::default();
+        for sym in elf.symbols() {
+            if sym.is_undefined()
+                || matches!(sym.kind(), object::SymbolKind::Section | object::SymbolKind::File)
+            {
+                continue;
+            }
+            let Ok(name) = sym.name() else { continue };
+            if name.is_empty() {
+                continue;
+            }
+            match out_syms.entry(name.to_string()) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    if *e.get() != sym.address() {
+                        ambiguous.insert(name.to_string());
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(sym.address());
                 }
             }
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(sym.address());
-            }
         }
+        for name in &ambiguous {
+            out_syms.remove(name);
+        }
+        println!(
+            "{} unique-address output symbols ({} ambiguous dropped)",
+            out_syms.len(),
+            ambiguous.len()
+        );
     }
-    for name in &ambiguous {
-        out_syms.remove(name);
-    }
-    println!(
-        "{} unique-address output symbols ({} ambiguous dropped)",
-        out_syms.len(),
-        ambiguous.len()
-    );
 
-    // phase 1: load every referenced archive once
+    // phase 1: load every referenced archive once (the v1 prototype
+    // re-read archives per section: 95% of its wall time)
     let remap = |p: &str| -> String {
         for (from, to) in &path_maps {
             if let Some(rest) = p.strip_prefix(from.as_str()) {
@@ -206,42 +254,46 @@ fn main() {
             None => (remap(obj), String::new()),
         }
     };
-    let mut archives = Archives { bytes: HashMap::new() };
+    let mut archive_bytes: HashMap<String, Vec<u8>> = HashMap::new();
     let mut load_errors: HashMap<String, String> = HashMap::new();
     for e in &entries {
         let (path, _) = split_obj(&e.obj);
-        if archives.bytes.contains_key(&path) || load_errors.contains_key(&path) {
+        if archive_bytes.contains_key(&path) || load_errors.contains_key(&path) {
             continue;
         }
         match std::fs::read(&path) {
             Ok(b) => {
-                archives.bytes.insert(path, b);
+                archive_bytes.insert(path, b);
             }
             Err(err) => {
                 load_errors.insert(path, err.to_string());
             }
         }
     }
-    let total: usize = archives.bytes.values().map(|b| b.len()).sum();
-    println!("{} archives loaded ({} MB)", archives.bytes.len(), total >> 20);
-    let members: HashMap<&String, MemberIndex> = archives
-        .bytes
+    let total: usize = archive_bytes.values().map(|b| b.len()).sum();
+    println!("{} archives loaded ({} MB)", archive_bytes.len(), total >> 20);
+    let members: HashMap<&String, MemberIndex> = archive_bytes
         .iter()
         .map(|(p, b)| (p, index_members(b).unwrap_or_default()))
         .collect();
+    let mut parsed: HashMap<(String, usize), Option<Member>> = HashMap::new();
 
     // walk every entry
-    let target = Xtensa;
     let mut attempted = 0usize;
     let mut reconciled = 0usize;
+    let mut fast_verified = 0usize;
     let mut diagnostic_uses = 0u64;
     let mut census = Census::default();
     let mut skips: HashMap<String, usize> = HashMap::new();
     let mut dirty: Vec<String> = Vec::new();
 
-    'entry: for e in &entries {
+    for e in &entries {
         let (path, member_name) = split_obj(&e.obj);
-        let Some(data) = archives.bytes.get(&path) else {
+        if path.ends_with(".graft-slack.o") {
+            *skips.entry("graft synthetic slack object".into()).or_default() += 1;
+            continue;
+        }
+        let Some(data) = archive_bytes.get(&path) else {
             *skips.entry(format!("archive read failed: {path}")).or_default() += 1;
             continue;
         };
@@ -252,14 +304,23 @@ fn main() {
             .unwrap_or_default();
 
         // candidates across duplicate member names AND duplicate
-        // same-named sections within a member: disambiguate by
-        // (section name, input size); bail if not exactly one
-        let mut candidates: Vec<(std::ops::Range<usize>, object::SectionIndex)> = Vec::new();
+        // same-named sections within a member; bail unless exactly
+        // one. Section identity: xtensa disambiguates by (name, input
+        // size) — the relaxed map size differs; x86 selects by name
+        // alone and treats a size mismatch as a verdict, not a lookup
+        // miss (the placed size must equal the input size for
+        // everything verified).
+        let mut candidates: Vec<(usize, object::SectionIndex)> = Vec::new();
         for r in &member_ranges {
-            let Ok(obj) = object::File::parse(&data[r.clone()]) else { continue };
-            for sec in obj.sections() {
-                if sec.name() == Ok(&e.in_name) && sec.size() == e.in_size {
-                    candidates.push((r.clone(), sec.index()));
+            let m = parsed
+                .entry((path.clone(), r.start))
+                .or_insert_with(|| parse_member(&data[r.clone()]));
+            let Some(m) = m else { continue };
+            if let Some(secs) = m.by_name.get(&e.in_name) {
+                for &(idx, size) in secs {
+                    if arch == Arch::X86 || size == e.in_size {
+                        candidates.push((r.start, idx));
+                    }
                 }
             }
         }
@@ -269,14 +330,67 @@ fn main() {
                 .or_default() += 1;
             continue;
         }
-        let (range, sec_index) = candidates.pop().unwrap();
-        let obj = object::File::parse(&data[range]).expect("re-parse member");
-        let sec = obj.section_by_index(sec_index).expect("section by index");
+        let member = parsed
+            .get(&(path.clone(), candidates[0].0))
+            .and_then(|m| m.as_ref())
+            .expect("member parsed above");
+        let sec = member
+            .file
+            .section_by_index(candidates[0].1)
+            .expect("section by index");
 
-        // only instruction streams and literal pools walk; other
-        // relaxed entries are SHF_MERGE string folding (docs/16 §4)
-        if sec.kind() != object::SectionKind::Text && !e.in_name.contains(".literal") {
-            *skips.entry("merge-fold (non-exec)".to_string()).or_default() += 1;
+        // section classes the walk does not cover
+        let skip_reason = match arch {
+            // non-exec relaxed entries are SHF_MERGE string folding
+            Arch::Xtensa
+                if sec.kind() != object::SectionKind::Text
+                    && !e.in_name.contains(".literal") =>
+            {
+                Some("merge-fold (non-exec)")
+            }
+            Arch::X86 => {
+                let sh_flags = match sec.flags() {
+                    object::SectionFlags::Elf { sh_flags } => sh_flags,
+                    _ => 0,
+                };
+                if sh_flags & u64::from(object::elf::SHF_ALLOC) == 0 {
+                    // debug/non-alloc "addresses" in the map are
+                    // offsets inside a vma-0 output section — they can
+                    // collide with real vaddrs in a big image
+                    Some("non-alloc")
+                } else if sh_flags & u64::from(object::elf::SHF_MERGE) != 0 {
+                    Some("merge section (folded)") // per-entry identity, graft v7
+                } else if matches!(
+                    sec.kind(),
+                    object::SectionKind::UninitializedData
+                        | object::SectionKind::UninitializedTls
+                        | object::SectionKind::Common
+                ) {
+                    Some("nobits")
+                } else if e.in_name == ".eh_frame" {
+                    Some(".eh_frame (CIE-edited by ld)")
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(why) = skip_reason {
+            *skips.entry(why.to_string()).or_default() += 1;
+            continue;
+        }
+        if arch == Arch::X86 && sec.size() != e.out_size {
+            // x86 ld never resizes a (non-merge) input section: a
+            // placed size differing from the input size means the
+            // positional model is wrong for this section
+            dirty.push(format!(
+                "SIZE {} {} input {:#x} placed {:#x}",
+                e.in_name,
+                e.obj,
+                sec.size(),
+                e.out_size
+            ));
+            attempted += 1;
             continue;
         }
 
@@ -284,24 +398,25 @@ fn main() {
         let out_bytes: &[u8] = if e.out_size == 0 {
             &[]
         } else {
-            let mut found = None;
-            for &(addr, data) in &out_secs {
-                if e.addr >= addr && e.addr + e.out_size <= addr + data.len() as u64 {
+            match out_secs.iter().find_map(|&(addr, data)| {
+                (e.addr >= addr && e.addr + e.out_size <= addr + data.len() as u64).then(|| {
                     let s = (e.addr - addr) as usize;
-                    found = Some(&data[s..s + e.out_size as usize]);
-                    break;
-                }
-            }
-            match found {
+                    &data[s..s + e.out_size as usize]
+                })
+            }) {
                 Some(b) => b,
                 None => {
                     *skips.entry("output bytes not found".to_string()).or_default() += 1;
-                    continue 'entry;
+                    continue;
                 }
             }
         };
 
-        let input = match xtensa::extract_input(&obj, &sec, &out_syms) {
+        let input = match arch {
+            Arch::Xtensa => xtensa::extract_input(&member.file, &sec, &out_syms),
+            Arch::X86 => x86::extract_input(&sec),
+        };
+        let input = match input {
             Ok(i) => i,
             Err(err) => {
                 *skips.entry(format!("extract failed: {err}")).or_default() += 1;
@@ -310,7 +425,29 @@ fn main() {
         };
 
         attempted += 1;
-        match engine::reconcile(&input, out_bytes, &target) {
+        // x86: same-size masked compare IS the degenerate walk, and
+        // with equal sizes the min-cost path is replace-only — extract
+        // mismatch runs directly instead of searching for them
+        if arch == Arch::X86 {
+            match masked_compare(&input, out_bytes) {
+                Ok(()) => {
+                    reconciled += 1;
+                    fast_verified += 1;
+                    census.data_bytes += out_bytes.len() as u64;
+                }
+                Err(runs) => {
+                    let desc: Vec<String> = runs
+                        .iter()
+                        .take(4)
+                        .map(|r| format!("({},{},{})", r.in_off, r.in_len, r.out_len))
+                        .collect();
+                    dirty.push(format!("{} {} runs {}", e.in_name, e.obj, desc.join(" ")));
+                }
+            }
+            continue;
+        }
+        let verdict = engine::reconcile(&input, out_bytes, &Xtensa);
+        match verdict {
             Verdict::Reconciled(c) => {
                 reconciled += 1;
                 diagnostic_uses += c.diagnostics();
@@ -337,11 +474,14 @@ fn main() {
     println!("\n=== relaxwalk results ===");
     let pct = if attempted > 0 { 100.0 * reconciled as f64 / attempted as f64 } else { 0.0 };
     println!("attempted: {attempted}   reconciled: {reconciled} ({pct:.1}%)");
+    if arch == Arch::X86 {
+        println!("  fast-path verified: {fast_verified}");
+    }
     println!("  of which used NON-SOURCE diagnostic rules: {diagnostic_uses}");
     println!("actions: {census:?}");
     if !dirty.is_empty() {
         println!("\n{} dirty sections:", dirty.len());
-        for d in dirty.iter().take(40) {
+        for d in &dirty {
             println!("  DIRTY {d}");
         }
     }
@@ -356,4 +496,32 @@ fn main() {
     if reconciled < attempted {
         std::process::exit(1);
     }
+}
+
+/// The degenerate walk for resize-free targets: byte-equal modulo
+/// reloc masks at identical sizes. On mismatch, returns the maximal
+/// unexplained runs (with equal sizes, the engine's min-cost path is
+/// replace-only, so direct extraction is exact and O(n)).
+fn masked_compare(input: &InputSection, out: &[u8]) -> Result<(), Vec<graft::relax::DirtyRun>> {
+    if input.bytes.len() != out.len() {
+        return Err(vec![graft::relax::DirtyRun {
+            in_off: 0,
+            in_len: input.bytes.len(),
+            out_len: out.len(),
+        }]);
+    }
+    let mut runs: Vec<graft::relax::DirtyRun> = Vec::new();
+    for (k, (a, b)) in input.bytes.iter().zip(out).enumerate() {
+        if a == b || input.mask[k] {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(r) if r.in_off + r.in_len == k => {
+                r.in_len += 1;
+                r.out_len += 1;
+            }
+            _ => runs.push(graft::relax::DirtyRun { in_off: k, in_len: 1, out_len: 1 }),
+        }
+    }
+    if runs.is_empty() { Ok(()) } else { Err(runs) }
 }
