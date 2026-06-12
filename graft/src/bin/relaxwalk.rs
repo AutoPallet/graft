@@ -131,6 +131,12 @@ fn load_input(obj_spec: &str, sec_name: &str, want_size: u64, v: bool) -> Result
         return Err(format!("ambiguous-or-missing section ({} candidates)", candidates.len()));
     }
     let sec = &candidates[0];
+    // only instruction streams walk; non-exec "relaxed" sections are
+    // merge-string folding (different mechanism, v7 territory)
+    let is_exec = matches!(sec.kind(), object::SectionKind::Text);
+    if !is_exec && !sec_name.contains(".literal") {
+        return Err("merge-fold (non-exec)".into());
+    }
     let bytes = sec.data().map_err(|e| e.to_string())?.to_vec();
     if bytes.len() as u64 != want_size {
         return Err(format!("input size {} != map before-relax {}", bytes.len(), want_size));
@@ -245,6 +251,154 @@ struct Counts {
 enum Verdict {
     Reconciled(Counts, usize /* windows */),
     Refused { in_off: usize, out_off: usize, reason: String },
+    /// weighted search succeeded only via catch-all edges: the listed
+    /// (in_off, in_len, out_len) runs are "bytes probably replaced"
+    Dirty { cost: u32, replaced: Vec<(usize, usize, usize)> },
+}
+
+/// Weighted matching search (dev tool): 0-1-Dijkstra over (i,o) states.
+/// Known transforms are cheap; catch-all skip/replace edges expensive.
+/// A clean min-cost path (no catch-alls) == old greedy reconcile; a
+/// dirty path localizes the unexplained byte runs in big functions.
+fn walk_dijkstra(inp: &InputSec, out: &[u8]) -> Verdict {
+    use std::collections::{BinaryHeap, HashMap};
+    const C_KNOWN: u32 = 1;
+    const C_REPLACE: u32 = 12;
+    const C_SKIP: u32 = 16;
+    let inb = &inp.bytes;
+    let (n, m) = (inb.len(), out.len());
+    let key = |i: usize, o: usize| (i as u64) << 32 | o as u64;
+    let mut dist: HashMap<u64, u32> = HashMap::new();
+    let mut prev: HashMap<u64, (usize, usize, u8)> = HashMap::new(); // action code
+    let mut heap = BinaryHeap::new();
+    heap.push((std::cmp::Reverse(0u32), 0usize, 0usize));
+    dist.insert(key(0, 0), 0);
+    let mut explored = 0usize;
+    while let Some((std::cmp::Reverse(d), i, o)) = heap.pop() {
+        if dist.get(&key(i, o)).copied().unwrap_or(u32::MAX) < d {
+            continue;
+        }
+        explored += 1;
+        if explored > 3_000_000 {
+            return Verdict::Refused { in_off: i, out_off: o, reason: "search overflow".into() };
+        }
+        if i == n && o == m {
+            // reconstruct: catch-alls and action counts
+            let (mut ci, mut co) = (n, m);
+            let mut c = Counts::default();
+            let mut windows = 0usize;
+            let mut replaced: Vec<(usize, usize, usize)> = Vec::new();
+            while ci != 0 || co != 0 {
+                let &(pi, po, act) = prev.get(&key(ci, co)).unwrap();
+                match act {
+                    0 => c.verbatim += 1,
+                    1 => c.retarget += 1,
+                    2 => { c.longcall += 1; windows += 1 }
+                    3 => { c.narrow += 1; windows += 1 }
+                    4 => { c.widen += 1; windows += 1 }
+                    5 => c.fill += 1,
+                    6 => { c.unfill += 1; windows += 1 }
+                    7 => { c.lit_del_words += 1; windows += 1 }
+                    8 => { c.longcall += 1 } // callx->call in place (paired remote l32r delete)
+                    9 => { c.lit_del_words += 0; windows += 1 } // l32r deleted remotely
+                    10..=12 => {
+                        // catch-all: merge adjacent runs
+                        if let Some(last) = replaced.last_mut() {
+                            if last.0 == ci { last.0 = pi; last.1 += ci - pi; last.2 += co - po; }
+                            else { replaced.push((pi, ci - pi, co - po)); }
+                        } else {
+                            replaced.push((pi, ci - pi, co - po));
+                        }
+                    }
+                    _ => {}
+                }
+                ci = pi;
+                co = po;
+            }
+            replaced.reverse();
+            return if replaced.is_empty() {
+                Verdict::Reconciled(c, windows)
+            } else {
+                Verdict::Dirty { cost: d, replaced }
+            };
+        }
+        let mut push = |i2: usize, o2: usize, nd: u32, act: u8, dist: &mut HashMap<u64, u32>, prev: &mut HashMap<u64, (usize, usize, u8)>, heap: &mut BinaryHeap<(std::cmp::Reverse<u32>, usize, usize)>| {
+            if i2 <= n && o2 <= m && nd < dist.get(&key(i2, o2)).copied().unwrap_or(u32::MAX) {
+                dist.insert(key(i2, o2), nd);
+                prev.insert(key(i2, o2), (i, o, act));
+                heap.push((std::cmp::Reverse(nd), i2, o2));
+            }
+        };
+        // literal region word edges
+        if let Some(&(_ls, le)) = inp.literal_ranges.iter().find(|&&(ls, le)| i >= ls && i < le) {
+            if i + 4 <= le.min(n) {
+                let masked = inp.mask[i..i + 4].iter().any(|&m| m);
+                if o + 4 <= m && (masked || inb[i..i + 4] == out[o..o + 4]) {
+                    push(i + 4, o + 4, d, 0, &mut dist, &mut prev, &mut heap);
+                }
+                push(i + 4, o, d + C_KNOWN, 7, &mut dist, &mut prev, &mut heap);
+            }
+            continue;
+        }
+        let li = (i < n).then(|| insn_len(inb[i]).filter(|l| i + l <= n)).flatten();
+        let lo = (o < m).then(|| insn_len(out[o]).filter(|l| o + l <= m)).flatten();
+        if let (Some(li), Some(lo)) = (li, lo) {
+            if li == lo {
+                let pm = pcrel_mask(&inb[i..i + li]);
+                let mut clean = true;
+                let mut pcrel = false;
+                for k in 0..li {
+                    if inb[i + k] == out[o + k] || inp.mask[i + k] { continue; }
+                    if pm >> k & 1 == 1 { pcrel = true; continue; }
+                    clean = false;
+                    break;
+                }
+                if clean {
+                    push(i + li, o + lo, d, if pcrel { 1 } else { 0 }, &mut dist, &mut prev, &mut heap);
+                }
+            }
+            // adjacent longcall
+            if li == 3 && is_l32r(&inb[i..]) && i + 6 <= n && is_callx_or_jx(&inb[i + 3..]) && is_call_or_j(&out[o..]) {
+                push(i + 6, o + 3, d + C_KNOWN, 2, &mut dist, &mut prev, &mut heap);
+            }
+            // callx/jx -> call/j in place (remote l32r deleted separately)
+            if li == 3 && lo == 3 && is_callx_or_jx(&inb[i..]) && is_call_or_j(&out[o..]) {
+                push(i + 3, o + 3, d + C_KNOWN, 8, &mut dist, &mut prev, &mut heap);
+            }
+            if li == 3 && lo == 2 {
+                push(i + 3, o + 2, d + C_KNOWN, 3, &mut dist, &mut prev, &mut heap);
+            }
+            if li == 2 && lo == 3 {
+                push(i + 2, o + 3, d + C_KNOWN, 4, &mut dist, &mut prev, &mut heap);
+            }
+        }
+        if let Some(li) = li {
+            // remote l32r deletion / nop removal
+            if is_l32r(&inb[i..]) || is_nop3(&inb[i..]) || is_nop2(&inb[i..]) {
+                push(i + li, o, d + C_KNOWN, if is_l32r(&inb[i..]) { 9 } else { 6 }, &mut dist, &mut prev, &mut heap);
+            }
+        }
+        if let Some(lo) = lo {
+            if is_nop3(&out[o..]) || is_nop2(&out[o..]) {
+                push(i, o + lo, d + C_KNOWN, 5, &mut dist, &mut prev, &mut heap);
+            }
+        }
+        // end trims
+        if i < n && o == m {
+            push(n, m, d + C_KNOWN, 6, &mut dist, &mut prev, &mut heap);
+        }
+        // catch-alls (byte granularity)
+        if i < n && o < m {
+            push(i + 1, o + 1, d + C_REPLACE, 10, &mut dist, &mut prev, &mut heap);
+        }
+        if i < n {
+            push(i + 1, o, d + C_SKIP, 11, &mut dist, &mut prev, &mut heap);
+        }
+        if o < m {
+            push(i, o + 1, d + C_SKIP, 12, &mut dist, &mut prev, &mut heap);
+        }
+    }
+    Verdict::Refused { in_off: 0, out_off: 0, reason: "no path".into() }
 }
 
 fn walk(inp: &InputSec, out: &[u8]) -> Verdict {
@@ -252,7 +406,7 @@ fn walk(inp: &InputSec, out: &[u8]) -> Verdict {
     let mut windows = 0usize;
     match walk_from(inp, out, 0, 0, &mut c, &mut windows, 0) {
         Ok(()) => Verdict::Reconciled(c, windows),
-        Err((i, o, r)) => Verdict::Refused { in_off: i, out_off: o, reason: r },
+        Err(_) => walk_dijkstra(inp, out), // greedy failed: weighted diagnosis
     }
 }
 
@@ -410,7 +564,7 @@ fn walk_from(
             i += li;
             continue;
         }
-        return Err((i, o, format!("no transform explains in={:02x?} out={:02x?}", &inb[i..(i + li).min(inb.len())], &out[o..(o + lo).min(out.len())])));
+        return Err((i, o, format!("unexplained li={li} lo={lo} in_op0={:x} out_op0={:x} | in={:02x?} out={:02x?}", inb[i] & 0xF, out[o] & 0xF, &inb[i..(i + li).min(inb.len())], &out[o..(o + lo).min(out.len())])));
     }
 }
 
@@ -498,11 +652,17 @@ fn main() {
                     eprintln!("  OK {c:?} windows={w}");
                 }
             }
+            Verdict::Dirty { cost, replaced } => {
+                *refusals.entry("dirty (catch-all path)".into()).or_default() += 1;
+                if verbose {
+                    eprintln!("  DIRTY cost={cost} replaced runs (in_off,in_len,out_len): {replaced:?}");
+                }
+            }
             Verdict::Refused { in_off, out_off, reason } => {
                 if verbose {
                     eprintln!("  REFUSE @in+{in_off:#x}/out+{out_off:#x}: {reason}");
                 }
-                let key = reason.split(['[', '{']).next().unwrap_or("?").trim().to_string();
+                let key = reason.split('|').next().unwrap_or("?").trim().to_string();
                 *refusals.entry(key).or_default() += 1;
             }
         }
