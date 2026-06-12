@@ -347,6 +347,12 @@ expect to reproduce *none* of them if it implements §§2–5 directly.
 9. **SLOT0_OP masks fixed at 3 bytes** over-masked density insns (§4).
 10. **callx encoding wrong in v1** (only 0xc0 family; callx8 is 0xe0)
     and **longcall ordered after masked compare** — both §5/§3.
+11. **v1 map parser dropped 796 real sections** (found by the clean
+    sheet): its name-line heuristic was `!line.contains("0x")`, and
+    Rust v0-mangled section names contain literal `"0x"`
+    (`.literal._R…10xtensa_cli…`, `…Cs4J0xEyox3ma…`). The true corpus
+    is 10,000 exec/literal sections, not 9,204 — parse map lines by
+    token shape, never by substring.
 
 ## 7. Corpus harness and acceptance criteria
 
@@ -364,18 +370,27 @@ Corpus (12,123 relaxed-section map annotations; 9,206 exec/literal):
 
 A reimplementation is accepted when, on this exact corpus:
 
-- attempted = 9,204; reconciled = 9,204 (100.0%);
+- attempted = 10,000; reconciled = 10,000 (100.0%) — the v1 numbers
+  (9,204) reflect its map-parser bug, §6.11; the map carries 12,919
+  relax annotations of which 10,000 are exec/literal;
 - skips: 2,917 merge-fold (non-exec), 2 ambiguous-member bails;
 - zero uses of any non-source rule on reconciled paths;
-- action census in the ballpark of: verbatim 178,058 · longcall 11,016
-  · longcall-convert 156 · narrow 3,277 · widen 6,201 · fill-zero 813
-  · unreachable-deleted 310 · lit-del words 38,839 · lit-add 0 ·
-  byte-verbatim 2;
+- action census in the ballpark of (v2 clean-sheet numbers; v1 folded
+  lit/unreach keeps into verbatim): verbatim 155,704 + unreach-keep
+  4,075 + lit-keep words 20,328 · longcall 11,016 · longcall-convert
+  156 · narrow 3,277 · widen 6,199 · fill-zero 815 ·
+  unreachable-deleted 310 · lit-del words 42,733 · lit-add 0 ·
+  byte-verbatim 2 · retarget 0 · end-trim 0;
 - the §3 ground-truth encoding tests pass.
 
 (Exact census equality isn't required — equal-cost parse ties can
 shift attribution — but order-of-magnitude deviations mean a rule is
 doing the wrong work.)
+
+The clean sheet (`graft/src/relax/{engine,xtensa}.rs` + the
+`relaxwalk` bin) meets all of the above; with archives cached in
+memory the full corpus runs in ~1.2s vs v1's ~102s (95% of v1's wall
+time was re-reading archives per section).
 
 ## 8. Not yet built (next after the rewrite)
 
