@@ -454,15 +454,59 @@ time was re-reading archives per section).
 
   Conclusion: positional anchoring into relaxed pools is futile —
   three quarters of real queries can't anchor no matter how good the
-  walk gets, while code-interior anchoring is perfect. So the policy
-  IS pool-travels-with-code (strong edge for any reloc targeting a
-  literal region): pools re-emit with their referencers, ld re-relaxes
-  them natively in the overlay link, and read-only-ness makes the
-  duplicate copies sound. Pool ambiguity then never reaches a
-  translation query; per-word value-addressed nodes (v7-merge-style)
-  remain the optimization if pool re-emission bytes ever matter.
-  The walk's production surface for interiors is code (clean) plus
-  verify-identity and start/size accounting.
+  walk gets, while code-interior anchoring is perfect.
+
+  Value-resolution cascade measurement (Eric's bind-by-value-first
+  proposal: compute each queried word's required value — named pins +
+  map-placed section addresses — and scan the placed pool for it):
+  of 60,445 literal queries, value found 19,685 (33%; includes 5,146
+  of the 10,001 ambiguous — the coalesced twins, interchangeable by
+  the read-only contract) · value absent 40,205 (99.6% of
+  DELETED-word queries miss: a longcall-killed word's value — the
+  callee address — genuinely leaves the pool) · value uncomputable
+  555 (0.9%; plus 126 false "misses" targeting SHF_MERGE sections
+  where placed+addend is invalid — harness lacks v7 per-entry
+  resolution, production has it).
+
+  POLICY (Eric, 2026-06-12) — literal pools never play index games;
+  bytes are the identity:
+
+  1. **Exact-byte-match lookup first**, gated by the same flags that
+     let the linker deduplicate — the existing `content_addressable`
+     predicate (has bytes AND (read-only OR exec)). Compute the
+     word's linked value (its own reloc through the normal channels;
+     raw words are their bytes), scan the placed base pool for it,
+     word-aligned linear scan — measured pools are ≤244B, a value
+     index/hashmap isn't worth its cost (an image-wide value→addr
+     manifest index would run ~500KB for bytes of per-edit savings;
+     drawer).
+     PLUS a range gate the measurement surfaced: **l32r reaches
+     −256KB backward only**, so a matched base word must also be
+     reachable from every possible PC in the text slack — graft knows
+     both addresses ex ante, so the check is exact (conservative
+     window: word below slack start, within 256KB of slack end). On
+     deploy-sized images this disqualifies most cross-image binds;
+     on fixtures/small images the lookup wins often. Today's
+     positional pool-word anchors have the same latent range bug —
+     one more reason pools stop being anchor targets entirely.
+  2. **Fallback: the word travels with its code — which is free.**
+     The overlay's own input object already carries a pool with
+     exactly the words its code needs (gas regenerates pools per
+     compilation); "emitting" means letting the input pool join the
+     overlay link, where ld re-relaxes it natively (converts,
+     dead-strips, dedups). Strong code→pool edge implements this.
+  3. **Mutable region → hard fail** (never duplicate or
+     representative-bind mutable state; pull-with-dependents is the
+     unbuilt technically-correct alternative).
+
+  Per-word nodes (v7-style) stay unnecessary for pools: unlike
+  shared cstN merge sections, pools have exactly one referencer, so
+  word granularity buys nothing the lookup+travel pair doesn't. Cost
+  ceiling measured: 236KB of pools if every relaxed section's
+  referencer re-emitted at once (= a full rebuild); a real edit
+  drags a few dozen bytes. The walk's production surface for
+  interiors is code (clean) plus verify-identity and start/size
+  accounting.
 - **CI oracle**: symbol-saturate a fixture object (nameless locals
   every few bytes), link, harvest ld's st_value movements as ground
   truth for the walk's translations; plus fuzzing with random

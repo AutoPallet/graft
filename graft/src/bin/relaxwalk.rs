@@ -189,6 +189,17 @@ fn main() {
     let map_text = std::fs::read_to_string(&map_path).expect("read map");
     let entries = parse_map(&map_text, arch == Arch::Xtensa);
     println!("{} input sections from map", entries.len());
+    // value-resolution measurement needs placed addresses for EVERY
+    // input section (section-symbol literal targets) and the relaxed
+    // set (whose interiors placed+addend can't address)
+    let mut placed: HashMap<(String, String), Vec<u64>> = HashMap::new();
+    let mut relaxed_set: std::collections::HashSet<(String, String)> = Default::default();
+    if ambiguity && arch == Arch::Xtensa {
+        for e in parse_map(&map_text, false) {
+            placed.entry((e.obj.clone(), e.in_name.clone())).or_default().push(e.addr);
+        }
+        relaxed_set = entries.iter().map(|e| (e.obj.clone(), e.in_name.clone())).collect();
+    }
     drop(map_text);
 
     // linked image: section bytes by vaddr + unique-address symbol table
@@ -470,7 +481,22 @@ fn main() {
                         .get(&candidates[0].1)
                         .map(Vec::as_slice)
                         .unwrap_or(&[]);
-                    amb.add(&input, out_bytes, queries, &format!("{} {}", e.in_name, e.obj));
+                    let lit_vals = literal_values(
+                        &member.file,
+                        &sec,
+                        &input,
+                        &out_syms,
+                        &placed,
+                        &relaxed_set,
+                        &e.obj,
+                    );
+                    amb.add(
+                        &input,
+                        out_bytes,
+                        queries,
+                        &lit_vals,
+                        &format!("{} {}", e.in_name, e.obj),
+                    );
                 }
             }
             Verdict::Dirty(c, runs) => {
@@ -555,6 +581,63 @@ fn collect_queries(
     out
 }
 
+/// Expected linked value per literal word offset (None = not
+/// computable here): raw words carry their input bytes; relocated
+/// words resolve named symbols through the output symtab and
+/// section-symbol targets through the map's placed addresses —
+/// except interiors of OTHER relaxed sections, which would need that
+/// section's walk first.
+fn literal_values(
+    obj: &object::File,
+    sec: &object::Section,
+    input: &InputSection,
+    out_syms: &HashMap<String, u64>,
+    placed: &HashMap<(String, String), Vec<u64>>,
+    relaxed: &std::collections::HashSet<(String, String)>,
+    obj_spec: &str,
+) -> HashMap<usize, Option<u32>> {
+    use object::{ObjectSection, ObjectSymbol, RelocationTarget};
+    let mut vals: HashMap<usize, Option<u32>> = HashMap::new();
+    for (r, k) in &input.regions {
+        if *k != RegionKind::Literal {
+            continue;
+        }
+        let end = r.end.min(input.bytes.len());
+        let mut w = r.start;
+        while w + 4 <= end {
+            vals.insert(w, Some(u32::from_le_bytes(input.bytes[w..w + 4].try_into().unwrap())));
+            w += 4;
+        }
+    }
+    for (off, rel) in sec.relocations() {
+        let off = off as usize;
+        if rel.size() != 32 || !vals.contains_key(&off) {
+            continue;
+        }
+        let v = (|| {
+            let RelocationTarget::Symbol(si) = rel.target() else { return None };
+            let sym = obj.symbol_by_index(si).ok()?;
+            if sym.kind() == object::SymbolKind::Section {
+                let tsec = obj.section_by_index(sym.section_index()?).ok()?;
+                let key = (obj_spec.to_string(), tsec.name().ok()?.to_string());
+                if rel.addend() != 0 && relaxed.contains(&key) {
+                    return None; // interior of a relaxed section
+                }
+                let addrs = placed.get(&key)?;
+                if addrs.len() != 1 {
+                    return None; // same-named sections in one object
+                }
+                Some((addrs[0] as i64 + rel.addend()) as u32)
+            } else {
+                let addr = out_syms.get(sym.name().ok()?)?;
+                Some(addr.wrapping_add(rel.addend() as u64) as u32)
+            }
+        })();
+        vals.insert(off, v);
+    }
+    vals
+}
+
 /// Corpus-wide DP-intersection accounting (docs/16 §8): how often do
 /// equal-cost parses disagree about a byte's fate, and where.
 #[derive(Default)]
@@ -578,10 +661,28 @@ struct AmbStats {
     /// sections whose QUERIED offsets include a problem (deleted /
     /// interior / ambiguous): the set that must pull or hard-fail
     q_problem_sections: Vec<String>,
+    /// value-resolution outcome for literal queries, × fate:
+    /// the required word value was found in the placed pool (bind by
+    /// value), not found (emit that word / pull), or not computable
+    val_hit: [u64; 4],
+    val_miss: [u64; 4],
+    val_unknown: [u64; 4],
+    /// fallback volume: distinct missing words ×4 (strings-like
+    /// per-word emission) vs whole input pools (section pull)
+    emit_words: u64,
+    pull_sections: u64,
+    pull_bytes: u64,
 }
 
 impl AmbStats {
-    fn add(&mut self, input: &InputSection, out: &[u8], queries: &[usize], desc: &str) {
+    fn add(
+        &mut self,
+        input: &InputSection,
+        out: &[u8],
+        queries: &[usize],
+        lit_vals: &HashMap<usize, Option<u32>>,
+        desc: &str,
+    ) {
         let Some(fates) = engine::translations(input, out, &Xtensa) else {
             self.no_parse += 1;
             return;
@@ -627,6 +728,7 @@ impl AmbStats {
         }
         // cross the real query population against the fates
         let mut problem = false;
+        let mut missing_words: std::collections::HashSet<usize> = Default::default();
         for &q in queries {
             if q >= fates.len() {
                 self.q_other += 1; // off-section addend arithmetic
@@ -640,7 +742,27 @@ impl AmbStats {
             };
             match kind[q] {
                 0 => self.q_code[fate_idx] += 1,
-                1 => self.q_lit[fate_idx] += 1,
+                1 => {
+                    self.q_lit[fate_idx] += 1;
+                    // value-resolution cascade: required value known?
+                    // does any word-aligned slot of the placed bytes
+                    // hold it? (read-only ⇒ any match is bindable)
+                    let word = q & !3;
+                    match lit_vals.get(&word) {
+                        Some(Some(v)) => {
+                            let found = out
+                                .chunks_exact(4)
+                                .any(|c| u32::from_le_bytes(c.try_into().unwrap()) == *v);
+                            if found {
+                                self.val_hit[fate_idx] += 1;
+                            } else {
+                                self.val_miss[fate_idx] += 1;
+                                missing_words.insert(word);
+                            }
+                        }
+                        _ => self.val_unknown[fate_idx] += 1,
+                    }
+                }
                 _ => self.q_other += 1,
             }
             if fate_idx != 0 {
@@ -649,6 +771,11 @@ impl AmbStats {
         }
         if problem {
             self.q_problem_sections.push(desc.to_string());
+        }
+        if !missing_words.is_empty() {
+            self.emit_words += missing_words.len() as u64;
+            self.pull_sections += 1;
+            self.pull_bytes += input.bytes.len() as u64;
         }
     }
 
@@ -693,9 +820,25 @@ impl AmbStats {
             "sections with problem queries (deleted/interior/ambiguous → pull-or-fail): {}",
             self.q_problem_sections.len()
         );
-        for desc in self.q_problem_sections.iter().take(15) {
-            println!("  QPROB {desc}");
-        }
+        let h: u64 = self.val_hit.iter().sum();
+        let m: u64 = self.val_miss.iter().sum();
+        let u: u64 = self.val_unknown.iter().sum();
+        println!(
+            "literal value-resolution: HIT {h} (kept {} / deleted {} / ambiguous {}) · MISS {m} (kept {} / deleted {} / ambiguous {}) · value-unknown {u}",
+            self.val_hit[0],
+            self.val_hit[1],
+            self.val_hit[3],
+            self.val_miss[0],
+            self.val_miss[1],
+            self.val_miss[3],
+        );
+        println!(
+            "fallback volume: per-word emission {} words = {} bytes · whole-pool pull {} sections = {} bytes",
+            self.emit_words,
+            self.emit_words * 4,
+            self.pull_sections,
+            self.pull_bytes,
+        );
     }
 }
 
