@@ -416,6 +416,53 @@ time was re-reading archives per section).
   residual: masked pool words without a value pin (section-symbol
   targets). Unreachable-pad share 4,191. 2,364 sections carry some
   ambiguity; translation refuses per-offset, not per-section.
+
+  Decisions on the refusal path (Eric, 2026-06-12):
+
+  - **Refuse → closure-pull is only sound for immutable content.**
+    Pulling a writable section re-emits a second live copy while
+    base code keeps referencing base's — state divergence unless
+    every base dependent is pulled too. Pull-with-dependents is
+    *technically* the right general answer but is not built;
+    until it is, a refused offset into MUTABLE content must
+    HARD-FAIL the overlay build (bail to full relink), never pull
+    silently. Same predicate as `content_addressable` everywhere
+    else. (Literal pools are read-only, so the pool case may pull.)
+  - **Literal words are value-addressed content, not positions.**
+    Within the linker's contract, an l32r may bind to ANY address
+    holding the required word value — so resolution by value is
+    sound (read-only ⇒ identical copies interchangeable), re-emitting
+    a duplicate word next to a surviving base copy is harmless, and
+    Kept(o1)-vs-Kept(o2) ambiguity collapses whenever the candidate
+    slots hold equal bytes. Design direction: treat pool words as
+    per-entry nodes like SHF_MERGE strings (v7 per-entry identity),
+    making pools coalescable/duplicable by construction.
+  - **Pool-travels-with-code (strong code→own-pool edge)** is the
+    candidate policy to eliminate pool-interior queries at the
+    source; decide with the query-population measurement below.
+
+  Query-population measurement (same-object reloc targets — the
+  channel-2 interior-anchor proxy; pools are function-local so this
+  is the full pool-query population):
+
+  - **code queries: 6,001 — 100% Kept.** Every interior code offset
+    anything actually targets translates unambiguously, corpus-wide.
+  - **literal queries: 60,445 — 59% target DELETED words, 17%
+    ambiguous, only 24% kept.** The l32r relocs still target the
+    words ld killed (longcall conversion / coalescing); 7,334 of
+    10,000 sections carry at least one pull-or-fail query.
+
+  Conclusion: positional anchoring into relaxed pools is futile —
+  three quarters of real queries can't anchor no matter how good the
+  walk gets, while code-interior anchoring is perfect. So the policy
+  IS pool-travels-with-code (strong edge for any reloc targeting a
+  literal region): pools re-emit with their referencers, ld re-relaxes
+  them natively in the overlay link, and read-only-ness makes the
+  duplicate copies sound. Pool ambiguity then never reaches a
+  translation query; per-word value-addressed nodes (v7-merge-style)
+  remain the optimization if pool re-emission bytes ever matter.
+  The walk's production surface for interiors is code (clean) plus
+  verify-identity and start/size accounting.
 - **CI oracle**: symbol-saturate a fixture object (nameless locals
   every few bytes), link, harvest ld's st_value movements as ground
   truth for the walk's translations; plus fuzzing with random

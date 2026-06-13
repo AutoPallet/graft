@@ -279,6 +279,11 @@ fn main() {
         .map(|(p, b)| (p, index_members(b).unwrap_or_default()))
         .collect();
     let mut parsed: HashMap<(String, usize), Option<Member>> = HashMap::new();
+    // per-member: target section index → in-section offsets referenced
+    // by OTHER alloc sections of the same object (the harness proxy
+    // for channel-2 interior anchor queries)
+    let mut query_cache: HashMap<(String, usize), HashMap<object::SectionIndex, Vec<usize>>> =
+        HashMap::new();
 
     // walk every entry
     let mut attempted = 0usize;
@@ -459,7 +464,13 @@ fn main() {
                 }
                 census.absorb(&c);
                 if ambiguity {
-                    amb.add(&input, out_bytes, &format!("{} {}", e.in_name, e.obj));
+                    let queries = query_cache
+                        .entry((path.clone(), candidates[0].0))
+                        .or_insert_with(|| collect_queries(&member.file))
+                        .get(&candidates[0].1)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    amb.add(&input, out_bytes, queries, &format!("{} {}", e.in_name, e.obj));
                 }
             }
             Verdict::Dirty(c, runs) => {
@@ -507,6 +518,43 @@ fn main() {
     }
 }
 
+/// Same-object reloc targets, bucketed by target section: which
+/// in-section offsets would channel-2 anchor resolution actually ask
+/// the walk to translate. Cross-object references into another
+/// object's literal pool don't exist (pools are function-local), so
+/// same-object is the full query population for pools; for code it
+/// undercounts cross-object callers, which target symbol offsets the
+/// same way.
+fn collect_queries(
+    obj: &object::File,
+) -> HashMap<object::SectionIndex, Vec<usize>> {
+    use object::{ObjectSection, ObjectSymbol, RelocationTarget};
+    let mut out: HashMap<object::SectionIndex, Vec<usize>> = HashMap::new();
+    for x in obj.sections() {
+        let alloc = matches!(x.flags(), object::SectionFlags::Elf { sh_flags }
+            if sh_flags & u64::from(object::elf::SHF_ALLOC) != 0);
+        if !alloc {
+            continue; // debug/.xt.prop relocs are not runtime references
+        }
+        if x.name().is_ok_and(|n| n.starts_with(".xt.")) {
+            continue;
+        }
+        for (_, rel) in x.relocations() {
+            let RelocationTarget::Symbol(si) = rel.target() else { continue };
+            let Ok(sym) = obj.symbol_by_index(si) else { continue };
+            let Some(target) = sym.section_index() else { continue };
+            if target == x.index() {
+                continue; // intra-section: prune wires these internally
+            }
+            let off = sym.address() as i64 + rel.addend();
+            if off >= 0 {
+                out.entry(target).or_default().push(off as usize);
+            }
+        }
+    }
+    out
+}
+
 /// Corpus-wide DP-intersection accounting (docs/16 §8): how often do
 /// equal-cost parses disagree about a byte's fate, and where.
 #[derive(Default)]
@@ -522,10 +570,18 @@ struct AmbStats {
     /// (ambiguous bytes, code-region share, description)
     offenders: Vec<(u64, u64, String)>,
     no_parse: usize,
+    /// channel-2 query population × fate, split code/literal:
+    /// [kept, deleted, interior, ambiguous]
+    q_code: [u64; 4],
+    q_lit: [u64; 4],
+    q_other: u64,
+    /// sections whose QUERIED offsets include a problem (deleted /
+    /// interior / ambiguous): the set that must pull or hard-fail
+    q_problem_sections: Vec<String>,
 }
 
 impl AmbStats {
-    fn add(&mut self, input: &InputSection, out: &[u8], desc: &str) {
+    fn add(&mut self, input: &InputSection, out: &[u8], queries: &[usize], desc: &str) {
         let Some(fates) = engine::translations(input, out, &Xtensa) else {
             self.no_parse += 1;
             return;
@@ -569,6 +625,31 @@ impl AmbStats {
             }
             self.offenders.push((n_amb, code_amb, format!("{desc} first@{first:?}")));
         }
+        // cross the real query population against the fates
+        let mut problem = false;
+        for &q in queries {
+            if q >= fates.len() {
+                self.q_other += 1; // off-section addend arithmetic
+                continue;
+            }
+            let fate_idx = match fates[q] {
+                FateCell::Agreed(Fate::Kept(_)) => 0,
+                FateCell::Agreed(Fate::Deleted) => 1,
+                FateCell::Agreed(Fate::Interior) => 2,
+                FateCell::Ambiguous => 3,
+            };
+            match kind[q] {
+                0 => self.q_code[fate_idx] += 1,
+                1 => self.q_lit[fate_idx] += 1,
+                _ => self.q_other += 1,
+            }
+            if fate_idx != 0 {
+                problem = true;
+            }
+        }
+        if problem {
+            self.q_problem_sections.push(desc.to_string());
+        }
     }
 
     fn report(&mut self) {
@@ -595,6 +676,25 @@ impl AmbStats {
         self.offenders.sort_by_key(|(n, c, _)| std::cmp::Reverse((*c, *n)));
         for (n, c, desc) in self.offenders.iter().take(25) {
             println!("  AMBIG bytes={n} code={c} {desc}");
+        }
+        println!(
+            "queries (same-object reloc targets): code kept {} / deleted {} / interior {} / AMBIGUOUS {} · literal kept {} / deleted {} / interior {} / AMBIGUOUS {} · other-region {}",
+            self.q_code[0],
+            self.q_code[1],
+            self.q_code[2],
+            self.q_code[3],
+            self.q_lit[0],
+            self.q_lit[1],
+            self.q_lit[2],
+            self.q_lit[3],
+            self.q_other,
+        );
+        println!(
+            "sections with problem queries (deleted/interior/ambiguous → pull-or-fail): {}",
+            self.q_problem_sections.len()
+        );
+        for desc in self.q_problem_sections.iter().take(15) {
+            println!("  QPROB {desc}");
         }
     }
 }
