@@ -468,36 +468,48 @@ time was re-reading archives per section).
   where placed+addend is invalid — harness lacks v7 per-entry
   resolution, production has it).
 
-  POLICY (Eric, 2026-06-12) — literal pools never play index games;
-  bytes are the identity:
+  POLICY (Eric, 2026-06-12, final) — literal pools never play index
+  games, and the l32r range limit means **always re-emit**:
 
-  1. **Exact-byte-match lookup first**, gated by the same flags that
-     let the linker deduplicate — the existing `content_addressable`
-     predicate (has bytes AND (read-only OR exec)). Compute the
-     word's linked value (its own reloc through the normal channels;
-     raw words are their bytes), scan the placed base pool for it,
-     word-aligned linear scan — measured pools are ≤244B, a value
-     index/hashmap isn't worth its cost (an image-wide value→addr
-     manifest index would run ~500KB for bytes of per-edit savings;
-     drawer).
-     PLUS a range gate the measurement surfaced: **l32r reaches
-     −256KB backward only**, so a matched base word must also be
-     reachable from every possible PC in the text slack — graft knows
-     both addresses ex ante, so the check is exact (conservative
-     window: word below slack start, within 256KB of slack end). On
-     deploy-sized images this disqualifies most cross-image binds;
-     on fixtures/small images the lookup wins often. Today's
-     positional pool-word anchors have the same latent range bug —
-     one more reason pools stop being anchor targets entirely.
-  2. **Fallback: the word travels with its code — which is free.**
-     The overlay's own input object already carries a pool with
-     exactly the words its code needs (gas regenerates pools per
-     compilation); "emitting" means letting the input pool join the
-     overlay link, where ld re-relaxes it natively (converts,
-     dead-strips, dedups). Strong code→pool edge implements this.
-  3. **Mutable region → hard fail** (never duplicate or
+  1. **Any reloc targeting a literal region makes the target travel
+     with the referencer** (strong code→pool edge), gated by the
+     flags that let the linker deduplicate — the existing
+     `content_addressable` predicate. Re-emission is free: the
+     overlay's input object already carries a pool with exactly the
+     words its code needs (gas regenerates pools per compilation);
+     ld re-relaxes it natively in the overlay link (converts,
+     dead-strips, coalesces).
+  2. **Mutable region → hard fail** (never duplicate or
      representative-bind mutable state; pull-with-dependents is the
      unbuilt technically-correct alternative).
+
+  Considered and rejected: exact-byte-match lookup against base's
+  placed pool before re-emitting (bind to any base word with the
+  same value — sound under the read-only contract, and measured to
+  hit for 33% of static queries). Killed by the range limit:
+  **l32r reaches −256KB backward only**, so a cross-image bind from
+  the text slack to an arbitrary base pool word usually can't
+  encode; the eligible window is a sliver of the image, and the
+  saved bytes per edit are ~tens. If it's ever revived (small
+  images, LITBASE targets, x86-class reach), it's a word-aligned
+  linear scan of the placed pool — pools are ≤244B, a cached value
+  index isn't worth its footprint.
+
+  Re-emitted pools themselves have NO range problem (the question
+  that settled this): inside the overlay link the target script's
+  wildcard interleaving (`*(.literal .text ...)`) keeps each pool
+  adjacent to (just before) its code within the slack; ld's own
+  literal moving/coalescing is range-checked in elf32-xtensa.c
+  (`relocations_reach`) and keeps both copies or errors loudly
+  rather than mis-binding; and a pool WORD's value is an absolute
+  32-bit address, so slack-resident words pointing at base content
+  carry no distance constraint at all. The only range hazard ever
+  was an overlay l32r instruction targeting a base pool word —
+  which always-re-emit eliminates by construction (and which
+  today's positional pool-word anchors would have hit as a latent
+  bug: one more reason pools stop being anchor targets). Already
+  exercised in anger: the M1/M2 hardware overlays re-emitted pools
+  through this exact path.
 
   Per-word nodes (v7-style) stay unnecessary for pools: unlike
   shared cstN merge sections, pools have exactly one referencer, so
