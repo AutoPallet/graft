@@ -60,7 +60,7 @@ fn run(argv: Vec<String>) -> Result<()> {
     let base_path: PathBuf = std::env::var("GRAFT_BASE_ELF")
         .map(PathBuf::from)
         .map_err(|_| anyhow!("GRAFT_BASE_ELF not set"))?;
-    let base = load_base_metadata(&base_path)?;
+    let mut base = load_base_metadata(&base_path)?;
 
     let driver = crate::argv::driver_path(&argv);
     let (eager_inputs, deferred_inputs) = resolve_scan_inputs(&link_args, &driver);
@@ -74,6 +74,22 @@ fn run(argv: Vec<String>) -> Result<()> {
     )
     .context("overlay pre-scan")?;
     let t_scan = t_scan_start.elapsed();
+
+    // esp-idf's linker scripts mark `.flash.rodata` with SHF_TLS (a
+    // workaround for ld's IROM/DROM vaddr-overlap error), leaving a
+    // fake megabyte-scale PT_TLS covering all of DROM. Real ELF TLS
+    // cannot exist without SHF_TLS *input* sections; when the scan
+    // sees none, the segment is that script artifact — drop TLS
+    // handling wholesale instead of marking every rodata anchor
+    // STT_TLS and pinning slack to a template that isn't one.
+    let tls_nids = tls_node_ids(&scan);
+    if base.tls.is_some() && tls_nids.is_empty() {
+        eprintln!(
+            "graft overlay: base has a PT_TLS but no input section is SHF_TLS — \
+             treating it as the esp-idf rodata-overlap artifact (TLS handling off)"
+        );
+        base.tls = None;
+    }
 
     if let Ok(p) = std::env::var("GRAFT_DEBUG_DUMP_GRAPH")
         && !p.is_empty()
@@ -111,6 +127,27 @@ fn run(argv: Vec<String>) -> Result<()> {
     let closure = compute_closure_fixpoint(&scan, &base, &roots, walker.as_ref())?;
     let t_closure = t_closure_start.elapsed();
 
+    // xtensa vector guard: the overlay layout emits `.iram0.vectors`
+    // as NOLOAD (its script fill would otherwise alias base's data —
+    // see `mutate_sections_ld`), so re-emitted vector code would be
+    // silently discarded. Changed vectors require a full base rebuild.
+    if base.e_machine == object::elf::EM_XTENSA {
+        for &nid in &closure.closure {
+            for seg in &scan.graph.nodes[nid as usize].segments {
+                let name =
+                    &scan.objects[seg.object as usize].sections[seg.section as usize].name;
+                if name.contains("Vector.") || name == ".entry.text" || name.contains(".UserEnter")
+                {
+                    bail!(
+                        "closure re-emits interrupt-vector section {name} — vectors \
+                         can't live in overlay slack (VECBASE points at base's table). \
+                         Rebuild the base instead."
+                    );
+                }
+            }
+        }
+    }
+
     // Scratch dir next to the output path. Cleaned and recreated each
     // run so stale pruned .o's from a prior invocation don't confuse
     // the real linker.
@@ -128,7 +165,6 @@ fn run(argv: Vec<String>) -> Result<()> {
     // `resolve.rs` for the channel cascade.
     let closure_nids: HashSet<NodeId> = closure.closure.iter().copied().collect();
     let mutable_ths = mutable_trans_hashes(&scan);
-    let tls_nids = tls_node_ids(&scan);
     // Channel-1b defense set: every pool node (xtensa). A pool target
     // reaching dispose outside the closure means the walk's
     // force-include rule and disposition disagree — bail, never anchor.
@@ -1927,12 +1963,21 @@ fn mutate_memory_ld(content: &str, slack: &Slack) -> Result<String> {
 /// Mutate esp-idf's `sections.ld`: strip the `.flash_rodata_dummy`
 /// (analog of esp-hal's `.rotext_dummy`, ensures DROM/IROM cache
 /// alignment by burning rodata-side space equal to .flash.text size)
-/// and INCLUDE `graft_blockers.ld` near the start so the IRAM
-/// blocker is parsed before `.iram0.text`. The
+/// and `.dram0.dummy` (reserves the DRAM alias of IRAM usage —
+/// esp32s3 IRAM/DRAM are two buses over one SRAM), and INCLUDE
+/// `graft_blockers.ld` near the start so the IRAM blocker is parsed
+/// before `.iram0.text`. The
 /// `_flash_rodata_dummy_start = ABSOLUTE(ORIGIN(default_rodata_seg))`
 /// ASSERT in memory.ld is gated on `_flash_rodata_dummy_start`
 /// existing — replace the dummy clause with a stub that defines
 /// the symbol at the slack origin.
+///
+/// Dropping `.dram0.dummy` is sound ONLY while the overlay emits no
+/// IRAM content of its own: new IRAM bytes past base's usage would
+/// alias base's live `.dram0.data` through the other bus. Until base
+/// reserves an IRAM slack (with its DRAM alias kept free), a
+/// trailing ASSERT pins that invariant — overlay IRAM content fails
+/// the link loudly instead of silently corrupting base's data.
 fn mutate_sections_ld(content: &str) -> Result<String> {
     // Replace the `.flash_rodata_dummy` body. Keep the section name
     // so the assert in memory.ld still finds `_flash_rodata_dummy_start`,
@@ -1975,7 +2020,55 @@ fn mutate_sections_ld(content: &str) -> Result<String> {
     final_out.push_str(&out[..injection_point]);
     final_out.push_str("\n  INCLUDE \"graft_blockers.ld\"\n");
     final_out.push_str(&out[injection_point..]);
-    Ok(final_out)
+
+    // `.iram0.vectors` emits 0x400 of script-generated fill (absolute
+    // `. = 0x180`-style bumps) even with zero input vector sections.
+    // Loaded, those bytes would land past base's IRAM usage and alias
+    // base's live `.dram0.data` through the other bus — NOLOAD keeps
+    // the symbols (`_vector_table`, `_iram_start`) at their addresses
+    // while emitting no bytes. Real vector-code edits are refused
+    // graft-side (see the closure vector guard in `run`).
+    let final_out = final_out.replacen(
+        ".iram0.vectors :",
+        ".iram0.vectors (NOLOAD) :",
+        1,
+    );
+    if !final_out.contains(".iram0.vectors (NOLOAD) :") {
+        bail!("sections.ld: no `.iram0.vectors :` clause — esp-idf layout changed?");
+    }
+
+    // Stub `.dram0.dummy`: overlay's dram0_0_seg IS the data slack — a
+    // hole base already placed clear of every IRAM alias — so the
+    // IRAM-mirror reservation must not eat it.
+    let dummy_start = final_out
+        .find(".dram0.dummy (NOLOAD):")
+        .ok_or_else(|| anyhow!("sections.ld: no `.dram0.dummy` clause"))?;
+    let body_open = final_out[dummy_start..]
+        .find('{')
+        .ok_or_else(|| anyhow!("sections.ld: malformed dram0.dummy (no `{{`)"))?;
+    let body_close_rel = final_out[dummy_start + body_open..]
+        .find('}')
+        .ok_or_else(|| anyhow!("sections.ld: malformed dram0.dummy (no `}}`)"))?;
+    let body_close = dummy_start + body_open + body_close_rel;
+    let mut stubbed = String::with_capacity(final_out.len() + 128);
+    stubbed.push_str(&final_out[..dummy_start + body_open + 1]);
+    stubbed.push_str(
+        "\n    /* graft overlay: IRAM-alias reservation removed; overlay's \
+         dram0_0_seg is the data slack (already alias-free). */\n  ",
+    );
+    stubbed.push_str(&final_out[body_close..]);
+
+    // The invariant that made the stub sound, enforced by ld itself:
+    // the overlay may emit ZERO loadable IRAM content (its DRAM alias
+    // past base's usage is base's live data).
+    stubbed.push_str(
+        "\nASSERT(SIZEOF(.iram0.text) == 0 && SIZEOF(.iram0.data) == 0 && \
+         SIZEOF(.iram0.bss) == 0, \
+         \"graft overlay: emits IRAM content — its DRAM alias would corrupt \
+         base's data. Unsupported until base reserves an IRAM slack; keep \
+         edited code out of IRAM (IRAM_ATTR) or rebuild base.\")\n",
+    );
+    Ok(stubbed)
 }
 
 /// ESP32-S3 IRAM region, per esp-hal `memory.x`:
