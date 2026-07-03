@@ -109,15 +109,17 @@ fn run(argv: Vec<String>) -> Result<()> {
         if let Some(outcome) = crate::icf::run(&scan_result, &output)? {
             let s = &outcome.stats;
             eprintln!(
-                "graft icf: folded {} groups · dropped {} copies · {} input bytes \
-                 · rewrote {} objects in {} archives (skipped: {} non-local, \
-                 {} name-mismatch, {} mechanical)",
+                "graft icf: folded {} groups ({} capped at {} copies) · dropped {} \
+                 copies · {} input bytes · rewrote {} objects in {} archives \
+                 (skipped: {} weak-def, {} name-mismatch, {} mechanical)",
                 s.groups_folded,
+                s.groups_capped,
+                crate::icf::MAX_PARTICIPANTS,
                 s.copies_dropped,
                 s.bytes_dropped,
                 s.rewritten_objects,
                 s.rewritten_archives,
-                s.skipped_nonlocal,
+                s.skipped_weak_def,
                 s.skipped_name_mismatch,
                 s.skipped_mechanical,
             );

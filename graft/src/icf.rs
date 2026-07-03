@@ -48,10 +48,20 @@
 //! - **Executable, non-writable sections only.** No rodata folding
 //!   (`ptr::eq` on distinct statics could observe it), no `.rwtext`
 //!   (RAM-resident code has region semantics), no TLS/MERGE/GROUP.
-//! - **All symbols defined in the section are LOCAL.** A global name
-//!   would be demand-load- and cross-object-visible; moving its
-//!   definition changes archive semantics. (Duplicated monomorphs are
-//!   LOCAL by construction.)
+//! Sections defining GLOBAL symbols fold too (most duplicated
+//! monomorphs are GLOBAL+HIDDEN under distinct crate-suffixed v0
+//! names): every participating copy DEMOTES its own global defs to
+//! WEAK in place and gains WEAK aliases for every other participant's
+//! names at the matching offsets (sections are byte-identical, so
+//! offsets transfer). All names then bind to the first-loaded
+//! participant and the rest gc away. External strong refs stay
+//! correct in every load order because BFD ld extracts an archive
+//! member to satisfy a strong undef against a *weak* definition
+//! (verified empirically on x86 and xtensa esp-12.2 binutils), and an
+//! already-loaded weak def short-circuits the search. Alias count is
+//! quadratic in group size, so only the first
+//! [`MAX_PARTICIPANTS`] copies of a group participate — later copies
+//! are left untouched (correct, just unfolded).
 //! - **Identical section-name *class* across the group** — the name
 //!   prefix before the per-function mangled tail (`.llvm.<id>`
 //!   internalization suffixes stripped). Linker scripts scoop input
@@ -117,16 +127,25 @@ pub struct IcfStats {
     pub bytes_dropped: u64,
     pub rewritten_objects: usize,
     pub rewritten_archives: usize,
-    /// Groups skipped because a copy's section defines a non-LOCAL
-    /// symbol.
-    pub skipped_nonlocal: usize,
+    /// Groups skipped because a copy's section defines a WEAK symbol
+    /// (already vague linkage — refuse to stack schemes on it).
+    pub skipped_weak_def: usize,
     /// Groups skipped because copies' section-name classes differ
     /// (would cross linker-script scooping rules).
     pub skipped_name_mismatch: usize,
     /// Groups skipped for mechanical reasons (section index beyond
     /// SHN_LORESERVE, REL-format relocs, unsupported ELF shape).
     pub skipped_mechanical: usize,
+    /// Groups larger than MAX_PARTICIPANTS: only the first
+    /// MAX_PARTICIPANTS copies folded, the tail left as-is.
+    pub groups_capped: usize,
 }
+
+/// Cross-alias count is quadratic in participants; cap it. 16 keeps
+/// the worst symtab/strtab growth per group in the tens of KB while
+/// covering the bulk of the waste (group-size distribution is heavily
+/// skewed toward small groups).
+pub const MAX_PARTICIPANTS: usize = 16;
 
 pub struct IcfOutcome {
     pub stats: IcfStats,
@@ -136,14 +155,19 @@ pub struct IcfOutcome {
 }
 
 /// One planned edit to one on-disk input file (loose `.o` or archive
-/// member): redirect references into `section0` to `und_name`, and/or
-/// define `adds` in it.
+/// member).
 #[derive(Debug, Default, Clone)]
 struct ObjectPlan {
-    /// 0-based section index → UND name replacing refs into it.
+    /// 0-based section index → weak name replacing refs into it.
     redirects: HashMap<u32, String>,
-    /// (name, 0-based section index, st_size, min sh_addralign).
+    /// New WEAK+HIDDEN definitions: (name, 0-based section index,
+    /// st_value, st_size).
     adds: Vec<(String, u32, u64, u64)>,
+    /// Existing GLOBAL definitions to demote to WEAK in place:
+    /// (0-based section index, symbol name).
+    weaken: Vec<(u32, String)>,
+    /// sh_addralign floor per 0-based section index.
+    align_bumps: Vec<(u32, u64)>,
 }
 
 /// Compute fold groups from the scan and rewrite the affected inputs
@@ -228,15 +252,41 @@ pub fn run(scan: &ScanResult, output: &Path) -> Result<Option<IcfOutcome>> {
             stats.skipped_name_mismatch += 1;
             continue;
         }
-        let nonlocal = copies.iter().any(|&(o, s)| {
-            scan.objects[o].symbols.iter().any(|sym| {
-                sym.defining_section == Some(s as usize)
-                    && sym.bind != crate::elf::SymbolBind::Local
-            })
-        });
-        if nonlocal {
-            stats.skipped_nonlocal += 1;
+        // Per-copy global definitions in the section. WEAK defs mean
+        // some other vague-linkage scheme is already in play — refuse.
+        // st_value/st_size beyond the section is malformed — refuse.
+        let mut copy_globals: Vec<Vec<(String, u64, u64)>> = Vec::with_capacity(copies.len());
+        let mut weird = false;
+        for &(o, s) in &copies {
+            let sec_size = scan.objects[o].sections[s as usize].sh_size;
+            let mut globals = Vec::new();
+            for sym in &scan.objects[o].symbols {
+                if sym.defining_section != Some(s as usize) {
+                    continue;
+                }
+                match sym.bind {
+                    crate::elf::SymbolBind::Local => {}
+                    crate::elf::SymbolBind::Global => {
+                        if sym.name.is_empty() || sym.value.saturating_add(sym.size) > sec_size {
+                            weird = true;
+                        }
+                        globals.push((sym.name.clone(), sym.value, sym.size));
+                    }
+                    crate::elf::SymbolBind::Weak => weird = true,
+                }
+            }
+            globals.sort();
+            copy_globals.push(globals);
+        }
+        if weird {
+            stats.skipped_weak_def += 1;
             continue;
+        }
+
+        if copies.len() > MAX_PARTICIPANTS {
+            copies.truncate(MAX_PARTICIPANTS);
+            copy_globals.truncate(MAX_PARTICIPANTS);
+            stats.groups_capped += 1;
         }
 
         let icf_name = {
@@ -252,9 +302,11 @@ pub fn run(scan: &ScanResult, output: &Path) -> Result<Option<IcfOutcome>> {
                 surgery::section_addralign(&inp.bytes, s).unwrap_or(0),
             );
         }
-        // Symmetric: every copy defines the weak name at its own
-        // section and redirects its own references through it.
-        for &(o, s) in &copies {
+        // Symmetric: every participant defines the weak group name at
+        // its own copy, redirects its own references through it,
+        // demotes its own global defs to WEAK, and carries WEAK
+        // aliases for every other participant's global names.
+        for (ci, &(o, s)) in copies.iter().enumerate() {
             let inp = &scan.inputs[o];
             let key = (
                 std::fs::canonicalize(&inp.source_path)
@@ -262,13 +314,20 @@ pub fn run(scan: &ScanResult, output: &Path) -> Result<Option<IcfOutcome>> {
                 inp.member_name.clone(),
             );
             let plan = plans.entry(key).or_default();
-            plan.adds.push((
-                icf_name.clone(),
-                s,
-                scan.objects[o].sections[s as usize].sh_size,
-                max_align,
-            ));
+            plan.adds.push((icf_name.clone(), s, 0, scan.objects[o].sections[s as usize].sh_size));
+            plan.align_bumps.push((s, max_align));
             plan.redirects.insert(s, icf_name.clone());
+            for (cj, globals) in copy_globals.iter().enumerate() {
+                if cj == ci {
+                    for (name, _, _) in globals {
+                        plan.weaken.push((s, name.clone()));
+                    }
+                } else {
+                    for (name, value, size) in globals {
+                        plan.adds.push((name.clone(), s, *value, *size));
+                    }
+                }
+            }
         }
         stats.copies_dropped += copies.len() - 1;
         stats.bytes_dropped += copies[1..]
@@ -570,8 +629,21 @@ mod surgery {
     }
 
     struct Sym {
+        name_off: u32,
         value: u64,
         shndx: u16,
+    }
+
+    fn strtab_name<'a>(strtab: &'a [u8], off: u32) -> &'a [u8] {
+        let start = off as usize;
+        if start >= strtab.len() {
+            return &[];
+        }
+        let end = strtab[start..]
+            .iter()
+            .position(|&b| b == 0)
+            .map_or(strtab.len(), |p| start + p);
+        &strtab[start..end]
     }
 
     pub(super) fn rewrite_object(bytes: &[u8], plan: &super::ObjectPlan) -> Result<Vec<u8>> {
@@ -598,13 +670,14 @@ mod surgery {
         let mut syms: Vec<Sym> = Vec::with_capacity(sym_count);
         for i in 0..sym_count {
             let p = symtab.offset + i * sym_entsize;
-            let (value, shndx) = if l.is64 {
-                (u64le(bytes, p + 8), u16le(bytes, p + 6))
+            let (name_off, value, shndx) = if l.is64 {
+                (u32le(bytes, p), u64le(bytes, p + 8), u16le(bytes, p + 6))
             } else {
-                (u64::from(u32le(bytes, p + 4)), u16le(bytes, p + 14))
+                (u32le(bytes, p), u64::from(u32le(bytes, p + 4)), u16le(bytes, p + 14))
             };
-            syms.push(Sym { value, shndx });
+            syms.push(Sym { name_off, value, shndx });
         }
+        let strtab_bytes = &bytes[strtab.offset..strtab.offset + strtab.size];
 
         // 1-based header index of each redirected section → UND name.
         let dropped: HashMap<u16, &String> = plan
@@ -678,13 +751,13 @@ mod surgery {
         adds_sorted.sort();
         let mut new_syms: Vec<(String, u8 /*info*/, u16 /*shndx*/, u64, u64)> = Vec::new();
         let mut name_index: HashMap<&str, usize> = HashMap::new();
-        for (name, sec0, size, _) in &adds_sorted {
+        for (name, sec0, value, size) in &adds_sorted {
             if name_index.contains_key(name.as_str()) {
                 continue; // two copies of one group in one object: first def suffices
             }
             name_index.insert(name.as_str(), sym_count + new_syms.len());
             // STB_WEAK=2, STT_FUNC=2; STV_HIDDEN via st_other below.
-            new_syms.push((name.clone(), 0x22, (*sec0 + 1) as u16, 0, *size));
+            new_syms.push((name.clone(), 0x22, (*sec0 + 1) as u16, *value, *size));
         }
         for (_, name, _) in &patches {
             if !name_index.contains_key(name.as_str()) {
@@ -693,6 +766,21 @@ mod surgery {
         }
         if plan.adds.is_empty() {
             bail!("empty rewrite plan"); // caller bug — plans imply edits
+        }
+
+        // Locate the GLOBAL definitions to demote to WEAK. Patched in
+        // the relocated symtab blob below (the in-place original
+        // becomes a dead gap once the symtab moves).
+        let mut demote_indexes: Vec<usize> = Vec::new();
+        for (sec0, name) in &plan.weaken {
+            let want_shndx = (*sec0 + 1) as u16;
+            let found = syms.iter().enumerate().find(|(_, sym)| {
+                sym.shndx == want_shndx && strtab_name(strtab_bytes, sym.name_off) == name.as_bytes()
+            });
+            match found {
+                Some((i, _)) => demote_indexes.push(i),
+                None => bail!("weaken: no symbol {name} defined in section {sec0}"),
+            }
         }
 
         // ---- emit ------------------------------------------------------
@@ -722,8 +810,8 @@ mod surgery {
             }
         }
 
-        // Keeper alignment bumps (in-place sh_addralign patch).
-        for (_, sec0, _, min_align) in &adds_sorted {
+        // Alignment bumps (in-place sh_addralign patch).
+        for (sec0, min_align) in &plan.align_bumps {
             let idx = *sec0 as usize + 1;
             let s = headers
                 .get(idx)
@@ -752,6 +840,12 @@ mod surgery {
         // entries appended. Old data stays as a dead gap (ELF allows it).
         let mut sym_blob = bytes[symtab.offset..symtab.offset + symtab.size].to_vec();
         let mut str_blob = bytes[strtab.offset..strtab.offset + strtab.size].to_vec();
+        // GLOBAL → WEAK demotions (bind bits only; type/visibility kept).
+        let info_off = if l.is64 { 4 } else { 12 };
+        for &i in &demote_indexes {
+            let p = i * sym_entsize + info_off;
+            sym_blob[p] = 0x20 | (sym_blob[p] & 0x0f);
+        }
         for (name, info, shndx, value, size) in &new_syms {
             let name_off = str_blob.len() as u32;
             str_blob.extend_from_slice(name.as_bytes());

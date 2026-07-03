@@ -212,16 +212,16 @@ fn fold_local_duplicate_across_rlib_members() {
     let fake_output = d.join("out.elf");
     let outcome = graft::icf::run(&scan, &fake_output)
         .unwrap()
-        .expect("fold should find the duplicate");
-    assert_eq!(outcome.stats.groups_folded, 1, "exactly the dupfn group folds");
-    assert_eq!(outcome.stats.copies_dropped, 1);
-    assert_eq!(outcome.stats.bytes_dropped, DUPFN.len() as u64);
-    // The byte-identical GLOBAL callers must NOT fold (name mismatch /
-    // non-local — either skip is acceptable, folding them is not).
+        .expect("fold should find the duplicates");
+    // Two groups fold: the LOCAL dupfn twins AND the byte-identical
+    // GLOBAL use_a/use_b callers (demote-to-weak + cross-alias path;
+    // same name class `.text`, trans_hash equal because their dupfn
+    // callees hash equal).
+    assert_eq!(outcome.stats.groups_folded, 2);
+    assert_eq!(outcome.stats.copies_dropped, 2);
     assert_eq!(
-        outcome.stats.skipped_name_mismatch + outcome.stats.skipped_nonlocal,
-        1,
-        "the use_a/use_b 'twin' group is skipped, not folded"
+        outcome.stats.bytes_dropped,
+        (DUPFN.len() + CALLER.len()) as u64
     );
 
     let new_rlib = outcome
@@ -229,34 +229,48 @@ fn fold_local_duplicate_across_rlib_members() {
         .get(&std::fs::canonicalize(&rlib).unwrap())
         .expect("rlib rewritten");
 
-    // Symmetric weak aliasing: BOTH members define __graft_icf_* as a
-    // weak symbol at their own copy; neither imports anything (no
-    // cross-object UND may exist — archive member selection must stay
-    // bit-identical to the unfolded link).
+    // Symmetric weak aliasing: BOTH members define __graft_icf_* (one
+    // per folded group) as weak symbols at their own copies; neither
+    // imports anything (no cross-object UND may exist — archive member
+    // selection must stay bit-identical to the unfolded link). The
+    // GLOBAL callers are demoted to weak in their own members and
+    // cross-aliased weak in the other.
     {
         use object::{Object, ObjectSymbol, read::archive::ArchiveFile};
         let bytes = std::fs::read(new_rlib).unwrap();
         let ar = ArchiveFile::parse(&*bytes).unwrap();
-        let mut weak_defs = 0;
+        let mut icf_weak_defs = 0;
         let mut unds = 0;
+        let mut use_defs = 0; // use_a/use_b definitions across members
         for m in ar.members() {
             let m = m.unwrap();
             let data = m.data(&*bytes).unwrap();
             let obj = object::File::parse(data).unwrap();
             for sym in obj.symbols() {
                 let name = sym.name().unwrap_or("");
-                if !name.starts_with("__graft_icf_") {
+                if sym.is_undefined() {
+                    if name.starts_with("__graft_icf_") {
+                        unds += 1;
+                    }
                     continue;
                 }
-                if sym.is_undefined() {
-                    unds += 1;
-                } else {
+                if name.starts_with("__graft_icf_") {
                     assert!(sym.is_weak(), "fold definitions must be weak");
-                    weak_defs += 1;
+                    icf_weak_defs += 1;
+                }
+                if name == "use_a" || name == "use_b" {
+                    assert!(
+                        sym.is_weak(),
+                        "{name} must be weak (demoted or cross-aliased)"
+                    );
+                    use_defs += 1;
                 }
             }
         }
-        assert_eq!((weak_defs, unds), (2, 0), "every copy defines weak, none imports");
+        // 2 groups × 2 members = 4 weak group names; each member holds
+        // its own demoted caller + the other's alias = 4 defs total.
+        assert_eq!((icf_weak_defs, unds), (4, 0));
+        assert_eq!(use_defs, 4);
     }
 
     // Folded link: one copy, same behavior.
@@ -266,8 +280,21 @@ fn fold_local_duplicate_across_rlib_members() {
         "link with rewritten rlib failed"
     );
     let folded_bytes = std::fs::read(&folded).unwrap();
-    assert_eq!(count_pattern(&folded_bytes, DUPFN), 1, "fold left exactly one copy");
+    assert_eq!(count_pattern(&folded_bytes, DUPFN), 1, "fold left exactly one dupfn copy");
     assert_eq!(run_exit_code(&folded), 84, "folded program still computes 42+42");
+    // The GLOBAL caller twins folded too: one body, and both names
+    // resolve to the same address.
+    {
+        use object::{Object, ObjectSymbol};
+        let elf = object::File::parse(&*folded_bytes).unwrap();
+        let addr = |n: &str| {
+            elf.symbols()
+                .find(|s| s.name() == Ok(n))
+                .unwrap_or_else(|| panic!("{n} missing"))
+                .address()
+        };
+        assert_eq!(addr("use_a"), addr("use_b"), "caller twins share one body");
+    }
 }
 
 #[test]
