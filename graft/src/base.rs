@@ -119,7 +119,8 @@ fn run(argv: Vec<String>) -> Result<()> {
     let map_text = std::fs::read_to_string(&map_path)
         .with_context(|| format!("read linker map {}", map_path.display()))?;
     let map = crate::mapcheck::parse_map(&map_text);
-    let (table, stats) = build_section_table(&scan_result, &elf_bytes, &map, arch)?;
+    let (table, stats, dups) = build_section_table(&scan_result, &elf_bytes, &map, arch)?;
+    print_dup_summary(&dups);
     eprintln!(
         "graft base map-recovery: {} attributed ({} byte-identical · {} reconciled \
          through relaxation · {} no-bytes) · {} dropped unreconciled · \
@@ -168,6 +169,101 @@ fn run(argv: Vec<String>) -> Result<()> {
         t_post.elapsed(),
         t_total,
     );
+    Ok(())
+}
+
+/// One-line dedup-miss summary, printed on every base link. The full
+/// per-group listing lives behind `graft dup-stats` (subcommands.rs).
+fn print_dup_summary(dups: &[DupGroup]) {
+    if dups.is_empty() {
+        return;
+    }
+    let (mut exec_waste, mut ro_waste, mut copies) = (0u64, 0u64, 0usize);
+    for d in dups {
+        copies += d.placements.len() - 1;
+        if d.exec {
+            exec_waste += d.wasted_bytes();
+        } else {
+            ro_waste += d.wasted_bytes();
+        }
+    }
+    eprintln!(
+        "graft base dedup-miss: {} content-identical groups · {} redundant copies · \
+         {} bytes exec + {} bytes non-exec unfolded (ld has no ICF)",
+        dups.len(),
+        copies,
+        exec_waste,
+        ro_waste,
+    );
+}
+
+/// Replay scan + map-recovery against an existing base link (no
+/// relink) and print the full duplicate-placement report. Driven by
+/// `graft dup-stats` — see subcommands.rs for the CLI.
+pub(crate) fn dup_stats(
+    argv_file: &std::path::Path,
+    elf_path: &std::path::Path,
+    map_path: &std::path::Path,
+) -> Result<()> {
+    let text = std::fs::read_to_string(argv_file)
+        .with_context(|| format!("read argv file {}", argv_file.display()))?;
+    let mut argv: Vec<String> = vec!["graft".into()];
+    argv.extend(text.lines().filter(|l| !l.is_empty()).map(str::to_string));
+    if let Some(cwd) = extract_flag(&argv, "--ldproxy-cwd") {
+        std::env::set_current_dir(&cwd)
+            .with_context(|| format!("chdir to --ldproxy-cwd {cwd}"))?;
+    }
+    let link_args = argv::parse(&argv);
+    let driver = crate::argv::driver_path(&argv);
+    let (eager, deferred) = crate::overlay::resolve_scan_inputs(&link_args, &driver);
+    let entry = find_entry_symbol(&[]);
+    let scan_result = scan::run(
+        &eager,
+        &deferred,
+        &link_args.undefined,
+        &link_args.wrapped,
+        entry.as_deref(),
+    )
+    .context("scan")?;
+    let elf_bytes =
+        std::fs::read(elf_path).with_context(|| format!("read {}", elf_path.display()))?;
+    let map_text =
+        std::fs::read_to_string(map_path).with_context(|| format!("read {}", map_path.display()))?;
+    let map = crate::mapcheck::parse_map(&map_text);
+    let arch = crate::slack::detect_architecture(&link_args.inputs)
+        .context("detect target architecture from input objects")?;
+    let (_table, stats, dups) = build_section_table(&scan_result, &elf_bytes, &map, arch)?;
+
+    println!(
+        "dup-stats: {} nodes attributed · {} groups placed at >1 address",
+        stats.attributed,
+        dups.len(),
+    );
+    let (mut exec_waste, mut ro_waste) = (0u64, 0u64);
+    for d in &dups {
+        if d.exec {
+            exec_waste += d.wasted_bytes();
+        } else {
+            ro_waste += d.wasted_bytes();
+        }
+    }
+    println!("redundant bytes: {exec_waste} exec · {ro_waste} non-exec");
+    println!();
+    for d in &dups {
+        let h: String = d.trans_hash.iter().take(8).map(|b| format!("{b:02x}")).collect();
+        println!(
+            "x{:<3} waste {:>8}  {}  th={h}  {}  [{}]",
+            d.placements.len(),
+            d.wasted_bytes(),
+            if d.exec { "exec" } else { "data" },
+            d.section,
+            d.placements
+                .iter()
+                .map(|&(a, s)| format!("{a:#x}+{s:#x}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
     Ok(())
 }
 
@@ -267,7 +363,7 @@ fn build_section_table(
     elf_bytes: &[u8],
     map: &[crate::mapcheck::MapSection],
     arch: object::Architecture,
-) -> Result<(SectionTable, RecoveryStats)> {
+) -> Result<(SectionTable, RecoveryStats, Vec<DupGroup>)> {
     use std::collections::HashMap;
     use std::collections::hash_map::Entry;
 
@@ -415,6 +511,10 @@ fn build_section_table(
     let mut by_th: HashMap<[u8; 16], (u64, u64)> = HashMap::new();
     let mut ambiguous: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
     let mut dropped_examples: Vec<String> = Vec::new();
+    // Every placement per hash, for the dedup-miss report (ld has no
+    // ICF; content-identical copies it kept are pure image waste).
+    let mut placements: HashMap<[u8; 16], Vec<(u64, u64)>> = HashMap::new();
+    let mut dup_meta: HashMap<[u8; 16], (String, String, bool)> = HashMap::new();
     for (nid, rec, checked) in outcomes {
         match checked {
             Checked::NoBytes => stats.unverifiable += 1,
@@ -430,6 +530,14 @@ fn build_section_table(
             }
         }
         let th = scan.trans_hash[nid as usize];
+        placements.entry(th).or_default().push((rec.address, rec.out_size));
+        dup_meta.entry(th).or_insert_with(|| {
+            let seg = &scan.graph.nodes[nid as usize].segments[0];
+            let sh_flags =
+                scan.objects[seg.object as usize].sections[seg.section as usize].sh_flags;
+            let exec = sh_flags & u64::from(object::elf::SHF_EXECINSTR) != 0;
+            (rec.section.clone(), rec.path.clone(), exec)
+        });
         match by_th.entry(th) {
             Entry::Vacant(e) => {
                 e.insert((rec.address, rec.out_size));
@@ -444,6 +552,17 @@ fn build_section_table(
             }
         }
     }
+    let mut dups: Vec<DupGroup> = Vec::new();
+    for (th, mut addrs) in placements {
+        addrs.sort();
+        addrs.dedup();
+        if addrs.len() < 2 {
+            continue;
+        }
+        let (section, path, exec) = dup_meta.remove(&th).unwrap_or_default();
+        dups.push(DupGroup { trans_hash: th, section, path, exec, placements: addrs });
+    }
+    dups.sort_by_key(|d| std::cmp::Reverse(d.wasted_bytes()));
     if stats.dropped > 0 {
         eprintln!(
             "graft base map-recovery: {} placement claim(s) failed byte \
@@ -460,7 +579,32 @@ fn build_section_table(
     entries.sort_by(|a, b| a.trans_hash.cmp(&b.trans_hash));
     let mut ambiguous: Vec<[u8; 16]> = ambiguous.into_iter().collect();
     ambiguous.sort();
-    Ok((SectionTable { entries, ambiguous }, stats))
+    Ok((SectionTable { entries, ambiguous }, stats, dups))
+}
+
+/// One `trans_hash` that base placed at more than one address:
+/// content-identical, reloc-identical (transitively) sections ld kept
+/// as separate copies because it has no ICF. Every copy past the first
+/// is redundant image bytes.
+pub(crate) struct DupGroup {
+    pub trans_hash: [u8; 16],
+    /// Representative input section name (diagnostic).
+    pub section: String,
+    /// Representative input path (diagnostic).
+    pub path: String,
+    pub exec: bool,
+    /// (address, out_size) per distinct placement, address-sorted.
+    pub placements: Vec<(u64, u64)>,
+}
+
+impl DupGroup {
+    /// Bytes the image would shed if all copies folded to one: total
+    /// placed size minus the largest copy (copies can relax to
+    /// different sizes at different addresses).
+    pub(crate) fn wasted_bytes(&self) -> u64 {
+        let total: u64 = self.placements.iter().map(|&(_, s)| s).sum();
+        total - self.placements.iter().map(|&(_, s)| s).max().unwrap_or(0)
+    }
 }
 
 #[derive(Default)]

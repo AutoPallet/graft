@@ -10,6 +10,7 @@ fn main() -> ExitCode {
             "cache-info" => return graft::subcommands::cache_info(&args[2..]),
             "combine" => return graft::subcommands::combine(&args[2..]),
             "scan-dump" => return graft::subcommands::scan_dump(&args[2..]),
+            "dup-stats" => return graft::subcommands::dup_stats(&args[2..]),
             "snapshot" | "clean" => {
                 eprintln!("graft: subcommand `{cmd}` not yet implemented");
                 return ExitCode::from(2);

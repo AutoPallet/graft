@@ -133,6 +133,46 @@ pub fn combine(args: &[String]) -> ExitCode {
     }
 }
 
+/// Replay scan + map-recovery against an existing base link and print
+/// every trans_hash the linker placed at more than one address —
+/// content-identical sections ld kept as separate copies (it has no
+/// ICF). Nothing is relinked; needs the link argv (one arg per line),
+/// the linked ELF, and its linker map.
+pub fn dup_stats(args: &[String]) -> ExitCode {
+    let mut argv_file: Option<&str> = None;
+    let mut elf: Option<&str> = None;
+    let mut map: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--argv" => {
+                argv_file = args.get(i + 1).map(String::as_str);
+                i += 2;
+            }
+            "--elf" => {
+                elf = args.get(i + 1).map(String::as_str);
+                i += 2;
+            }
+            "--map" => {
+                map = args.get(i + 1).map(String::as_str);
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    let (Some(argv_file), Some(elf), Some(map)) = (argv_file, elf, map) else {
+        eprintln!("usage: graft dup-stats --argv <argv-file> --elf <base.elf> --map <link.map>");
+        return ExitCode::from(2);
+    };
+    match crate::base::dup_stats(Path::new(argv_file), Path::new(elf), Path::new(map)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("graft dup-stats: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// Scan a set of inputs and dump per-section content/reloc fingerprints.
 /// Output is one line per allocated section, in a stable text format
 /// suitable for diffing two scans of the "same" inputs (e.g. before
