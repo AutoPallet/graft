@@ -32,6 +32,7 @@ use anyhow::{Result, bail};
 
 use crate::graph::{NodeId, ResolvedTarget};
 use crate::hash::TransHash;
+use crate::metadata::Placed;
 
 /// What prune should emit for one relocation it can't satisfy from its
 /// own kept sections.
@@ -97,8 +98,8 @@ pub struct Resolver<'a> {
     /// applied the rename; this re-applies it to the *emitted* name
     /// (UND / verify) so ld sees the wrapper.
     pub wrapped: &'a HashSet<String>,
-    /// Base's content-keyed section table (`trans_hash → address`).
-    pub by_section: &'a HashMap<TransHash, u64>,
+    /// Base's content-keyed section table (`trans_hash → placement`).
+    pub by_section: &'a HashMap<TransHash, Placed>,
     /// Hashes base placed at multiple distinct addresses.
     pub ambiguous_sections: &'a HashSet<TransHash>,
     /// Base.elf symtab snapshot (unique-address names only).
@@ -175,7 +176,7 @@ impl<'a> Resolver<'a> {
                 tls: self.tls_nids.contains(&nid),
             });
         }
-        if let Some(&sec_addr) = self.by_section.get(&th) {
+        if let Some(&Placed { addr: sec_addr, .. }) = self.by_section.get(&th) {
             if self.ambiguous_sections.contains(&th) {
                 if let Some(name) = name
                     && let Some(&addr) = self.by_name.get(name)

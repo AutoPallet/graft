@@ -16,6 +16,7 @@
 //! ld's transform *alphabet*, never its decisions.
 
 pub mod engine;
+pub mod verify;
 pub mod x86;
 pub mod xtensa;
 

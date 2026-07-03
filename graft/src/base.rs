@@ -10,10 +10,9 @@ use std::io::Write;
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, anyhow, bail};
-use object::{Object, ObjectSymbol, SymbolScope};
+use object::Object;
 
 use crate::argv;
-use crate::elf::SymbolBind;
 use crate::elf_attach::{self, NewSection};
 use crate::metadata::{
     GRAFT_MAGIC, GraftManifest, SCHEMA_VERSION, SECTION_MANIFEST, SECTION_SECTIONS, SectionEntry,
@@ -84,16 +83,13 @@ fn run(argv: Vec<String>) -> Result<()> {
         .context("detect target architecture from input objects")?;
     let mut argv = inject_slack(argv, arch, &output)?;
 
-    // `-Map` oracle (GRAFT_MAP_ORACLE=1): ask the real linker for its
-    // map and, after address recovery, verify every recovered section
-    // address against it — ld is the reference implementation, so any
-    // disagreement is an identity-model bug that must fail the base
-    // build. Enabled in the e2e suites; see `mapcheck`.
-    let map_oracle = std::env::var("GRAFT_MAP_ORACLE").is_ok_and(|v| !v.is_empty() && v != "0");
+    // The linker map is base's address-recovery source (see `mapcheck`):
+    // it states every input section's placed address, size, and — on
+    // relaxing targets — the pre-relaxation size, none of which can be
+    // recovered from symbols once ld rewrites section interiors. Always
+    // requested; kept next to the output for debugging.
     let map_path = output.with_extension("graft-map");
-    if map_oracle {
-        argv.push(format!("-Wl,-Map={}", map_path.display()));
-    }
+    argv.push(format!("-Wl,-Map={}", map_path.display()));
     let argv = argv;
 
     let t_link_start = std::time::Instant::now();
@@ -120,20 +116,22 @@ fn run(argv: Vec<String>) -> Result<()> {
             eprintln!("graft base: GRAFT_DEBUG_DUMP_GRAPH write {p} failed: {e}");
         }
     }
-    let (table, node_addrs) = build_section_table(&scan_result, &elf_bytes)?;
-
-    if map_oracle {
-        let text = std::fs::read_to_string(&map_path)
-            .with_context(|| format!("GRAFT_MAP_ORACLE: read {}", map_path.display()))?;
-        let map = crate::mapcheck::parse_map(&text);
-        let stats = crate::mapcheck::oracle_check(&scan_result, &node_addrs, &map)
-            .context("GRAFT_MAP_ORACLE")?;
-        eprintln!(
-            "graft base map-oracle: {} recovered addresses verified against the \
-             linker map · {} ambiguous-key skipped · {} placed-but-unrecovered",
-            stats.checked, stats.skipped_ambiguous_key, stats.coverage_gaps,
-        );
-    }
+    let map_text = std::fs::read_to_string(&map_path)
+        .with_context(|| format!("read linker map {}", map_path.display()))?;
+    let map = crate::mapcheck::parse_map(&map_text);
+    let (table, stats) = build_section_table(&scan_result, &elf_bytes, &map, arch)?;
+    eprintln!(
+        "graft base map-recovery: {} attributed ({} byte-identical · {} reconciled \
+         through relaxation · {} no-bytes) · {} dropped unreconciled · \
+         {} ambiguous-key skipped · {} size-mismatch skipped",
+        stats.attributed,
+        stats.verified,
+        stats.verified_relaxed,
+        stats.unverifiable,
+        stats.dropped,
+        stats.skipped_ambiguous,
+        stats.skipped_size_mismatch,
+    );
 
     let manifest = GraftManifest {
         magic: GRAFT_MAGIC,
@@ -235,255 +233,252 @@ fn exec_real_linker(argv: &[String]) -> Result<std::process::ExitStatus> {
     Ok(status)
 }
 
-/// Recover each retained input section's base virtual address, keyed by
-/// the section's `trans_hash`, producing the `.graft.sections` table.
+/// Build the `.graft.sections` table: where did base place each input
+/// section, keyed by the section's `trans_hash`.
 ///
-/// base.elf's section headers only expose the *merged output* section
-/// (e.g. one `.rwtext` for all CGUs), so per-input addresses are
-/// recovered from symbols: for each symbol a node defines that base
-/// resolved, `candidate = final_addr − st_value` is the section start.
-/// Symbols genuinely in *this* copy agree on one base; a weak global ld
-/// resolved to a *different* copy is an outlier, so we take the majority
-/// (preferring locals — they are never cross-resolved, hence
-/// authoritative). Content-identical sections base placed at distinct
-/// addresses (un-folded identical monomorphizations) collide on
-/// `trans_hash`; we keep one representative address and flag the hash
-/// `ambiguous` so a named reference can be disambiguated by name when the
-/// name is unique. See `docs/14-identity-granularity.md`.
+/// Addresses and placed sizes come from the **linker map** — ld's own
+/// record, and the only source that survives relaxation (back-computing
+/// from symbols drifts the moment ld deletes bytes inside a section).
+/// Attribution is by exact key (object basename, archive member,
+/// section name) plus input size; anything ambiguous is skipped, not
+/// guessed (the node just isn't in the table, and an overlay reference
+/// to it re-emits — always safe).
 ///
-/// Aggregator brackets (`__init_array_start` etc.) and other
-/// linker-script / crt symbols are intentionally NOT in this table —
-/// they carry no section content and resolve overlay-side through the
-/// base.elf symtab snapshot (prune channel 3) with a post-link verify.
-/// Returns the encoded table plus the raw per-node recovery
-/// (`NodeId → placed section base`), which the `-Map` oracle checks
-/// against the linker's own record — including the individual copies
-/// behind an ambiguous trans_hash, which the collapsed table can't
-/// represent.
+/// Every attributed claim is then **byte-verified** against the linked
+/// image before it's recorded: masked compare, with the relaxation
+/// walk as the slow path on xtensa (`relax::verify`). A claim the
+/// bytes can't support is dropped with a count. This is the entire
+/// integrity story — no symbol votes, no map-symbol cross-checks —
+/// and it's strictly stronger wherever bytes exist: it verifies the
+/// actual placement against ld's output. Sections with no bytes
+/// anywhere (.bss) ride on the exact-key attribution alone; a key
+/// collision there is refused as ambiguous rather than resolved.
+///
+/// Content-identical sections base placed at distinct addresses
+/// (un-folded identical monomorphizations) collide on `trans_hash`; we
+/// keep one representative address and flag the hash `ambiguous` so a
+/// named reference can be disambiguated by name when the name is
+/// unique. Aggregator brackets (`__init_array_start` etc.) and
+/// SHF_MERGE / string-pool per-entry nodes are intentionally NOT in
+/// this table — they resolve through other channels (symtab snapshot /
+/// re-emission). See `docs/14-identity-granularity.md`, docs/16 §8.
 fn build_section_table(
     scan: &ScanResult,
     elf_bytes: &[u8],
-) -> Result<(SectionTable, std::collections::HashMap<u32, u64>)> {
+    map: &[crate::mapcheck::MapSection],
+    arch: object::Architecture,
+) -> Result<(SectionTable, RecoveryStats)> {
     use std::collections::HashMap;
     use std::collections::hash_map::Entry;
-    let elf = object::File::parse(elf_bytes).context("parse output ELF")?;
 
-    // TLS st_values are template-relative (the map oracle caught std's
-    // .tbss statics "recovered" at 0x20 when treated as addresses);
-    // `symbol_vaddr` translates them so TLS sections join the same
-    // vaddr-keyed table as everything else, and overlay-side anchors
-    // land inside the TLS map sections.
-    let tls_vaddr: Option<u64> = crate::combine::pt_tls(elf_bytes)?.map(|t| t.vaddr);
+    use crate::relax::verify::{self, LinkedImage, SectionCheck};
 
-    // (name, key_tu) → unique final address, or `None` once the name is
-    // seen at two distinct addresses (then it's a poor surrogate and we
-    // skip it for voting). key_tu = None for globals/weaks, Some(tu) for
-    // STT_FILE-partitioned locals — matching `tu_id` derivation.
-    let mut final_addr: HashMap<(String, Option<[u8; 8]>), Option<u64>> = HashMap::new();
-    let mut current_tu: Option<[u8; 8]> = None;
-    for s in elf.symbols() {
-        let name_raw = s.name().unwrap_or("");
-        if matches!(s.kind(), object::SymbolKind::File) {
-            current_tu = Some(tu_id_from_file_name(name_raw));
-            continue;
-        }
-        if s.is_undefined() { continue; }
-        if matches!(s.kind(), object::SymbolKind::Section) { continue; }
-        if name_raw.is_empty() { continue; }
-        let Some(addr) = crate::combine::symbol_vaddr(s.kind(), s.address(), tls_vaddr) else {
-            continue;
-        };
-        let is_global = matches!(s.scope(), SymbolScope::Linkage | SymbolScope::Dynamic);
-        let key_tu = if is_global { None } else { current_tu };
-        match final_addr.entry((name_raw.to_string(), key_tu)) {
-            Entry::Vacant(v) => {
-                v.insert(Some(addr));
-            }
-            Entry::Occupied(mut o) => {
-                if let Some(a) = *o.get()
-                    && a != addr
-                {
-                    o.insert(None); // same (name, tu) at two addresses → unusable surrogate
-                }
-            }
-        }
+    if map.is_empty() {
+        bail!(
+            "graft base map-recovery: parsed zero input-section records — \
+             wrong linker map format (is the real linker GNU ld?)"
+        );
     }
 
-    // (object, section) → node, keeping the first node for shared
-    // sections (mirrors `node_id_of`'s first-match for string-pool
-    // sub-nodes / aggregator contributors).
-    let mut node_of: HashMap<(u32, u32), u32> = HashMap::new();
+    // (object basename, member, section name) → map records.
+    let mut index: HashMap<(&str, Option<&str>, &str), Vec<&crate::mapcheck::MapSection>> =
+        HashMap::new();
+    for m in map {
+        index
+            .entry((m.object.as_str(), m.member.as_deref(), m.section.as_str()))
+            .or_default()
+            .push(m);
+    }
+
+    let mut stats = RecoveryStats::default();
+    // Attributed placement claims: (node, object, section, record).
+    let mut attributed: Vec<(u32, u32, u32, &crate::mapcheck::MapSection)> = Vec::new();
     for (nid, nm) in scan.graph.nodes.iter().enumerate() {
-        for seg in &nm.segments {
-            node_of.entry((seg.object, seg.section)).or_insert(nid as u32);
+        if nm.is_aggregator() {
+            continue; // many contributors, no single base address
+        }
+        let [seg] = nm.segments.as_slice() else { continue };
+        if seg.range.is_some() {
+            continue; // per-string / per-merge-entry nodes re-emit, never positional
+        }
+        let obj = &scan.objects[seg.object as usize];
+        let sec = &obj.sections[seg.section as usize];
+        if sec.sh_flags & u64::from(object::elf::SHF_ALLOC) == 0 {
+            continue; // never placed; map "addresses" would be vma-0 offsets
+        }
+        if sec.sh_flags & u64::from(object::elf::SHF_MERGE) != 0 {
+            continue; // ld shuffles entries; the section address says nothing
+        }
+        let input = &scan.inputs[seg.object as usize];
+        let obj_name = input
+            .source_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let key = (obj_name, input.member_name.as_deref(), sec.name.as_str());
+        let Some(records) = index.get(&key) else {
+            continue; // gc'd by ld, or the member wasn't loaded
+        };
+        // ld's input size must equal ours. A mismatch means the record
+        // isn't this section — or ld structurally edited it (.eh_frame
+        // CIE dedup), in which case positional anchoring is wrong anyway.
+        let matching: Vec<&&crate::mapcheck::MapSection> =
+            records.iter().filter(|r| r.in_size == sec.sh_size).collect();
+        match matching.len() {
+            1 => attributed.push((nid as u32, seg.object, seg.section, matching[0])),
+            0 => stats.skipped_size_mismatch += 1,
+            // Same name AND same size twice in one object (the .rwtext
+            // twins): indistinguishable — refuse rather than guess.
+            _ => stats.skipped_ambiguous += 1,
         }
     }
-
-    // Per-node candidate section-base addresses, kept separate because
-    // they carry different authority: ld can resolve a *global/weak*
-    // name to a different copy than this node's (cross-resolution), so
-    // those are majority-voted; an STB_LOCAL symbol is NEVER resolved
-    // to another object's copy, so locals aren't a vote at all — they
-    // are ground truth. Any disagreement among one node's locals means
-    // the section was not placed as a single unit (an identity-model
-    // violation), and the base build fails loud rather than recording
-    // an address that resolves some references into the wrong bytes.
-    struct Votes {
-        /// (symbol name, back-computed section base) — names kept for
-        /// the unanimity-violation diagnostic.
-        local: Vec<(String, u64)>,
-        other: Vec<u64>,
+    stats.attributed = attributed.len();
+    if attributed.is_empty() {
+        bail!(
+            "graft base map-recovery: zero nodes attributed to map records — \
+             object/section key derivation is broken"
+        );
     }
-    let mut votes: HashMap<u32, Votes> = HashMap::new();
-    for (obj_idx, obj) in scan.objects.iter().enumerate() {
-        for sym in &obj.symbols {
-            let Some(sec_idx) = sym.defining_section else { continue };
-            if sym.name.is_empty() { continue; }
-            // TLS sections vote like everything else — their final
-            // symtab values were translated to template *vaddrs* above
-            // (PT_TLS.p_vaddr + st_value), so `final − input_offset`
-            // recovers the section's template vaddr. Overlay-side, a
-            // reference to one anchors inside the SHF_TLS map sections
-            // and ld recomputes the TP offset from the identical
-            // template geometry. See docs/15 mechanism (c).
-            //
-            // SHF_MERGE sections never vote: ld deduplicates/reorders
-            // their *entries* across inputs, so `final − st_value` is
-            // valid only for the one entry carrying the symbol and is
-            // NOT the section's base (the map oracle caught salsa's
-            // `.rodata.cstN` recovered this way). Their per-entry
-            // nodes resolve by re-emission, never positionally.
-            if obj.sections[sec_idx].sh_flags & u64::from(object::elf::SHF_MERGE) != 0 {
+
+    // Byte-verify every claim against the linked image (docs/16 §8):
+    // masked compare, then (xtensa) the transform walk. One object
+    // parse per object, fanned out across cores.
+    let image = LinkedImage::new(elf_bytes).map_err(|e| anyhow!("parse linked image: {e}"))?;
+    let lit_syms = if matches!(arch, object::Architecture::Xtensa) {
+        let elf = object::File::parse(elf_bytes).context("parse output ELF")?;
+        verify::unique_symbol_addrs(&elf)
+    } else {
+        HashMap::new()
+    };
+    let mut by_obj: HashMap<u32, Vec<(u32, u32, &crate::mapcheck::MapSection)>> = HashMap::new();
+    for &(nid, obj, sec, rec) in &attributed {
+        by_obj.entry(obj).or_default().push((nid, sec, rec));
+    }
+    enum Checked {
+        NoBytes,
+        Identical,
+        Reconciled,
+        Drop(String),
+    }
+    use rayon::prelude::*;
+    let by_obj: Vec<_> = by_obj.into_iter().collect();
+    let outcomes: Vec<(u32, &crate::mapcheck::MapSection, Checked)> = by_obj
+        .par_iter()
+        .flat_map(|(obj, entries)| {
+            let file = object::File::parse(&*scan.inputs[*obj as usize].bytes);
+            entries
+                .iter()
+                .map(|&(nid, sec_idx, rec)| {
+                    let sinfo = &scan.objects[*obj as usize].sections[sec_idx as usize];
+                    if sinfo.bytes.is_empty() {
+                        // NOBITS / zero-size: nothing to match anywhere.
+                        // The claim rides on the exact key + size alone.
+                        return (nid, rec, Checked::NoBytes);
+                    }
+                    let checked = (|| {
+                        let file = match &file {
+                            Ok(f) => f,
+                            Err(e) => return Checked::Drop(format!("reparse object: {e}")),
+                        };
+                        let Some(out) = image.slice(rec.address, rec.out_size) else {
+                            return Checked::Drop(format!(
+                                "no linked bytes at {:#x}+{:#x}",
+                                rec.address, rec.out_size
+                            ));
+                        };
+                        let osec = match file
+                            .section_by_index(object::SectionIndex(sec_idx as usize + 1))
+                        {
+                            Ok(s) => s,
+                            Err(e) => return Checked::Drop(format!("section by index: {e}")),
+                        };
+                        let input = match verify::input_view(arch, file, &osec, &lit_syms) {
+                            Ok(i) => i,
+                            Err(e) => return Checked::Drop(format!("extract input: {e}")),
+                        };
+                        match verify::check_section(arch, &input, out) {
+                            SectionCheck::Identical => Checked::Identical,
+                            SectionCheck::Reconciled => Checked::Reconciled,
+                            SectionCheck::Dirty(why) => Checked::Drop(why),
+                        }
+                    })();
+                    (nid, rec, checked)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // trans_hash → placed (address, out_size). When several nodes share
+    // a trans_hash at *different* addresses (content-identical sections
+    // base did not fold) we keep one representative (the smallest, for
+    // determinism) and flag the hash ambiguous.
+    let mut by_th: HashMap<[u8; 16], (u64, u64)> = HashMap::new();
+    let mut ambiguous: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
+    let mut dropped_examples: Vec<String> = Vec::new();
+    for (nid, rec, checked) in outcomes {
+        match checked {
+            Checked::NoBytes => stats.unverifiable += 1,
+            Checked::Identical => stats.verified += 1,
+            Checked::Reconciled => stats.verified_relaxed += 1,
+            Checked::Drop(why) => {
+                stats.dropped += 1;
+                if dropped_examples.len() < 20 {
+                    dropped_examples
+                        .push(format!("  {} {} @{:#x}: {why}", rec.section, rec.path, rec.address));
+                }
                 continue;
             }
-            let Some(&nid) = node_of.get(&(obj_idx as u32, sec_idx as u32)) else { continue };
-            let (key_tu, is_local) = match sym.bind {
-                SymbolBind::Global | SymbolBind::Weak => (None, false),
-                SymbolBind::Local => (Some(obj.tu_id), true),
-            };
-            let Some(Some(addr)) = final_addr.get(&(sym.name.clone(), key_tu)).copied() else {
-                continue; // not in base symtab, or an ambiguous surrogate
-            };
-            let Some(base) = addr.checked_sub(sym.value) else { continue };
-            let v = votes
-                .entry(nid)
-                .or_insert_with(|| Votes { local: Vec::new(), other: Vec::new() });
-            if is_local {
-                v.local.push((sym.name.clone(), base));
-            } else {
-                v.other.push(base);
-            }
         }
-    }
-
-    // trans_hash → recovered base address. When several nodes share a
-    // trans_hash at *different* addresses (content-identical sections base
-    // did not fold — e.g. a tiny local helper duplicated across CGUs) we
-    // keep one **representative** (the smallest, for determinism) and flag
-    // the hash ambiguous. A named overlay reference to a multi-copy hash
-    // resolves to base's exact copy by name when the name is unique
-    // (genuinely distinct symbols that happen to be byte-identical);
-    // same-name duplicates are interchangeable, so the representative is
-    // sound. See `docs/14-identity-granularity.md`.
-    let mut by_th: HashMap<[u8; 16], u64> = HashMap::new();
-    let mut ambiguous: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
-    let mut node_addrs: HashMap<u32, u64> = HashMap::new();
-    for (&nid, v) in &votes {
-        // Aggregator nodes fold many contributor sections into one node;
-        // a single "section base" is meaningless for them (and their
-        // contributors' locals would trip the unanimity check below).
-        // They resolve through bracket names via base_symtab (channel 3),
-        // never positionally — keep them out of the table.
-        if scan.graph.nodes[nid as usize].is_aggregator() {
-            continue;
-        }
-        let base = if v.local.is_empty() {
-            let Some(base) = majority(&v.other) else { continue };
-            base
-        } else {
-            // Locals are ground truth and must agree exactly (see the
-            // Votes doc above). Fail the BASE build on disagreement —
-            // this is the self-check that turns an identity-model
-            // violation into a build error instead of an overlay that
-            // resolves references into the wrong bytes at runtime.
-            let first = v.local[0].1;
-            if v.local.iter().any(|&(_, b)| b != first) {
-                let nm = &scan.graph.nodes[nid as usize];
-                let mut evidence = String::new();
-                for (name, b) in &v.local {
-                    use std::fmt::Write;
-                    let _ = write!(evidence, "\n    {name} → section base {b:#x}");
-                }
-                let where_ = nm
-                    .segments
-                    .first()
-                    .map(|seg| {
-                        let obj = &scan.objects[seg.object as usize];
-                        format!(
-                            "{} :: {}",
-                            obj.tu_name,
-                            obj.sections[seg.section as usize].name
-                        )
-                    })
-                    .unwrap_or_else(|| "<no segments>".into());
-                bail!(
-                    "graft base self-check: STB_LOCAL symbols of one node disagree on \
-                     its section base — the section was not placed as a unit, so \
-                     positional resolution against it would be unsound.\n  node {nid} \
-                     ({where_}):{evidence}"
-                );
-            }
-            first
-        };
-        node_addrs.insert(nid, base);
         let th = scan.trans_hash[nid as usize];
         match by_th.entry(th) {
             Entry::Vacant(e) => {
-                e.insert(base);
+                e.insert((rec.address, rec.out_size));
             }
             Entry::Occupied(mut e) => {
-                if *e.get() != base {
+                if e.get().0 != rec.address {
                     ambiguous.insert(th);
-                    if base < *e.get() {
-                        e.insert(base); // keep the smallest as the representative
+                    if rec.address < e.get().0 {
+                        e.insert((rec.address, rec.out_size));
                     }
                 }
             }
         }
     }
+    if stats.dropped > 0 {
+        eprintln!(
+            "graft base map-recovery: {} placement claim(s) failed byte \
+             verification and were dropped (references re-emit):\n{}",
+            stats.dropped,
+            dropped_examples.join("\n"),
+        );
+    }
 
     let mut entries: Vec<SectionEntry> = by_th
         .into_iter()
-        .map(|(trans_hash, address)| SectionEntry { trans_hash, address })
+        .map(|(trans_hash, (address, out_size))| SectionEntry { trans_hash, address, out_size })
         .collect();
     entries.sort_by(|a, b| a.trans_hash.cmp(&b.trans_hash));
     let mut ambiguous: Vec<[u8; 16]> = ambiguous.into_iter().collect();
     ambiguous.sort();
-    Ok((SectionTable { entries, ambiguous }, node_addrs))
+    Ok((SectionTable { entries, ambiguous }, stats))
 }
 
-/// Most frequent value (ties broken toward the smallest). `None` if empty.
-fn majority(vals: &[u64]) -> Option<u64> {
-    let mut counts: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
-    for &v in vals {
-        *counts.entry(v).or_insert(0) += 1;
-    }
-    let mut best: Option<(u64, usize)> = None;
-    for (v, c) in counts {
-        best = Some(match best {
-            Some((bv, bc)) if bc > c || (bc == c && bv <= v) => (bv, bc),
-            _ => (v, c),
-        });
-    }
-    best.map(|(v, _)| v)
-}
-
-/// Same derivation as `elf::ParsedObject::tu_id` — blake3(file)[:8].
-fn tu_id_from_file_name(name: &str) -> [u8; 8] {
-    let digest = *blake3::hash(name.as_bytes()).as_bytes();
-    let mut out = [0u8; 8];
-    out.copy_from_slice(&digest[..8]);
-    out
+#[derive(Default)]
+struct RecoveryStats {
+    /// Nodes attributed to exactly one map record (key + size).
+    attributed: usize,
+    /// Key collisions the size filter couldn't split.
+    skipped_ambiguous: usize,
+    /// Keyed records whose input size didn't match ours (.eh_frame &c).
+    skipped_size_mismatch: usize,
+    /// Byte-identical at the claimed address (modulo reloc fields).
+    verified: usize,
+    /// xtensa: explained by the relaxation walk.
+    verified_relaxed: usize,
+    /// No bytes to check (.bss / zero-size) — kept on attribution alone.
+    unverifiable: usize,
+    /// Claims the bytes refused — NOT recorded in the table.
+    dropped: usize,
 }
 
 fn compute_base_abi(elf_bytes: &[u8]) -> [u8; 20] {

@@ -34,79 +34,12 @@ enum Arch {
 }
 
 // ---------- map parsing ----------
-
-#[derive(Debug)]
-struct MapEntry {
-    in_name: String,
-    addr: u64,
-    out_size: u64,
-    in_size: u64,
-    obj: String, // "path/lib.a(member.o)" or "path/file.o"
-}
-
-/// Input-section placements from a GNU ld -Map. With `relaxed_only`,
-/// keep only entries whose next line ends "(size before relaxing)"
-/// (xtensa corpus); otherwise keep every placed entry (x86 verify).
-/// Long names wrap onto their own line.
-///
-/// The v1 prototype classified name lines with `!line.contains("0x")`,
-/// which silently dropped 796 sections whose Rust v0-mangled names
-/// contain a literal "0x" (`...10xtensa_cli...`); parse by token shape
-/// instead.
-fn parse_map(text: &str, relaxed_only: bool) -> Vec<MapEntry> {
-    let mut out = Vec::new();
-    let mut pending_name: Option<String> = None;
-    let mut last: Option<MapEntry> = None;
-    for line in text.lines() {
-        let toks: Vec<&str> = line.split_whitespace().collect();
-        if line.trim_end().ends_with("(size before relaxing)") {
-            if let (Some(mut e), Some(sz)) = (last.take(), toks.first().and_then(|t| hex(t))) {
-                e.in_size = sz;
-                out.push(e);
-            }
-            pending_name = None;
-            continue;
-        }
-        if relaxed_only {
-            last = None;
-        }
-        // input-section lines: exactly one leading space, name starts '.'
-        let named = line.starts_with(' ')
-            && !line.starts_with("  ")
-            && toks.first().is_some_and(|t| t.starts_with('.'));
-        if named && toks.len() == 1 {
-            pending_name = Some(toks[0].to_string()); // wrapped long name
-            continue;
-        }
-        let (name, rest) = if named {
-            (Some(toks[0].to_string()), &toks[1..])
-        } else {
-            (pending_name.take(), &toks[..])
-        };
-        pending_name = None;
-        if let (Some(name), [a, s, obj, ..]) = (name, rest)
-            && let (Some(addr), Some(size)) = (hex(a), hex(s))
-        {
-            let e = MapEntry {
-                in_name: name,
-                addr,
-                out_size: size,
-                in_size: size,
-                obj: obj.to_string(),
-            };
-            if relaxed_only {
-                last = Some(e); // confirmed by the annotation line
-            } else if addr != 0 && size != 0 {
-                out.push(e); // discarded/non-alloc sit at addr 0
-            }
-        }
-    }
-    out
-}
-
-fn hex(s: &str) -> Option<u64> {
-    u64::from_str_radix(s.strip_prefix("0x")?, 16).ok()
-}
+//
+// The shared graft parser (`mapcheck::parse_map`) — token-shape based
+// (the v1 prototype's `!contains("0x")` name heuristic dropped 796
+// Rust-v0-mangled sections, docs/16 §6.11). The harness aliases its
+// fields: `path` is the verbatim path column ("lib.a(member.o)").
+use graft::mapcheck::MapSection as MapEntry;
 
 // ---------- archive + member caches ----------
 
@@ -187,7 +120,19 @@ fn main() {
     let elf_path = elf_path.expect("--elf <file> required");
 
     let map_text = std::fs::read_to_string(&map_path).expect("read map");
-    let entries = parse_map(&map_text, arch == Arch::Xtensa);
+    let all_records = graft::mapcheck::parse_map(&map_text);
+    drop(map_text);
+    // xtensa mode walks only relaxed sections; x86 verify-identity mode
+    // walks everything placed (skip vma-0 non-alloc records and
+    // zero-size stubs).
+    let entries: Vec<MapEntry> = match arch {
+        Arch::Xtensa => all_records.iter().filter(|e| e.relaxed).cloned().collect(),
+        Arch::X86 => all_records
+            .iter()
+            .filter(|e| e.address != 0 && e.out_size != 0)
+            .cloned()
+            .collect(),
+    };
     println!("{} input sections from map", entries.len());
     // value-resolution measurement needs placed addresses for EVERY
     // input section (section-symbol literal targets) and the relaxed
@@ -195,12 +140,11 @@ fn main() {
     let mut placed: HashMap<(String, String), Vec<u64>> = HashMap::new();
     let mut relaxed_set: std::collections::HashSet<(String, String)> = Default::default();
     if ambiguity && arch == Arch::Xtensa {
-        for e in parse_map(&map_text, false) {
-            placed.entry((e.obj.clone(), e.in_name.clone())).or_default().push(e.addr);
+        for e in &all_records {
+            placed.entry((e.path.clone(), e.section.clone())).or_default().push(e.address);
         }
-        relaxed_set = entries.iter().map(|e| (e.obj.clone(), e.in_name.clone())).collect();
+        relaxed_set = entries.iter().map(|e| (e.path.clone(), e.section.clone())).collect();
     }
-    drop(map_text);
 
     // linked image: section bytes by vaddr + unique-address symbol table
     let elf_bytes = std::fs::read(&elf_path).expect("read elf");
@@ -270,7 +214,7 @@ fn main() {
     let mut archive_bytes: HashMap<String, Vec<u8>> = HashMap::new();
     let mut load_errors: HashMap<String, String> = HashMap::new();
     for e in &entries {
-        let (path, _) = split_obj(&e.obj);
+        let (path, _) = split_obj(&e.path);
         if archive_bytes.contains_key(&path) || load_errors.contains_key(&path) {
             continue;
         }
@@ -307,7 +251,7 @@ fn main() {
     let mut amb = AmbStats::default();
 
     for e in &entries {
-        let (path, member_name) = split_obj(&e.obj);
+        let (path, member_name) = split_obj(&e.path);
         if path.ends_with(".graft-slack.o") {
             *skips.entry("graft synthetic slack object".into()).or_default() += 1;
             continue;
@@ -335,7 +279,7 @@ fn main() {
                 .entry((path.clone(), r.start))
                 .or_insert_with(|| parse_member(&data[r.clone()]));
             let Some(m) = m else { continue };
-            if let Some(secs) = m.by_name.get(&e.in_name) {
+            if let Some(secs) = m.by_name.get(&e.section) {
                 for &(idx, size) in secs {
                     if arch == Arch::X86 || size == e.in_size {
                         candidates.push((r.start, idx));
@@ -363,7 +307,7 @@ fn main() {
             // non-exec relaxed entries are SHF_MERGE string folding
             Arch::Xtensa
                 if sec.kind() != object::SectionKind::Text
-                    && !e.in_name.contains(".literal") =>
+                    && !e.section.contains(".literal") =>
             {
                 Some("merge-fold (non-exec)")
             }
@@ -386,7 +330,7 @@ fn main() {
                         | object::SectionKind::Common
                 ) {
                     Some("nobits")
-                } else if e.in_name == ".eh_frame" {
+                } else if e.section == ".eh_frame" {
                     Some(".eh_frame (CIE-edited by ld)")
                 } else {
                     None
@@ -404,8 +348,8 @@ fn main() {
             // positional model is wrong for this section
             dirty.push(format!(
                 "SIZE {} {} input {:#x} placed {:#x}",
-                e.in_name,
-                e.obj,
+                e.section,
+                e.path,
                 sec.size(),
                 e.out_size
             ));
@@ -418,8 +362,8 @@ fn main() {
             &[]
         } else {
             match out_secs.iter().find_map(|&(addr, data)| {
-                (e.addr >= addr && e.addr + e.out_size <= addr + data.len() as u64).then(|| {
-                    let s = (e.addr - addr) as usize;
+                (e.address >= addr && e.address + e.out_size <= addr + data.len() as u64).then(|| {
+                    let s = (e.address - addr) as usize;
                     &data[s..s + e.out_size as usize]
                 })
             }) {
@@ -448,7 +392,7 @@ fn main() {
         // with equal sizes the min-cost path is replace-only — extract
         // mismatch runs directly instead of searching for them
         if arch == Arch::X86 {
-            match masked_compare(&input, out_bytes) {
+            match engine::masked_compare(&input, out_bytes) {
                 Ok(()) => {
                     reconciled += 1;
                     fast_verified += 1;
@@ -460,7 +404,7 @@ fn main() {
                         .take(4)
                         .map(|r| format!("({},{},{})", r.in_off, r.in_len, r.out_len))
                         .collect();
-                    dirty.push(format!("{} {} runs {}", e.in_name, e.obj, desc.join(" ")));
+                    dirty.push(format!("{} {} runs {}", e.section, e.path, desc.join(" ")));
                 }
             }
             continue;
@@ -471,7 +415,7 @@ fn main() {
                 reconciled += 1;
                 diagnostic_uses += c.diagnostics();
                 if verbose && c.diagnostics() > 0 {
-                    println!("DIAG {} {} ({})", e.in_name, e.obj, c.diagnostics());
+                    println!("DIAG {} {} ({})", e.section, e.path, c.diagnostics());
                 }
                 census.absorb(&c);
                 if ambiguity {
@@ -488,14 +432,14 @@ fn main() {
                         &out_syms,
                         &placed,
                         &relaxed_set,
-                        &e.obj,
+                        &e.path,
                     );
                     amb.add(
                         &input,
                         out_bytes,
                         queries,
                         &lit_vals,
-                        &format!("{} {}", e.in_name, e.obj),
+                        &format!("{} {}", e.section, e.path),
                     );
                 }
             }
@@ -505,7 +449,7 @@ fn main() {
                     .take(4)
                     .map(|r| format!("({},{},{})", r.in_off, r.in_len, r.out_len))
                     .collect();
-                dirty.push(format!("{} {} runs {}", e.in_name, e.obj, desc.join(" ")));
+                dirty.push(format!("{} {} runs {}", e.section, e.path, desc.join(" ")));
                 census.absorb(&c);
             }
             Verdict::Refused(why) => {
@@ -840,32 +784,4 @@ impl AmbStats {
             self.pull_bytes,
         );
     }
-}
-
-/// The degenerate walk for resize-free targets: byte-equal modulo
-/// reloc masks at identical sizes. On mismatch, returns the maximal
-/// unexplained runs (with equal sizes, the engine's min-cost path is
-/// replace-only, so direct extraction is exact and O(n)).
-fn masked_compare(input: &InputSection, out: &[u8]) -> Result<(), Vec<graft::relax::DirtyRun>> {
-    if input.bytes.len() != out.len() {
-        return Err(vec![graft::relax::DirtyRun {
-            in_off: 0,
-            in_len: input.bytes.len(),
-            out_len: out.len(),
-        }]);
-    }
-    let mut runs: Vec<graft::relax::DirtyRun> = Vec::new();
-    for (k, (a, b)) in input.bytes.iter().zip(out).enumerate() {
-        if a == b || input.mask[k] {
-            continue;
-        }
-        match runs.last_mut() {
-            Some(r) if r.in_off + r.in_len == k => {
-                r.in_len += 1;
-                r.out_len += 1;
-            }
-            _ => runs.push(graft::relax::DirtyRun { in_off: k, in_len: 1, out_len: 1 }),
-        }
-    }
-    if runs.is_empty() { Ok(()) } else { Err(runs) }
 }

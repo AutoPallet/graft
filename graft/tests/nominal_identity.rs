@@ -30,6 +30,7 @@ fn bss_section(name: &str) -> SectionInfo {
         kind: SectionKind::Bss,
         sh_flags: u64::from(SHF_ALLOC | SHF_WRITE),
         sh_entsize: 0,
+        sh_size: 16,
         bytes: Vec::new(), // NOBITS: no bytes
         relocs: Vec::new(),
     }
@@ -41,6 +42,7 @@ fn rodata_section(name: &str, bytes: &[u8]) -> SectionInfo {
         kind: SectionKind::Rodata,
         sh_flags: u64::from(SHF_ALLOC),
         sh_entsize: 0,
+        sh_size: bytes.len() as u64,
         bytes: bytes.to_vec(),
         relocs: Vec::new(),
     }
@@ -143,6 +145,7 @@ fn scc_members_get_distinct_trans_hashes() {
         kind: SectionKind::Text,
         sh_flags: u64::from(SHF_ALLOC | SHF_EXECINSTR),
         sh_entsize: 0,
+        sh_size: bytes.len() as u64,
         bytes: bytes.to_vec(),
         relocs: vec![CanonicalReloc {
             offset: 0,
@@ -185,6 +188,7 @@ fn ram_resident_code_stays_content_addressable() {
         kind: SectionKind::Text,
         sh_flags: u64::from(SHF_ALLOC | SHF_WRITE | SHF_EXECINSTR),
         sh_entsize: 0,
+        sh_size: 16,
         bytes: vec![0x90; 16],
         relocs: Vec::new(),
     };
@@ -209,6 +213,7 @@ fn merge_cst_sections_split_per_entry() {
         kind: SectionKind::Rodata,
         sh_flags: u64::from(SHF_ALLOC | SHF_MERGE),
         sh_entsize: 8,
+        sh_size: 16,
         bytes: vec![1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0],
         relocs: Vec::new(),
     };
@@ -230,6 +235,7 @@ fn merge_section_with_ragged_size_stays_whole() {
         kind: SectionKind::Rodata,
         sh_flags: u64::from(SHF_ALLOC | SHF_MERGE),
         sh_entsize: 8,
+        sh_size: 12,
         bytes: vec![0u8; 12],
         relocs: Vec::new(),
     };

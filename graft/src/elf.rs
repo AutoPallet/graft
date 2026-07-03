@@ -37,6 +37,11 @@ pub struct SectionInfo {
     /// NUL-terminated strings for SHF_MERGE|SHF_STRINGS pools. The
     /// graph splits such sections into per-entry nodes.
     pub sh_entsize: u64,
+    /// Raw ELF `sh_size`. Equals `bytes.len()` for retained PROGBITS,
+    /// but is the only size record for NOBITS (.bss) and for non-alloc
+    /// slots whose bytes we drop — map-record attribution disambiguates
+    /// same-named sections by it.
+    pub sh_size: u64,
     /// Section contents, or empty for NOBITS sections (.bss).
     pub bytes: Vec<u8>,
     /// Forward relocations from this section, canonicalized and sorted by
@@ -196,6 +201,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedObject> {
                 kind,
                 sh_flags,
                 sh_entsize,
+                sh_size: sec.size(),
                 bytes: Vec::new(),
                 relocs: Vec::new(),
             });
@@ -260,6 +266,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedObject> {
             kind,
             sh_flags,
             sh_entsize,
+            sh_size: sec.size(),
             bytes,
             relocs,
         });

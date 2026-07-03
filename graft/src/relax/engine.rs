@@ -98,6 +98,32 @@ pub fn reconcile<T: Target>(input: &InputSection, out: &[u8], target: &T) -> Ver
     }
 }
 
+/// The degenerate (zero-transform) walk: byte-compare modulo reloc
+/// masks, equal sizes required. With equal sizes the min-cost path is
+/// replace-only, so mismatch runs fall out directly — O(n) instead of
+/// a Dijkstra over the catch-all lattice (which is pathological on big
+/// mismatching sections). `Ok(())` means the input provably landed at
+/// this output location unchanged; `Err` localizes the dirt.
+pub fn masked_compare(input: &InputSection, out: &[u8]) -> Result<(), Vec<DirtyRun>> {
+    if input.bytes.len() != out.len() {
+        return Err(vec![DirtyRun { in_off: 0, in_len: input.bytes.len(), out_len: out.len() }]);
+    }
+    let mut runs: Vec<DirtyRun> = Vec::new();
+    for (k, (a, b)) in input.bytes.iter().zip(out).enumerate() {
+        if a == b || input.mask[k] {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(r) if r.in_off + r.in_len == k => {
+                r.in_len += 1;
+                r.out_len += 1;
+            }
+            _ => runs.push(DirtyRun { in_off: k, in_len: 1, out_len: 1 }),
+        }
+    }
+    if runs.is_empty() { Ok(()) } else { Err(runs) }
+}
+
 fn key(i: usize, o: usize) -> u64 {
     (i as u64) << 32 | o as u64
 }
@@ -423,7 +449,7 @@ pub fn translations<T: Target>(
 
     // intersect fates over every tight edge
     let mut cells: Vec<Option<FateCell>> = vec![None; in_len];
-    let mut record = |k: usize, fate: Fate, cells: &mut Vec<Option<FateCell>>| {
+    let record = |k: usize, fate: Fate, cells: &mut Vec<Option<FateCell>>| {
         cells[k] = match cells[k] {
             None => Some(FateCell::Agreed(fate)),
             Some(FateCell::Agreed(f)) if f == fate => Some(FateCell::Agreed(f)),

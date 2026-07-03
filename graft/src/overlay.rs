@@ -1043,12 +1043,12 @@ fn run_real_linker(
 pub struct BaseMetadata {
     pub manifest: GraftManifest,
     /// Content-keyed section table from base's `.graft.sections`:
-    /// `trans_hash → section base address`. A reference resolves
-    /// positionally as `by_section[node.trans_hash] + in_section_offset`.
-    /// Build-invariant: same `trans_hash` means base has byte-identical
-    /// section content (hence identical layout), regardless of CGU
-    /// re-partition or `.llvm.<id>` suffix drift.
-    pub by_section: HashMap<TransHash, u64>,
+    /// `trans_hash → placement (address + placed size)`. A reference
+    /// resolves positionally as `by_section[th].addr + in_section_offset`
+    /// (offset walk-translated on relaxing targets). Build-invariant:
+    /// same `trans_hash` means base has byte-identical section content,
+    /// regardless of CGU re-partition or `.llvm.<id>` suffix drift.
+    pub by_section: HashMap<TransHash, metadata::Placed>,
     /// `trans_hash`es base saw at more than one distinct address
     /// (content-identical sections it did not fold). Excluded from
     /// `by_section`; a *named* reference to one resolves to base's exact
@@ -1102,9 +1102,12 @@ fn load_base_metadata(path: &std::path::Path) -> Result<BaseMetadata> {
     }
 
     let table = metadata::decode_sections(sections_bytes)?;
-    let mut by_section: HashMap<TransHash, u64> = HashMap::with_capacity(table.entries.len());
+    let mut by_section: HashMap<TransHash, metadata::Placed> =
+        HashMap::with_capacity(table.entries.len());
     for e in &table.entries {
-        by_section.entry(e.trans_hash).or_insert(e.address);
+        by_section
+            .entry(e.trans_hash)
+            .or_insert(metadata::Placed { addr: e.address, out_size: e.out_size });
     }
     let ambiguous_sections: HashSet<TransHash> = table.ambiguous.iter().copied().collect();
 

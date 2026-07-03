@@ -23,7 +23,12 @@ pub const GRAFT_MAGIC: [u8; 4] = *b"GRFT";
 // Also: GRAFT_DATA_SLACK is zero-filled (re-emitted .bss lands there
 // and must read zero; a 0xFF-filled v6 data slack would silently
 // corrupt overlay statics).
-pub const SCHEMA_VERSION: u16 = 7;
+// v8: addresses come from the linker map, not symbol votes, and every
+// entry carries the placed (post-relaxation) output size — the lazy
+// relaxation walk needs it to slice base.elf's bytes. A v7 table has
+// vote-recovered addresses that silently drift on relaxing targets
+// and no sizes to walk with.
+pub const SCHEMA_VERSION: u16 = 8;
 
 pub const SECTION_MANIFEST: &str = ".graft.manifest";
 pub const SECTION_SECTIONS: &str = ".graft.sections";
@@ -66,6 +71,18 @@ pub struct SectionEntry {
     pub trans_hash: [u8; 16],
     /// Base virtual address of the section's start (offset 0).
     pub address: u64,
+    /// Placed (post-relaxation) size in base. May differ from the
+    /// input section's size on relaxing targets (xtensa); the lazy
+    /// walk reconciles interiors against base.elf bytes of this length.
+    pub out_size: u64,
+}
+
+/// Where base placed one section: the overlay-side view of a
+/// `SectionEntry` (`by_section` value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placed {
+    pub addr: u64,
+    pub out_size: u64,
 }
 
 /// The full `.graft.sections` payload: the content→address table (one
@@ -121,8 +138,8 @@ mod tests {
     fn sections_roundtrip() {
         let table = SectionTable {
             entries: vec![
-                SectionEntry { trans_hash: [1; 16], address: 0x400000 },
-                SectionEntry { trans_hash: [3; 16], address: 0x401000 },
+                SectionEntry { trans_hash: [1; 16], address: 0x400000, out_size: 0x40 },
+                SectionEntry { trans_hash: [3; 16], address: 0x401000, out_size: 0 },
             ],
             ambiguous: vec![[7; 16]],
         };

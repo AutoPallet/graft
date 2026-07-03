@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use graft::graph::{NodeId, ResolvedTarget};
 use graft::hash::TransHash;
 use graft::prune;
+use graft::metadata::Placed;
 use graft::resolve::{RelocDisposition, RelocQuery, Resolver};
 use object::write::{Object, Relocation, Symbol, SymbolSection};
 use object::{
@@ -39,7 +40,7 @@ struct Tables {
     closure_nids: HashSet<NodeId>,
     mutable_ths: HashSet<TransHash>,
     wrapped: HashSet<String>,
-    by_section: HashMap<TransHash, u64>,
+    by_section: HashMap<TransHash, Placed>,
     ambiguous_sections: HashSet<TransHash>,
     by_name: HashMap<String, u64>,
     by_name_ambiguous: HashSet<String>,
@@ -113,7 +114,7 @@ fn channel1_is_node_keyed_not_hash_keyed() {
     let mut t = Tables::with_target(ResolvedTarget::Symbol { nid: NID_BAR, value: 0x10 });
     t.trans_hash.push(TH_BAR); // content twin at NID_BAR + 1
     t.closure_nids.insert(NID_BAR + 1);
-    t.by_section.insert(TH_BAR, 0x2000);
+    t.by_section.insert(TH_BAR, Placed { addr: 0x2000, out_size: 0x100 });
 
     let d = t.resolver().dispose(0, &query_bar()).expect("dispose ok");
     assert_eq!(d, RelocDisposition::Anchor { tls: false, vaddr: 0x2010, verify_name: None });
@@ -122,7 +123,7 @@ fn channel1_is_node_keyed_not_hash_keyed() {
 #[test]
 fn channel2_content_match_anchors_positionally_without_verify() {
     let mut t = Tables::with_target(ResolvedTarget::Symbol { nid: NID_BAR, value: 0x10 });
-    t.by_section.insert(TH_BAR, 0x2000);
+    t.by_section.insert(TH_BAR, Placed { addr: 0x2000, out_size: 0x100 });
 
     let d = t.resolver().dispose(0, &query_bar()).expect("dispose ok");
     assert_eq!(d, RelocDisposition::Anchor { tls: false, vaddr: 0x2010, verify_name: None });
@@ -131,7 +132,7 @@ fn channel2_content_match_anchors_positionally_without_verify() {
 #[test]
 fn channel2a_ambiguous_unique_name_pins_via_symtab_with_verify() {
     let mut t = Tables::with_target(ResolvedTarget::Symbol { nid: NID_BAR, value: 0x8 });
-    t.by_section.insert(TH_BAR, 0x2000); // representative copy
+    t.by_section.insert(TH_BAR, Placed { addr: 0x2000, out_size: 0x100 }); // representative copy
     t.ambiguous_sections.insert(TH_BAR);
     t.by_name.insert("bar".into(), 0x3000); // bar's exact (unique) address
 
@@ -148,7 +149,7 @@ fn ambiguous_mutable_unpinnable_bails() {
     // uniquely resolve in base.symtab: a representative bind would alias
     // distinct variables (the M2 xtensa .bss/.data call-to-0 bug).
     let mut t = Tables::with_target(ResolvedTarget::Symbol { nid: NID_BAR, value: 0 });
-    t.by_section.insert(TH_BAR, 0x2000);
+    t.by_section.insert(TH_BAR, Placed { addr: 0x2000, out_size: 0x100 });
     t.ambiguous_sections.insert(TH_BAR);
     t.mutable_ths.insert(TH_BAR);
     t.by_name_ambiguous.insert("bar".into());
@@ -162,7 +163,7 @@ fn ambiguous_readonly_same_name_dup_uses_representative() {
     // Byte-identical read-only copies, name not uniquely pinnable →
     // interchangeable; representative + offset, no verify.
     let mut t = Tables::with_target(ResolvedTarget::Symbol { nid: NID_BAR, value: 0x4 });
-    t.by_section.insert(TH_BAR, 0x2000);
+    t.by_section.insert(TH_BAR, Placed { addr: 0x2000, out_size: 0x100 });
     t.ambiguous_sections.insert(TH_BAR);
     t.by_name_ambiguous.insert("bar".into());
 
@@ -256,7 +257,7 @@ fn wrapped_name_resolves_and_emits_as_wrapper() {
 #[test]
 fn section_target_resolves_positionally() {
     let mut t = Tables::with_target(ResolvedTarget::Section { nid: NID_BAR });
-    t.by_section.insert(TH_BAR, 0x5000);
+    t.by_section.insert(TH_BAR, Placed { addr: 0x5000, out_size: 0x100 });
 
     let d = t.resolver().dispose(0, &section_query()).expect("dispose ok");
     // The reloc's own addend rides along separately; the anchor is the
@@ -269,7 +270,7 @@ fn section_target_ambiguous_mutable_bails() {
     // STT_SECTION ref into ambiguous *mutable* content: no name to pin
     // a copy, representative would alias distinct variables.
     let mut t = Tables::with_target(ResolvedTarget::Section { nid: NID_BAR });
-    t.by_section.insert(TH_BAR, 0x5000);
+    t.by_section.insert(TH_BAR, Placed { addr: 0x5000, out_size: 0x100 });
     t.ambiguous_sections.insert(TH_BAR);
     t.mutable_ths.insert(TH_BAR);
 
@@ -280,7 +281,7 @@ fn section_target_ambiguous_mutable_bails() {
 #[test]
 fn section_target_ambiguous_readonly_uses_representative() {
     let mut t = Tables::with_target(ResolvedTarget::Section { nid: NID_BAR });
-    t.by_section.insert(TH_BAR, 0x5000);
+    t.by_section.insert(TH_BAR, Placed { addr: 0x5000, out_size: 0x100 });
     t.ambiguous_sections.insert(TH_BAR);
 
     let d = t.resolver().dispose(0, &section_query()).expect("dispose ok");
@@ -322,7 +323,7 @@ fn channel2_anchor_inside_tls_range_is_classified_tls() {
     // prune emits an STT_TLS reference and the base map defines it in
     // an SHF_TLS map section.
     let mut t = Tables::with_target(ResolvedTarget::Symbol { nid: NID_BAR, value: 0x10 });
-    t.by_section.insert(TH_BAR, 0x7000);
+    t.by_section.insert(TH_BAR, Placed { addr: 0x7000, out_size: 0x100 });
     t.tls_range = Some((0x7000, 0x7100));
 
     let d = t.resolver().dispose(0, &query_bar()).expect("dispose ok");
@@ -347,7 +348,7 @@ fn channel4_name_inside_tls_range_is_classified_tls() {
 #[test]
 fn anchor_outside_tls_range_is_not_tls() {
     let mut t = Tables::with_target(ResolvedTarget::Symbol { nid: NID_BAR, value: 0 });
-    t.by_section.insert(TH_BAR, 0x2000);
+    t.by_section.insert(TH_BAR, Placed { addr: 0x2000, out_size: 0x100 });
     t.tls_range = Some((0x7000, 0x7100));
 
     let d = t.resolver().dispose(0, &query_bar()).expect("dispose ok");
