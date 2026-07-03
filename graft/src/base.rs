@@ -90,15 +90,51 @@ fn run(argv: Vec<String>) -> Result<()> {
     // requested; kept next to the output for debugging.
     let map_path = output.with_extension("graft-map");
     argv.push(format!("-Wl,-Map={}", map_path.display()));
-    let argv = argv;
 
-    let t_link_start = std::time::Instant::now();
-    let ld_status = exec_real_linker(&argv)?;
-    let t_link = t_link_start.elapsed();
-    let (scan_result, t_scan) = scan_handle
-        .join()
-        .map_err(|_| anyhow!("pre-scan thread panicked"))?;
-    let scan_result = scan_result.context("pre-scan failed")?;
+    // GRAFT_ICF (default off): fold trans_hash-identical Rust sections
+    // before the real link. Needs the scan's hashes, so the parallel
+    // scan-under-the-linker overlap is traded for a serial
+    // scan → rewrite → ld pipeline on this path. See `icf.rs`.
+    let (ld_status, t_link, scan_result, t_scan) = if crate::icf::enabled()? {
+        if !argv.iter().any(|a| a.contains("--gc-sections")) {
+            bail!(
+                "GRAFT_ICF requires --gc-sections in the link argv — folding \
+                 works by orphaning duplicate copies for ld's gc to collect"
+            );
+        }
+        let (scan_result, t_scan) = scan_handle
+            .join()
+            .map_err(|_| anyhow!("pre-scan thread panicked"))?;
+        let scan_result = scan_result.context("pre-scan failed")?;
+        if let Some(outcome) = crate::icf::run(&scan_result, &output)? {
+            let s = &outcome.stats;
+            eprintln!(
+                "graft icf: folded {} groups · dropped {} copies · {} input bytes \
+                 · rewrote {} objects in {} archives (skipped: {} non-local, \
+                 {} name-mismatch, {} mechanical)",
+                s.groups_folded,
+                s.copies_dropped,
+                s.bytes_dropped,
+                s.rewritten_objects,
+                s.rewritten_archives,
+                s.skipped_nonlocal,
+                s.skipped_name_mismatch,
+                s.skipped_mechanical,
+            );
+            argv = crate::icf::substitute_argv(argv, &outcome.replacements);
+        }
+        let t_link_start = std::time::Instant::now();
+        let ld_status = exec_real_linker(&argv)?;
+        (ld_status, t_link_start.elapsed(), scan_result, t_scan)
+    } else {
+        let t_link_start = std::time::Instant::now();
+        let ld_status = exec_real_linker(&argv)?;
+        let t_link = t_link_start.elapsed();
+        let (scan_result, t_scan) = scan_handle
+            .join()
+            .map_err(|_| anyhow!("pre-scan thread panicked"))?;
+        (ld_status, t_link, scan_result.context("pre-scan failed")?, t_scan)
+    };
 
     let t_parallel = t_start.elapsed();
 
@@ -252,11 +288,12 @@ pub(crate) fn dup_stats(
     for d in &dups {
         let h: String = d.trans_hash.iter().take(8).map(|b| format!("{b:02x}")).collect();
         println!(
-            "x{:<3} waste {:>8}  {}  th={h}  {}  [{}]",
+            "x{:<3} waste {:>8}  {}  th={h}  {}  {}  [{}]",
             d.placements.len(),
             d.wasted_bytes(),
             if d.exec { "exec" } else { "data" },
             d.section,
+            d.path,
             d.placements
                 .iter()
                 .map(|&(a, s)| format!("{a:#x}+{s:#x}"))
