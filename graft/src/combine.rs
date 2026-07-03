@@ -191,6 +191,11 @@ fn combine_splice(
 
     let mut total_spliced: u64 = 0;
     let mut overlay_vaddr_first: u64 = 0;
+    // Content identity of this combine's delta: every spliced byte at
+    // its address, every trampoline, every appended load. Folded into
+    // the refreshed build-id so distinct overlays get distinct ids and
+    // the same overlay reproduces the same id.
+    let mut delta_hasher = blake3::Hasher::new();
 
     // Pass 1: per-section splice for SHF_ALLOC sections that land in a
     // declared slack region. Sections outside slack are *not* errors
@@ -251,6 +256,8 @@ fn combine_splice(
         let base_off = (load.p_offset + (v_start - load.p_vaddr)) as usize;
         let src = &overlay_bytes[sec_off as usize..(sec_off + sec_size) as usize];
         out[base_off..base_off + sec_size as usize].copy_from_slice(src);
+        delta_hasher.update(&v_start.to_le_bytes());
+        delta_hasher.update(src);
         if overlay_vaddr_first == 0 {
             overlay_vaddr_first = v_start;
         }
@@ -385,10 +392,20 @@ fn combine_splice(
     if !trampolines.is_empty() {
         let e_machine = u16::from_le_bytes(base_bytes[18..20].try_into().unwrap());
         apply_trampolines(&mut out, &base_phdrs, &trampolines, e_machine)?;
+        for t in &trampolines {
+            delta_hasher.update(t.name.as_bytes());
+            delta_hasher.update(&t.base_addr.to_le_bytes());
+            delta_hasher.update(&t.overlay_addr.to_le_bytes());
+        }
     }
 
     let mut appended_filesz: u64 = 0;
     if !append_loads.is_empty() {
+        for p in &append_loads {
+            delta_hasher.update(&p.p_vaddr.to_le_bytes());
+            delta_hasher
+                .update(&overlay_bytes[p.p_offset as usize..(p.p_offset + p.p_filesz) as usize]);
+        }
         let new_loads =
             append_pt_loads(&mut out, overlay_bytes, &append_loads, &base_phdrs, class)?;
         appended_filesz = new_loads.iter().map(|p| p.p_filesz).sum();
@@ -398,6 +415,8 @@ fn combine_splice(
             overlay_vaddr_first = p.p_vaddr;
         }
     }
+
+    refresh_build_id(&mut out, &base_obj_for_slack, &base_loads, delta_hasher.finalize())?;
 
     write_executable(output_path, &out)?;
 
@@ -478,6 +497,64 @@ pub struct Trampoline {
     pub name: String,
     pub base_addr: u64,
     pub overlay_addr: u64,
+}
+
+/// Refresh the image's build id: `new_id = blake3(old_id ‖ delta)[..len]`.
+///
+/// The id lives between `__build_id_start` and `__build_id_end` (an
+/// esp-idf linker-script window in `.flash.rodata`; the first 16 bytes
+/// are the ELF note header, the rest is the id — same layout roborack's
+/// `read_deploy_bin_build_id` reads). Deterministic: the same base and
+/// the same overlay delta always produce the same id, and chained
+/// overlays chain ids. Images without the symbols (fixtures, native
+/// targets) are left untouched.
+fn refresh_build_id(
+    out: &mut [u8],
+    base_obj: &object::File,
+    base_loads: &[Phdr],
+    delta: blake3::Hash,
+) -> Result<()> {
+    use object::{Object, ObjectSymbol};
+
+    let mut start = None;
+    let mut end = None;
+    for sym in base_obj.symbols() {
+        match sym.name() {
+            Ok("__build_id_start") => start = Some(sym.address()),
+            Ok("__build_id_end") => end = Some(sym.address()),
+            _ => {}
+        }
+    }
+    let (Some(start), Some(end)) = (start, end) else {
+        return Ok(()); // no build-id convention in this image
+    };
+    // Skip the 16-byte ELF note header (namesz/descsz/type + "GNU\0").
+    let id_vaddr = start + 16;
+    if end <= id_vaddr {
+        bail!("build-id window malformed: [{start:#x}, {end:#x})");
+    }
+    let id_len = (end - id_vaddr) as usize;
+    let load = base_loads
+        .iter()
+        .find(|p| id_vaddr >= p.p_vaddr && end <= p.p_vaddr + p.p_filesz)
+        .ok_or_else(|| anyhow!("build-id window outside every PT_LOAD"))?;
+    let off = (load.p_offset + (id_vaddr - load.p_vaddr)) as usize;
+
+    let old_id = out[off..off + id_len].to_vec();
+    let mut h = blake3::Hasher::new();
+    h.update(&old_id);
+    h.update(delta.as_bytes());
+    let mut new_id = vec![0u8; id_len];
+    h.finalize_xof().fill(&mut new_id);
+    out[off..off + id_len].copy_from_slice(&new_id);
+
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    eprintln!(
+        "graft combine: build-id {}… -> {}… ({id_len} bytes)",
+        &hex(&old_id)[..16],
+        &hex(&new_id)[..16],
+    );
+    Ok(())
 }
 
 /// A vaddr range in base.elf that splice-mode overlay sections are
