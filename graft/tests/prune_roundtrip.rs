@@ -25,7 +25,7 @@ fn first_rcgu_o(dir: &std::path::Path) -> Option<PathBuf> {
 /// Shape tests don't care where external refs land — anchor them all at
 /// a fixed dummy address.
 fn dummy_dispose(_q: &RelocQuery<'_>) -> anyhow::Result<RelocDisposition> {
-    Ok(RelocDisposition::Anchor { tls: false, vaddr: 0x1000, verify_name: None })
+    Ok(RelocDisposition::Anchor { tls: false, vaddr: 0x1000, verify_name: None, addend: None })
 }
 
 #[test]

@@ -83,9 +83,32 @@ fn run(argv: Vec<String>) -> Result<()> {
         }
     }
 
+    // Lazy walk (xtensa only): base's link relaxed code, so channel-2
+    // positional anchors must translate interior offsets through the
+    // recorded transform fates. Non-relaxing targets skip the read,
+    // the walker, and the pre-pass entirely — every recorded placement
+    // was byte-verified at base time, so identity holds.
+    let base_elf_bytes: Option<Vec<u8>> = if base.e_machine == object::elf::EM_XTENSA {
+        Some(std::fs::read(&base_path).with_context(|| format!("read {}", base_path.display()))?)
+    } else {
+        None
+    };
+    let walker = match &base_elf_bytes {
+        Some(bytes) => Some(
+            crate::relax::walker::Walker::new(
+                &scan,
+                &base.by_section,
+                bytes,
+                object::Architecture::Xtensa,
+            )
+            .map_err(|e| anyhow!("lazy walk init: {e}"))?,
+        ),
+        None => None,
+    };
+
     let t_closure_start = std::time::Instant::now();
     let roots = roots::find_roots(&scan, &base, &link_args)?;
-    let closure = compute_closure(&scan, &base, &roots)?;
+    let closure = compute_closure_fixpoint(&scan, &base, &roots, walker.as_ref())?;
     let t_closure = t_closure_start.elapsed();
 
     // Scratch dir next to the output path. Cleaned and recreated each
@@ -117,6 +140,22 @@ fn run(argv: Vec<String>) -> Result<()> {
         HashSet::new()
     };
     let resolver_wrapped: HashSet<String> = link_args.wrapped.iter().cloned().collect();
+    // Count how many anchors the walk actually re-homed — the roborack
+    // failure mode was exactly these, so surface them in the summary.
+    let walk_translated = std::cell::Cell::new(0usize);
+    let translate: Box<crate::resolve::TranslateFn<'_>> = match &walker {
+        Some(w) => {
+            let counter = &walk_translated;
+            Box::new(move |nid, q| {
+                let r = w.query(nid, q);
+                if matches!(r, Ok(crate::resolve::Translation::Mapped(_))) {
+                    counter.set(counter.get() + 1);
+                }
+                r
+            })
+        }
+        None => Box::new(crate::resolve::identity_translate),
+    };
     let resolver = crate::resolve::Resolver {
         trans_hash: &scan.trans_hash,
         reloc_targets: &scan.graph.reloc_targets,
@@ -127,6 +166,7 @@ fn run(argv: Vec<String>) -> Result<()> {
         ambiguous_sections: &base.ambiguous_sections,
         by_name: &base.by_name,
         by_name_ambiguous: &base.by_name_ambiguous,
+        translate: &*translate,
         pool_nids: &pool_nids,
         tls_range: base.tls.map(|t| (t.vaddr, t.vaddr + t.memsz)),
         tls_nids: &tls_nids,
@@ -355,7 +395,7 @@ fn run(argv: Vec<String>) -> Result<()> {
     let summary = format!(
         "graft overlay: base {} sections · overlay {} objs / {} sections · \
          closure {} sections · \
-         pruned {} objs / {} sections / {} anchor-rewrites ({} anchors) / {} base-assumed (ch3) · \
+         pruned {} objs / {} sections / {} anchor-rewrites ({} anchors, {} walk-translated) / {} base-assumed (ch3) · \
          combined {} bytes (overlay payload {} @ {:#x}, {} trampolines) · \
          scan {:.1?} · closure {:.1?} · prune {:.1?} · link {:.1?} · combine {:.1?} · \
          total {:.1?}\n\
@@ -368,6 +408,7 @@ fn run(argv: Vec<String>) -> Result<()> {
         kept_sec_total,
         anchor_rewrites_total,
         anchors.len(),
+        walk_translated.get(),
         assumed_names.len(),
         combine_stats.combined_size,
         combine_stats.overlay_load_size,
@@ -1238,7 +1279,101 @@ fn tls_node_ids(scan: &ScanResult) -> HashSet<NodeId> {
 }
 
 
-fn compute_closure(scan: &ScanResult, base: &BaseMetadata, roots: &[NodeId]) -> Result<Closure> {
+/// Closure + walk-refusal fixpoint. Positional (channel-2) anchors into
+/// base's relaxed sections need offset translation; where the walk
+/// REFUSES (ambiguous fates, deleted bytes, unwalkable node), the only
+/// sound alternative is re-emitting the target — legal for immutable
+/// content (base code keeps calling base's copy), a hard error for
+/// mutable content (re-emitting would fork the variable). Pulling a
+/// node into the closure adds sections (and their relocs) to the
+/// frontier, so iterate to a fixed point; by construction dispose then
+/// never sees a refusal. Off-frontier ambiguity costs nothing: the
+/// walk runs only for offsets an actual reloc queries.
+fn compute_closure_fixpoint(
+    scan: &ScanResult,
+    base: &BaseMetadata,
+    roots: &[NodeId],
+    walker: Option<&crate::relax::walker::Walker<'_>>,
+) -> Result<Closure> {
+    let mut forced: HashSet<NodeId> = HashSet::new();
+    loop {
+        let closure = compute_closure(scan, base, roots, &forced)?;
+        let Some(walker) = walker else { return Ok(closure) };
+
+        let closure_set: HashSet<NodeId> = closure.closure.iter().copied().collect();
+        // Physical sections the pruned objects will keep — their relocs
+        // are exactly what prune will ask dispose about.
+        let mut kept_secs: HashSet<(u32, u32)> = HashSet::new();
+        for &nid in &closure.closure {
+            for seg in &scan.graph.nodes[nid as usize].segments {
+                kept_secs.insert((seg.object, seg.section));
+            }
+        }
+
+        let mut pulled: Vec<NodeId> = Vec::new();
+        for &(obj, sec) in &kept_secs {
+            let Some(site_map) = scan.graph.reloc_targets.get(&(obj, sec)) else { continue };
+            for r in &scan.objects[obj as usize].sections[sec as usize].relocs {
+                let (tnid, value) = match site_map.get(&(r.offset, r.r_type)) {
+                    Some(&crate::graph::ResolvedTarget::Symbol { nid, value }) => (nid, value),
+                    Some(&crate::graph::ResolvedTarget::Section { nid }) => (nid, 0),
+                    // External → channel 4 (output-space symtab
+                    // address, no translation).
+                    Some(&crate::graph::ResolvedTarget::External) | None => continue,
+                };
+                if closure_set.contains(&tnid) || forced.contains(&tnid) {
+                    continue; // channel 1 — UND, no anchor
+                }
+                let th = scan.trans_hash[tnid as usize];
+                if !base.by_section.contains_key(&th) {
+                    continue; // channel 3 — dispose bails with its own message
+                }
+                if base.ambiguous_sections.contains(&th)
+                    && r.target_section.is_none()
+                    && base.by_name.contains_key(&r.target)
+                {
+                    continue; // channel 2a name pin — output-space, no translation
+                }
+                let q = i128::from(value) + i128::from(r.addend);
+                if let Err(why) = walker.query(tnid, q) {
+                    if node_content_addressable(tnid, scan) {
+                        pulled.push(tnid);
+                    } else {
+                        let names: Vec<&str> = scan.graph.nodes[tnid as usize]
+                            .defined_symbols
+                            .iter()
+                            .map(|s| s.name.as_str())
+                            .collect();
+                        bail!(
+                            "reloc in obj {obj} section {sec} targets mutable node \
+                             [{}] whose base placement the walk can't translate \
+                             ({why}) — no sound resolution exists (re-emitting \
+                             would fork the variable).",
+                            names.join(", "),
+                        );
+                    }
+                }
+            }
+        }
+        if pulled.is_empty() {
+            return Ok(closure);
+        }
+        pulled.sort_unstable();
+        pulled.dedup();
+        eprintln!(
+            "graft overlay: lazy walk re-emitting {} target(s) it refused to translate",
+            pulled.len()
+        );
+        forced.extend(pulled);
+    }
+}
+
+fn compute_closure(
+    scan: &ScanResult,
+    base: &BaseMetadata,
+    roots: &[NodeId],
+    forced: &HashSet<NodeId>,
+) -> Result<Closure> {
     let mut closure: Vec<NodeId> = Vec::new();
 
     // Per-node state: Unknown / Included / Provided. We don't walk into
@@ -1266,16 +1401,19 @@ fn compute_closure(scan: &ScanResult, base: &BaseMetadata, roots: &[NodeId]) -> 
     // set; the Provided/Included classification terminates branches
     // whose trans_hash matches base (i.e., base's already-linked
     // version is interchangeable with whatever overlay would emit).
+    // `forced` nodes (walk-refusal pulls from the fixpoint pre-pass)
+    // are seeded and never Provided.
     let mut stack: Vec<NodeId> = roots.to_vec();
+    stack.extend(forced.iter().copied());
     while let Some(nid) = stack.pop() {
         if decision[nid as usize] != Decision::Unknown {
             continue;
         }
         let force_pool = pool_rule && is_literal_pool(nid, scan);
-        if !force_pool && classify_provided(nid, scan, base) {
+        if !force_pool && !forced.contains(&nid) && classify_provided(nid, scan, base) {
             decision[nid as usize] = Decision::Provided;
         } else {
-            if force_pool && !pool_content_addressable(nid, scan) {
+            if force_pool && !node_content_addressable(nid, scan) {
                 let nm = &scan.graph.nodes[nid as usize];
                 let names: Vec<&str> =
                     nm.defined_symbols.iter().map(|s| s.name.as_str()).collect();
@@ -1309,9 +1447,10 @@ fn is_literal_pool(nid: NodeId, scan: &ScanResult) -> bool {
     })
 }
 
-/// Force-included pools must be safe to duplicate: base code keeps
-/// reading base's copy, so a writable pool would fork state.
-fn pool_content_addressable(nid: NodeId, scan: &ScanResult) -> bool {
+/// Force-included nodes (pools, walk-refusal pulls) must be safe to
+/// duplicate: base code keeps reading base's copy, so a writable
+/// section would fork state.
+fn node_content_addressable(nid: NodeId, scan: &ScanResult) -> bool {
     scan.graph.nodes[nid as usize].segments.iter().all(|seg| {
         scan.objects[seg.object as usize].sections[seg.section as usize].content_addressable()
     })

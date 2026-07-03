@@ -47,6 +47,8 @@ struct Tables {
     pool_nids: HashSet<NodeId>,
     tls_range: Option<(u64, u64)>,
     tls_nids: HashSet<NodeId>,
+    /// `None` = identity (the non-relaxing default).
+    translate: Option<Box<graft::resolve::TranslateFn<'static>>>,
 }
 
 impl Tables {
@@ -74,6 +76,7 @@ impl Tables {
             ambiguous_sections: &self.ambiguous_sections,
             by_name: &self.by_name,
             by_name_ambiguous: &self.by_name_ambiguous,
+            translate: self.translate.as_deref().unwrap_or(&graft::resolve::identity_translate),
             pool_nids: &self.pool_nids,
             tls_range: self.tls_range,
             tls_nids: &self.tls_nids,
@@ -88,6 +91,7 @@ fn query_bar() -> RelocQuery<'static> {
         section0: 0,
         offset: 4,
         r_type: 1,
+        addend: 0,
         target_name: Some("bar"),
         weak_ref: false,
         from_section: ".text.foo",
@@ -145,7 +149,7 @@ fn channel1_is_node_keyed_not_hash_keyed() {
     t.by_section.insert(TH_BAR, Placed { addr: 0x2000, out_size: 0x100 });
 
     let d = t.resolver().dispose(0, &query_bar()).expect("dispose ok");
-    assert_eq!(d, RelocDisposition::Anchor { tls: false, vaddr: 0x2010, verify_name: None });
+    assert_eq!(d, RelocDisposition::Anchor { tls: false, vaddr: 0x2010, verify_name: None, addend: None });
 }
 
 #[test]
@@ -154,7 +158,43 @@ fn channel2_content_match_anchors_positionally_without_verify() {
     t.by_section.insert(TH_BAR, Placed { addr: 0x2000, out_size: 0x100 });
 
     let d = t.resolver().dispose(0, &query_bar()).expect("dispose ok");
-    assert_eq!(d, RelocDisposition::Anchor { tls: false, vaddr: 0x2010, verify_name: None });
+    assert_eq!(d, RelocDisposition::Anchor { tls: false, vaddr: 0x2010, verify_name: None, addend: None });
+}
+
+#[test]
+fn channel2_walk_translation_folds_addend_and_overrides() {
+    // The target sits in a base section relaxation shifted: input
+    // offset value+addend = 0x10+0x4 lands at output offset 0xc. The
+    // anchor must point at the TRANSLATED byte and zero the emitted
+    // addend (S + A = (0x2000 + 0xc) + 0), not re-apply the input-
+    // space addend on top.
+    let mut t = Tables::with_target(ResolvedTarget::Symbol { nid: NID_BAR, value: 0x10 });
+    t.by_section.insert(TH_BAR, Placed { addr: 0x2000, out_size: 0xf8 });
+    t.translate = Some(Box::new(|nid, q| {
+        assert_eq!(nid, NID_BAR);
+        assert_eq!(q, 0x14);
+        Ok(graft::resolve::Translation::Mapped(0xc))
+    }));
+
+    let q = RelocQuery { addend: 4, ..query_bar() };
+    let d = t.resolver().dispose(0, &q).expect("dispose ok");
+    assert_eq!(
+        d,
+        RelocDisposition::Anchor { tls: false, vaddr: 0x200c, verify_name: None, addend: Some(0) },
+    );
+}
+
+#[test]
+fn channel2_walk_refusal_is_fatal() {
+    // The fixpoint pre-pass re-emits refused targets before prune runs;
+    // a refusal surfacing in dispose is a pre-pass gap — bail, never
+    // guess an interior offset.
+    let mut t = Tables::with_target(ResolvedTarget::Symbol { nid: NID_BAR, value: 0x10 });
+    t.by_section.insert(TH_BAR, Placed { addr: 0x2000, out_size: 0xf8 });
+    t.translate = Some(Box::new(|_, _| Err("min-cost parses disagree".into())));
+
+    let err = t.resolver().dispose(0, &query_bar()).unwrap_err().to_string();
+    assert!(err.contains("refused to translate"), "unexpected error: {err}");
 }
 
 #[test]
@@ -167,7 +207,7 @@ fn channel2a_ambiguous_unique_name_pins_via_symtab_with_verify() {
     let d = t.resolver().dispose(0, &query_bar()).expect("dispose ok");
     assert_eq!(
         d,
-        RelocDisposition::Anchor { tls: false, vaddr: 0x3000, verify_name: Some("bar".into()) },
+        RelocDisposition::Anchor { tls: false, vaddr: 0x3000, verify_name: Some("bar".into()), addend: None },
     );
 }
 
@@ -196,7 +236,7 @@ fn ambiguous_readonly_same_name_dup_uses_representative() {
     t.by_name_ambiguous.insert("bar".into());
 
     let d = t.resolver().dispose(0, &query_bar()).expect("dispose ok");
-    assert_eq!(d, RelocDisposition::Anchor { tls: false, vaddr: 0x2004, verify_name: None });
+    assert_eq!(d, RelocDisposition::Anchor { tls: false, vaddr: 0x2004, verify_name: None, addend: None });
 }
 
 #[test]
@@ -224,7 +264,7 @@ fn channel4_external_name_anchors_with_verify() {
     let d = t.resolver().dispose(0, &query_bar()).expect("dispose ok");
     assert_eq!(
         d,
-        RelocDisposition::Anchor { tls: false, vaddr: 0x1000, verify_name: Some("bar".into()) },
+        RelocDisposition::Anchor { tls: false, vaddr: 0x1000, verify_name: Some("bar".into()), addend: None },
     );
 }
 
@@ -238,7 +278,7 @@ fn external_unrecorded_reloc_site_defaults_to_external() {
     let d = t.resolver().dispose(0, &query_bar()).expect("dispose ok");
     assert_eq!(
         d,
-        RelocDisposition::Anchor { tls: false, vaddr: 0x1000, verify_name: Some("bar".into()) },
+        RelocDisposition::Anchor { tls: false, vaddr: 0x1000, verify_name: Some("bar".into()), addend: None },
     );
 }
 
@@ -278,7 +318,7 @@ fn wrapped_name_resolves_and_emits_as_wrapper() {
     let d = t.resolver().dispose(0, &query_bar()).expect("dispose ok");
     assert_eq!(
         d,
-        RelocDisposition::Anchor { tls: false, vaddr: 0x4000, verify_name: Some("__wrap_bar".into()) },
+        RelocDisposition::Anchor { tls: false, vaddr: 0x4000, verify_name: Some("__wrap_bar".into()), addend: None },
     );
 }
 
@@ -290,7 +330,7 @@ fn section_target_resolves_positionally() {
     let d = t.resolver().dispose(0, &section_query()).expect("dispose ok");
     // The reloc's own addend rides along separately; the anchor is the
     // section's base.
-    assert_eq!(d, RelocDisposition::Anchor { tls: false, vaddr: 0x5000, verify_name: None });
+    assert_eq!(d, RelocDisposition::Anchor { tls: false, vaddr: 0x5000, verify_name: None, addend: None });
 }
 
 #[test]
@@ -313,7 +353,7 @@ fn section_target_ambiguous_readonly_uses_representative() {
     t.ambiguous_sections.insert(TH_BAR);
 
     let d = t.resolver().dispose(0, &section_query()).expect("dispose ok");
-    assert_eq!(d, RelocDisposition::Anchor { tls: false, vaddr: 0x5000, verify_name: None });
+    assert_eq!(d, RelocDisposition::Anchor { tls: false, vaddr: 0x5000, verify_name: None, addend: None });
 }
 
 #[test]
@@ -355,7 +395,7 @@ fn channel2_anchor_inside_tls_range_is_classified_tls() {
     t.tls_range = Some((0x7000, 0x7100));
 
     let d = t.resolver().dispose(0, &query_bar()).expect("dispose ok");
-    assert_eq!(d, RelocDisposition::Anchor { tls: true, vaddr: 0x7010, verify_name: None });
+    assert_eq!(d, RelocDisposition::Anchor { tls: true, vaddr: 0x7010, verify_name: None, addend: None });
 }
 
 #[test]
@@ -369,7 +409,7 @@ fn channel4_name_inside_tls_range_is_classified_tls() {
     let d = t.resolver().dispose(0, &query_bar()).expect("dispose ok");
     assert_eq!(
         d,
-        RelocDisposition::Anchor { tls: true, vaddr: 0x7020, verify_name: Some("bar".into()) },
+        RelocDisposition::Anchor { tls: true, vaddr: 0x7020, verify_name: Some("bar".into()), addend: None },
     );
 }
 
@@ -380,7 +420,7 @@ fn anchor_outside_tls_range_is_not_tls() {
     t.tls_range = Some((0x7000, 0x7100));
 
     let d = t.resolver().dispose(0, &query_bar()).expect("dispose ok");
-    assert_eq!(d, RelocDisposition::Anchor { tls: false, vaddr: 0x2000, verify_name: None });
+    assert_eq!(d, RelocDisposition::Anchor { tls: false, vaddr: 0x2000, verify_name: None, addend: None });
 }
 
 // ---------------------------------------------------------------------
@@ -450,7 +490,7 @@ fn prune_emits_anchor_and_records_verify_name() {
     let keep = keep_text_foo(&bytes);
     let dispose = |q: &RelocQuery<'_>| {
         assert_eq!(q.target_name, Some("bar"));
-        Ok(RelocDisposition::Anchor { tls: false, vaddr: 0x3000, verify_name: Some("bar".into()) })
+        Ok(RelocDisposition::Anchor { tls: false, vaddr: 0x3000, verify_name: Some("bar".into()), addend: None })
     };
     let p = prune::prune_object(&bytes, &keep, &dispose).expect("prune ok");
     assert_eq!(p.anchor_rewrites, 1);
@@ -494,7 +534,7 @@ fn prune_emits_tls_anchor_as_und_stt_tls() {
     let bytes = synth_obj_ref_bar();
     let keep = keep_text_foo(&bytes);
     let dispose = |_q: &RelocQuery<'_>| {
-        Ok(RelocDisposition::Anchor { tls: true, vaddr: 0x7010, verify_name: None })
+        Ok(RelocDisposition::Anchor { tls: true, vaddr: 0x7010, verify_name: None, addend: None })
     };
     let p = prune::prune_object(&bytes, &keep, &dispose).expect("prune ok");
     assert_eq!(p.anchors, vec![(0x7010, true)]);

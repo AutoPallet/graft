@@ -59,8 +59,11 @@ pub enum RelocDisposition {
     /// ld accepts TLS-flavored relocs and recomputes TP offsets from
     /// the (identical) template geometry. `verify_name = Some` for
     /// resolutions that assume base.elf's symtab address — overlay
-    /// post-link verifies the name landed there.
-    Anchor { vaddr: u64, tls: bool, verify_name: Option<String> },
+    /// post-link verifies the name landed there. `addend = Some(a)`
+    /// REPLACES the reloc's own addend in the pruned object: walk-
+    /// translated anchors fold `value + addend` into a single output
+    /// offset (the input-space addend must not be re-applied on top).
+    Anchor { vaddr: u64, tls: bool, verify_name: Option<String>, addend: Option<i64> },
 }
 
 /// One reloc prune couldn't satisfy internally, described for
@@ -71,6 +74,10 @@ pub struct RelocQuery<'a> {
     pub section0: u32,
     pub offset: u64,
     pub r_type: u32,
+    /// The reloc's own addend. Channel 2 composes it with the symbol
+    /// value to query the walk (the target BYTE is what must be
+    /// translated); every other channel lets it ride unchanged.
+    pub addend: i64,
     pub target_name: Option<&'a str>,
     /// True if the referencing object's symtab entry for the target is
     /// STB_WEAK — the weak-undef mirror channel keys on this.
@@ -82,6 +89,28 @@ pub struct RelocQuery<'a> {
 /// Disposition callback handed to `prune_object`. Borrows the overlay
 /// run's `Resolver` (tests substitute a fixture closure).
 pub type DisposeFn<'a> = dyn Fn(&RelocQuery<'_>) -> Result<RelocDisposition> + 'a;
+
+/// Where an input-space offset lands inside base's placed copy of a
+/// section (`relax::walker::Walker::query`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Translation {
+    /// Input offsets map 1:1 to output offsets — non-relaxing targets
+    /// and unrelaxed xtensa sections.
+    Identity,
+    /// The queried input offset survives at this output offset.
+    Mapped(u64),
+}
+
+/// Positional offset translation for channel 2 — `(node, value +
+/// addend) -> Translation`. `Err` is a refusal: the pre-pass should
+/// have re-emitted the target, so disposition treats it as fatal.
+pub type TranslateFn<'a> = dyn Fn(NodeId, i128) -> Result<Translation, String> + 'a;
+
+/// The non-relaxing default: every recorded placement was byte-
+/// verified at base time, so offsets map 1:1.
+pub fn identity_translate(_: NodeId, _: i128) -> Result<Translation, String> {
+    Ok(Translation::Identity)
+}
 
 /// Everything disposition needs, as flat borrowed tables (directly
 /// constructible in tests).
@@ -110,6 +139,9 @@ pub struct Resolver<'a> {
     pub by_name: &'a HashMap<String, u64>,
     /// Names base defined at multiple distinct addresses.
     pub by_name_ambiguous: &'a HashSet<String>,
+    /// Channel-2 positional offset translation (the lazy walk).
+    /// `identity_translate` everywhere except xtensa overlay runs.
+    pub translate: &'a TranslateFn<'a>,
     /// Literal-pool nodes (xtensa; empty elsewhere). Pools always
     /// travel with the code that references them — `l32r` reaches
     /// −256KB backward only, so a base pool address is out of range
@@ -150,12 +182,12 @@ impl<'a> Resolver<'a> {
 
         match resolved {
             ResolvedTarget::Symbol { nid, value } => {
-                self.dispose_node(nid, value, lookup_name.as_deref(), q.from_section)
+                self.dispose_node(nid, value, q.addend, lookup_name.as_deref(), q.from_section)
             }
             ResolvedTarget::Section { nid } => {
-                // A section ref carries no name; the addend (which
-                // rides on the reloc unchanged) holds the offset.
-                self.dispose_node(nid, 0, None, q.from_section)
+                // A section ref carries no name; the addend holds the
+                // offset (and rides unchanged unless walk-translated).
+                self.dispose_node(nid, 0, q.addend, None, q.from_section)
             }
             ResolvedTarget::External => {
                 self.dispose_external(lookup_name.as_deref(), q.weak_ref, q.from_section)
@@ -167,6 +199,7 @@ impl<'a> Resolver<'a> {
         &self,
         nid: NodeId,
         value: u64,
+        addend: i64,
         name: Option<&str>,
         from_section: &str,
     ) -> Result<RelocDisposition> {
@@ -201,11 +234,13 @@ impl<'a> Resolver<'a> {
                     && let Some(&addr) = self.by_name.get(name)
                 {
                     // (2a) several byte-identical copies; the name pins
-                    // base's exact one. Verify post-link.
+                    // base's exact one (an output-space symtab address —
+                    // no walk translation). Verify post-link.
                     return Ok(RelocDisposition::Anchor {
                         vaddr: addr,
                         tls: self.is_tls(addr),
                         verify_name: Some(name.to_string()),
+                        addend: None,
                     });
                 }
                 if self.mutable_ths.contains(&th) {
@@ -217,18 +252,10 @@ impl<'a> Resolver<'a> {
                     );
                 }
                 // Read-only/exec interchangeable copies → representative.
-                return Ok(RelocDisposition::Anchor {
-                    vaddr: sec_addr + value,
-                    tls: self.is_tls(sec_addr + value),
-                    verify_name: None,
-                });
+                return self.positional_anchor(nid, sec_addr, value, addend, name, from_section);
             }
             // (2) clean positional content match.
-            return Ok(RelocDisposition::Anchor {
-                vaddr: sec_addr + value,
-                tls: self.is_tls(sec_addr + value),
-                verify_name: None,
-            });
+            return self.positional_anchor(nid, sec_addr, value, addend, name, from_section);
         }
         // (3) overlay has a definition whose content is NOT in base and
         // the closure didn't re-emit it — binding to any base address
@@ -239,6 +266,48 @@ impl<'a> Resolver<'a> {
              Likely a closure / scan-discovery bug.",
             name.unwrap_or("<section ref>"),
         );
+    }
+
+    /// Channels 2 / 2-representative: anchor at base's placed copy,
+    /// translating the interior offset through the lazy walk. The walk
+    /// queries the target BYTE — `value + addend` — because that is
+    /// the input-space position whose output-space home we need; a
+    /// translated anchor therefore folds the addend in and overrides
+    /// the emitted addend to 0 (`S + A = (sec_addr + T) + 0`).
+    fn positional_anchor(
+        &self,
+        nid: NodeId,
+        sec_addr: u64,
+        value: u64,
+        addend: i64,
+        name: Option<&str>,
+        from_section: &str,
+    ) -> Result<RelocDisposition> {
+        let q = i128::from(value) + i128::from(addend);
+        match (self.translate)(nid, q) {
+            Ok(Translation::Identity) => Ok(RelocDisposition::Anchor {
+                vaddr: sec_addr + value,
+                tls: self.is_tls(sec_addr + value),
+                verify_name: None,
+                addend: None,
+            }),
+            Ok(Translation::Mapped(t)) => {
+                let vaddr = sec_addr + t;
+                Ok(RelocDisposition::Anchor {
+                    vaddr,
+                    tls: self.is_tls(vaddr),
+                    verify_name: None,
+                    addend: Some(0),
+                })
+            }
+            // The fixpoint pre-pass re-emits refused targets before
+            // prune ever disposes, so a refusal here is a walk/dispose
+            // disagreement — refuse loudly, never guess an offset.
+            Err(why) => bail!(
+                "reloc in {from_section}: {} resolves into base's relaxed copy but the                  walk refused to translate offset {q:#x}: {why} (pre-pass gap)",
+                name.unwrap_or("<section ref>"),
+            ),
+        }
     }
 
     fn dispose_external(
@@ -256,10 +325,12 @@ impl<'a> Resolver<'a> {
         if let Some(&addr) = self.by_name.get(lookup_name) {
             // (4) base resolved it (script absolute, PROVIDE, ROM, crt,
             // aggregator bracket, prebuilt-lib symbol) → anchor + verify.
+            // Output-space symtab address: no walk translation.
             return Ok(RelocDisposition::Anchor {
                 vaddr: addr,
                 tls: self.is_tls(addr),
                 verify_name: Some(lookup_name.to_string()),
+                addend: None,
             });
         }
         if self.by_name_ambiguous.contains(lookup_name) {

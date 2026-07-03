@@ -17,6 +17,7 @@
 
 pub mod engine;
 pub mod verify;
+pub mod walker;
 pub mod x86;
 pub mod xtensa;
 

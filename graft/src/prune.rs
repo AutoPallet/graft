@@ -209,6 +209,7 @@ pub fn prune_object(
                                     section0,
                                     offset,
                                     r_type,
+                                    addend: r.addend(),
                                     target_name: None,
                                     weak_ref: false,
                                     from_section: &from_section,
@@ -226,6 +227,7 @@ pub fn prune_object(
                                 section0,
                                 offset,
                                 r_type,
+                                addend: r.addend(),
                                 target_name: Some(name),
                                 weak_ref: src_sym.is_weak(),
                                 from_section: &from_section,
@@ -241,6 +243,7 @@ pub fn prune_object(
                             section0,
                             offset,
                             r_type,
+                            addend: r.addend(),
                             target_name: None,
                             weak_ref: false,
                             from_section: &from_section,
@@ -253,6 +256,10 @@ pub fn prune_object(
                 other => bail!("unsupported reloc target {other:?} in {from_section}"),
             };
 
+            // A walk-translated anchor folds `value + addend` into its
+            // vaddr; the emitted addend must be overridden (to 0), not
+            // re-applied on top.
+            let mut addend_override: Option<i64> = None;
             let sym_id = match disposition {
                 Ok(internal) => internal,
                 Err(RelocDisposition::Und { name, weak, tls }) => {
@@ -271,8 +278,9 @@ pub fn prune_object(
                         })
                     })
                 }
-                Err(RelocDisposition::Anchor { vaddr, tls, verify_name }) => {
+                Err(RelocDisposition::Anchor { vaddr, tls, verify_name, addend }) => {
                     anchor_rewrites += 1;
+                    addend_override = addend;
                     if let Some(name) = verify_name {
                         assumed_names.push((name, vaddr));
                     }
@@ -310,7 +318,7 @@ pub fn prune_object(
                 WRelocation {
                     offset,
                     symbol: sym_id,
-                    addend: r.addend(),
+                    addend: addend_override.unwrap_or_else(|| r.addend()),
                     flags: RelocationFlags::Elf { r_type },
                 },
             )
