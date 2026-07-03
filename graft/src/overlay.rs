@@ -106,6 +106,16 @@ fn run(argv: Vec<String>) -> Result<()> {
     let closure_nids: HashSet<NodeId> = closure.closure.iter().copied().collect();
     let mutable_ths = mutable_trans_hashes(&scan);
     let tls_nids = tls_node_ids(&scan);
+    // Channel-1b defense set: every pool node (xtensa). A pool target
+    // reaching dispose outside the closure means the walk's
+    // force-include rule and disposition disagree — bail, never anchor.
+    let pool_nids: HashSet<NodeId> = if base.e_machine == object::elf::EM_XTENSA {
+        (0..scan.graph.nodes.len() as NodeId)
+            .filter(|&n| is_literal_pool(n, &scan))
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let resolver_wrapped: HashSet<String> = link_args.wrapped.iter().cloned().collect();
     let resolver = crate::resolve::Resolver {
         trans_hash: &scan.trans_hash,
@@ -117,6 +127,7 @@ fn run(argv: Vec<String>) -> Result<()> {
         ambiguous_sections: &base.ambiguous_sections,
         by_name: &base.by_name,
         by_name_ambiguous: &base.by_name_ambiguous,
+        pool_nids: &pool_nids,
         tls_range: base.tls.map(|t| (t.vaddr, t.vaddr + t.memsz)),
         tls_nids: &tls_nids,
     };
@@ -1078,6 +1089,9 @@ pub struct BaseMetadata {
     pub tls: Option<crate::combine::PtTls>,
     /// Base's PT_LOAD spans `(vaddr, memsz)` — the map-object intervals.
     pub load_spans: Vec<(u64, u64)>,
+    /// Base's ELF machine — gates arch-specific policy (the literal-pool
+    /// travel rule is xtensa-only).
+    pub e_machine: u16,
 }
 
 fn load_base_metadata(path: &std::path::Path) -> Result<BaseMetadata> {
@@ -1162,6 +1176,8 @@ fn load_base_metadata(path: &std::path::Path) -> Result<BaseMetadata> {
         by_name.remove(n);
     }
 
+    let e_machine = base_e_machine(&bytes)?;
+
     Ok(BaseMetadata {
         manifest,
         by_section,
@@ -1170,6 +1186,7 @@ fn load_base_metadata(path: &std::path::Path) -> Result<BaseMetadata> {
         by_name_ambiguous,
         tls,
         load_spans,
+        e_machine,
     })
 }
 
@@ -1235,6 +1252,16 @@ fn compute_closure(scan: &ScanResult, base: &BaseMetadata, roots: &[NodeId]) -> 
     }
     let mut decision = vec![Decision::Unknown; scan.graph.nodes.len()];
 
+    // Literal pools always travel with the code that references them
+    // (xtensa): `l32r` reaches −256KB backward only, so a re-emitted
+    // function can't reach base's copy of its pool, while a re-emitted
+    // pool has no range problem (pool words are absolute values, and
+    // the script's wildcards keep pools adjacent to their code in
+    // slack). Every node on the DFS stack was demanded by an Included
+    // node (or is a root), so a *popped* pool node is referenced by
+    // re-emitted code and must never be Provided.
+    let pool_rule = base.e_machine == object::elf::EM_XTENSA;
+
     // DFS from every root. ld's gc-sections would start from the same
     // set; the Provided/Included classification terminates branches
     // whose trans_hash matches base (i.e., base's already-linked
@@ -1244,9 +1271,20 @@ fn compute_closure(scan: &ScanResult, base: &BaseMetadata, roots: &[NodeId]) -> 
         if decision[nid as usize] != Decision::Unknown {
             continue;
         }
-        if classify_provided(nid, scan, base) {
+        let force_pool = pool_rule && is_literal_pool(nid, scan);
+        if !force_pool && classify_provided(nid, scan, base) {
             decision[nid as usize] = Decision::Provided;
         } else {
+            if force_pool && !pool_content_addressable(nid, scan) {
+                let nm = &scan.graph.nodes[nid as usize];
+                let names: Vec<&str> =
+                    nm.defined_symbols.iter().map(|s| s.name.as_str()).collect();
+                bail!(
+                    "literal pool node {nid} [{}] is not content-addressable — \
+                     re-emitting it alongside base's copy would fork mutable state",
+                    names.join(", "),
+                );
+            }
             decision[nid as usize] = Decision::Included;
             closure.push(nid);
             for &succ in &scan.graph.edges[nid as usize] {
@@ -1259,6 +1297,24 @@ fn compute_closure(scan: &ScanResult, base: &BaseMetadata, roots: &[NodeId]) -> 
 
     closure.sort();
     Ok(Closure { closure })
+}
+
+/// Pool predicate: any segment whose section name contains `.literal`
+/// (the same convention `relax::xtensa::extract_input` keys on).
+fn is_literal_pool(nid: NodeId, scan: &ScanResult) -> bool {
+    scan.graph.nodes[nid as usize].segments.iter().any(|seg| {
+        scan.objects[seg.object as usize].sections[seg.section as usize]
+            .name
+            .contains(".literal")
+    })
+}
+
+/// Force-included pools must be safe to duplicate: base code keeps
+/// reading base's copy, so a writable pool would fork state.
+fn pool_content_addressable(nid: NodeId, scan: &ScanResult) -> bool {
+    scan.graph.nodes[nid as usize].segments.iter().all(|seg| {
+        scan.objects[seg.object as usize].sections[seg.section as usize].content_addressable()
+    })
 }
 
 /// True iff base can satisfy this node positionally: its `trans_hash` is

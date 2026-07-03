@@ -47,8 +47,8 @@ build() {
 echo "== 1/7 host musl graft"
 (cd "$ROOT" && cargo build --release --target x86_64-unknown-linux-musl -p graft)
 
-echo "== 2/7 base build (Hello, map oracle on)"
-build "GRAFT=base GRAFT_ENTRY_SYMBOL=graft_entry GRAFT_MAP_ORACLE=1"
+echo "== 2/7 base build (Hello)"
+build "GRAFT=base GRAFT_ENTRY_SYMBOL=graft_entry"
 run "cp /workspace/esp32s3-hello/target/xtensa-esp32s3-none-elf/release/esp32s3-hello /tmp/base.elf"
 
 echo "== 3/7 flash base + verify"
@@ -75,7 +75,7 @@ grep -q "GE4: greeting load ok = Howdy" <<<"$out" || fail "overlay GE4 (edit not
 grep -q "Howdy from ESP32-S3! mut=2 atomic=2 ram=3" <<<"$out" || fail "overlay counters (mutable-static aliasing?)"
 
 echo "== 7/7 restore Hello base"
-build "GRAFT=base GRAFT_ENTRY_SYMBOL=graft_entry GRAFT_MAP_ORACLE=1"
+build "GRAFT=base GRAFT_ENTRY_SYMBOL=graft_entry"
 run "cp /workspace/esp32s3-hello/target/xtensa-esp32s3-none-elf/release/esp32s3-hello /tmp/base.elf &&
      espflash flash --port $PORT /tmp/base.elf >/dev/null 2>&1"
 out=$(monitor)

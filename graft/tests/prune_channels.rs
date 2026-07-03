@@ -44,6 +44,7 @@ struct Tables {
     ambiguous_sections: HashSet<TransHash>,
     by_name: HashMap<String, u64>,
     by_name_ambiguous: HashSet<String>,
+    pool_nids: HashSet<NodeId>,
     tls_range: Option<(u64, u64)>,
     tls_nids: HashSet<NodeId>,
 }
@@ -73,6 +74,7 @@ impl Tables {
             ambiguous_sections: &self.ambiguous_sections,
             by_name: &self.by_name,
             by_name_ambiguous: &self.by_name_ambiguous,
+            pool_nids: &self.pool_nids,
             tls_range: self.tls_range,
             tls_nids: &self.tls_nids,
         }
@@ -103,6 +105,32 @@ fn channel1_closure_node_disposes_und() {
 
     let d = t.resolver().dispose(0, &query_bar()).expect("dispose ok");
     assert_eq!(d, RelocDisposition::Und { name: "bar".into(), weak: false, tls: false });
+}
+
+#[test]
+fn pool_node_in_closure_disposes_und() {
+    // A literal pool that traveled with its code disposes like any
+    // closure member — channel 1, before the pool defense fires.
+    let mut t = Tables::with_target(ResolvedTarget::Symbol { nid: NID_BAR, value: 0 });
+    t.closure_nids.insert(NID_BAR);
+    t.pool_nids.insert(NID_BAR);
+
+    let d = t.resolver().dispose(0, &query_bar()).expect("dispose ok");
+    assert_eq!(d, RelocDisposition::Und { name: "bar".into(), weak: false, tls: false });
+}
+
+#[test]
+fn pool_node_outside_closure_bails_even_with_base_content() {
+    // Channel 1b: the pool's bytes ARE in base's table, but anchoring
+    // re-emitted code at a base pool word is an l32r range hazard —
+    // the closure walk should have force-included it, so disposition
+    // refuses rather than papering over the walk bug.
+    let mut t = Tables::with_target(ResolvedTarget::Symbol { nid: NID_BAR, value: 0 });
+    t.by_section.insert(TH_BAR, Placed { addr: 0x2000, out_size: 0x100 });
+    t.pool_nids.insert(NID_BAR);
+
+    let err = t.resolver().dispose(0, &query_bar()).unwrap_err().to_string();
+    assert!(err.contains("literal pool"), "unexpected error: {err}");
 }
 
 #[test]

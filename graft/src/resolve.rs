@@ -15,6 +15,10 @@
 //! The cascade (see `CLAUDE.md` § "prune's resolution channels"):
 //!   1. target node is in the closure → UND; ld binds overlay's
 //!      re-emitted copy.
+//!   1b. target is a literal pool NOT in the closure → BAIL. The
+//!      closure walk force-includes every pool a kept section
+//!      references (`l32r` can't reach base's copy), so this firing
+//!      means the walk and disposition disagree.
 //!   2. target node's trans_hash is in base's table → anchor at
 //!      `by_section[th] + value` (positional, no verify).
 //!      2a. ambiguous hash + name uniquely in base.symtab → pin that
@@ -106,6 +110,14 @@ pub struct Resolver<'a> {
     pub by_name: &'a HashMap<String, u64>,
     /// Names base defined at multiple distinct addresses.
     pub by_name_ambiguous: &'a HashSet<String>,
+    /// Literal-pool nodes (xtensa; empty elsewhere). Pools always
+    /// travel with the code that references them — `l32r` reaches
+    /// −256KB backward only, so a base pool address is out of range
+    /// for re-emitted overlay code. Every reloc we dispose lives in a
+    /// kept (closure) section, and the closure walk force-includes
+    /// pools its members reference, so a pool target reaching channel
+    /// 2 is an invariant violation, not a resolvable case.
+    pub pool_nids: &'a HashSet<NodeId>,
     /// Base's PT_TLS template span `[start, end)`, if base has one.
     /// Anchors whose vaddr falls inside are TLS anchors (template
     /// vaddrs — see `build_section_table`'s translation).
@@ -175,6 +187,13 @@ impl<'a> Resolver<'a> {
                 weak: false,
                 tls: self.tls_nids.contains(&nid),
             });
+        }
+        if self.pool_nids.contains(&nid) {
+            bail!(
+                "reloc in {from_section}: {} is a literal pool that was not re-emitted \
+                 — pools must travel with their referencing code (closure walk bug).",
+                name.unwrap_or("<section ref>"),
+            );
         }
         if let Some(&Placed { addr: sec_addr, .. }) = self.by_section.get(&th) {
             if self.ambiguous_sections.contains(&th) {
