@@ -416,7 +416,16 @@ fn combine_splice(
         }
     }
 
-    refresh_build_id(&mut out, &base_obj_for_slack, &base_loads, delta_hasher.finalize())?;
+    let ov_loads: Vec<Phdr> = ov_phdrs.iter().copied().filter(|p| p.p_type == PT_LOAD).collect();
+    refresh_build_id(
+        &mut out,
+        &base_obj_for_slack,
+        &base_loads,
+        &overlay_obj,
+        &ov_loads,
+        overlay_bytes,
+        delta_hasher.finalize(),
+    )?;
 
     write_executable(output_path, &out)?;
 
@@ -499,26 +508,16 @@ pub struct Trampoline {
     pub overlay_addr: u64,
 }
 
-/// Refresh the image's build id: `new_id = blake3(old_id ‖ delta)[..len]`.
-///
-/// The id lives between `__build_id_start` and `__build_id_end` (an
-/// esp-idf linker-script window in `.flash.rodata`; the first 16 bytes
-/// are the ELF note header, the rest is the id — same layout roborack's
-/// `read_deploy_bin_build_id` reads). Deterministic: the same base and
-/// the same overlay delta always produce the same id, and chained
-/// overlays chain ids. Images without the symbols (fixtures, native
-/// targets) are left untouched.
-fn refresh_build_id(
-    out: &mut [u8],
-    base_obj: &object::File,
-    base_loads: &[Phdr],
-    delta: blake3::Hash,
-) -> Result<()> {
+/// Locate an image's build-id bytes: the window between
+/// `__build_id_start` and `__build_id_end` minus the 16-byte ELF note
+/// header (esp-idf linker-script convention; same layout roborack's
+/// `read_deploy_bin_build_id` reads). Returns (file_offset, id_len).
+fn build_id_window(obj: &object::File, loads: &[Phdr]) -> Result<Option<(usize, usize)>> {
     use object::{Object, ObjectSymbol};
 
     let mut start = None;
     let mut end = None;
-    for sym in base_obj.symbols() {
+    for sym in obj.symbols() {
         match sym.name() {
             Ok("__build_id_start") => start = Some(sym.address()),
             Ok("__build_id_end") => end = Some(sym.address()),
@@ -526,24 +525,48 @@ fn refresh_build_id(
         }
     }
     let (Some(start), Some(end)) = (start, end) else {
-        return Ok(()); // no build-id convention in this image
+        return Ok(None); // no build-id convention in this image
     };
-    // Skip the 16-byte ELF note header (namesz/descsz/type + "GNU\0").
     let id_vaddr = start + 16;
     if end <= id_vaddr {
         bail!("build-id window malformed: [{start:#x}, {end:#x})");
     }
-    let id_len = (end - id_vaddr) as usize;
-    let load = base_loads
+    let load = loads
         .iter()
         .find(|p| id_vaddr >= p.p_vaddr && end <= p.p_vaddr + p.p_filesz)
         .ok_or_else(|| anyhow!("build-id window outside every PT_LOAD"))?;
     let off = (load.p_offset + (id_vaddr - load.p_vaddr)) as usize;
+    Ok(Some((off, (end - id_vaddr) as usize)))
+}
+
+/// Refresh the combined image's build id:
+/// `new_id = blake3(base_id ‖ overlay_id)[..len]` — the overlay link
+/// runs through the same linker script, so overlay.elf mints its own
+/// build-id; composing the two published identities is deterministic
+/// per (base, overlay) and chains across chained overlays. If the
+/// overlay somehow lacks the window, the splice-delta hash stands in
+/// for its identity. Images whose base has no window (fixtures, native
+/// targets) are left untouched.
+fn refresh_build_id(
+    out: &mut [u8],
+    base_obj: &object::File,
+    base_loads: &[Phdr],
+    overlay_obj: &object::File,
+    overlay_loads: &[Phdr],
+    overlay_bytes: &[u8],
+    delta: blake3::Hash,
+) -> Result<()> {
+    let Some((off, id_len)) = build_id_window(base_obj, base_loads)? else {
+        return Ok(());
+    };
 
     let old_id = out[off..off + id_len].to_vec();
     let mut h = blake3::Hasher::new();
     h.update(&old_id);
-    h.update(delta.as_bytes());
+    match build_id_window(overlay_obj, overlay_loads)? {
+        Some((ov_off, ov_len)) => h.update(&overlay_bytes[ov_off..ov_off + ov_len]),
+        None => h.update(delta.as_bytes()),
+    };
     let mut new_id = vec![0u8; id_len];
     h.finalize_xof().fill(&mut new_id);
     out[off..off + id_len].copy_from_slice(&new_id);
