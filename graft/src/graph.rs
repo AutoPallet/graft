@@ -93,6 +93,13 @@ pub struct Graph {
     /// the same resolution that built `edges` — so inclusion (closure)
     /// and resolution can't drift.
     pub reloc_targets: HashMap<(u32, u32), HashMap<(u64, u32), ResolvedTarget>>,
+    /// The trampoline target's node, if the entry symbol resolved.
+    /// `reloc_targets` records the true node for entry-targeted relocs
+    /// (prune needs the real resolution), but *edges* fold them into
+    /// external sentinels — consumers that re-derive per-reloc
+    /// dependencies from `reloc_targets` (hash slot streams) must apply
+    /// the same cut, so the cut point lives here, not in each consumer.
+    pub entry_node: Option<NodeId>,
 }
 
 /// A LogicalNode is the unit of inclusion: closure, hashing, and SCC
@@ -538,6 +545,7 @@ pub fn build(
         external_edge_counts: external_counts,
         symbols,
         reloc_targets,
+        entry_node,
     }
 }
 
@@ -678,6 +686,7 @@ mod tests {
             edges,
             symbols: SymbolIndex::default(),
             reloc_targets: HashMap::new(),
+            entry_node: None,
         }
     }
 

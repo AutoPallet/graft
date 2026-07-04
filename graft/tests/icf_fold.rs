@@ -473,6 +473,173 @@ fn oversized_group_folds_as_chunks() {
     }
 }
 
+/// Regression pin for #42 — the intra-SCC trans_hash collision.
+///
+/// Three "wrapper towers" `wrap_i → helper_i → leaf_i` where the wrap
+/// and helper bytes are identical across towers and only the leaves
+/// differ (`mov eax, 42+i`), cross-linked `leaf_i → wrap_{(i+1)%3}` so
+/// all nine sections weld into ONE SCC — the roborack fmt/panic
+/// mega-SCC in miniature (write_fmt text / literal+vtable / write_str).
+/// The pre-refinement hash gave every member `H(shared scc_hash ‖
+/// one-hop bytes-only member hash)`, so the wrappers collided and ICF
+/// folded three behaviorally different functions onto one body (null
+/// `self` in `spec_extend` on hardware). Color refinement must split
+/// them — and must still assign EQUAL hashes to two disjoint towers
+/// that are genuinely byte-and-wiring identical (no over-splitting:
+/// content-keyed resolution and ICF both rely on true copies
+/// colliding).
+#[test]
+fn same_scc_towers_with_distinct_leaves_do_not_collide() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+
+    let mut obj = WObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+
+    // Declare all symbols first (relocs reference them by SymbolId),
+    // then fill in section data. GLOBAL scope so resolution goes
+    // through the flat symbol index.
+    let mut sym_of = std::collections::HashMap::new();
+    let names: Vec<String> = (0..3)
+        .flat_map(|i| {
+            vec![format!("wrap_{i}"), format!("helper_{i}"), format!("leaf_{i}")]
+        })
+        .chain(["wrap_a", "helper_a", "leaf_a", "wrap_b", "helper_b", "leaf_b", "main"]
+            .into_iter()
+            .map(str::to_string))
+        .collect();
+    let mut sec_of = std::collections::HashMap::new();
+    for name in &names {
+        let sec = obj.add_section(
+            Vec::new(),
+            format!(".text.{name}").into_bytes(),
+            SectionKind::Text,
+        );
+        let sym = obj.add_symbol(WSymbol {
+            name: name.as_bytes().to_vec(),
+            value: 0,
+            size: 0,
+            kind: SymbolKind::Text,
+            scope: object::write::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(sec),
+            flags: object::write::SymbolFlags::None,
+        });
+        sec_of.insert(name.clone(), sec);
+        sym_of.insert(name.clone(), sym);
+    }
+
+    // call rel32 <target>; ret — reloc at +1. Identical bytes for
+    // every wrap and every helper; only the call target differs.
+    let call_ret = |obj: &mut WObject, sec_name: &str, target: &str| {
+        let sec = sec_of[sec_name];
+        obj.section_mut(sec).set_data(vec![0xe8, 0, 0, 0, 0, 0xc3], 16);
+        obj.add_relocation(
+            sec,
+            WRelocation {
+                offset: 1,
+                symbol: sym_of[target],
+                addend: -4,
+                flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PLT32 },
+            },
+        )
+        .unwrap();
+    };
+    // mov eax, imm32; call rel32 <next>; ret — reloc at +6. The imm is
+    // the towers' ONLY byte difference, two hops from the wrappers.
+    let leaf = |obj: &mut WObject, sec_name: &str, imm: u8, next: &str| {
+        let sec = sec_of[sec_name];
+        obj.section_mut(sec)
+            .set_data(vec![0xb8, imm, 0, 0, 0, 0xe8, 0, 0, 0, 0, 0xc3], 16);
+        obj.add_relocation(
+            sec,
+            WRelocation {
+                offset: 6,
+                symbol: sym_of[next],
+                addend: -4,
+                flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PLT32 },
+            },
+        )
+        .unwrap();
+    };
+
+    for i in 0..3usize {
+        call_ret(&mut obj, &format!("wrap_{i}"), &format!("helper_{i}"));
+        call_ret(&mut obj, &format!("helper_{i}"), &format!("leaf_{i}"));
+        // Cross-link into a ring: one nine-member SCC.
+        leaf(&mut obj, &format!("leaf_{i}"), 42 + i as u8, &format!("wrap_{}", (i + 1) % 3));
+    }
+    // Control pair: two DISJOINT self-cycling towers, byte- and
+    // wiring-identical. Their members must collide cross-SCC.
+    for t in ["a", "b"] {
+        call_ret(&mut obj, &format!("wrap_{t}"), &format!("helper_{t}"));
+        call_ret(&mut obj, &format!("helper_{t}"), &format!("leaf_{t}"));
+        leaf(&mut obj, &format!("leaf_{t}"), 0x99, &format!("wrap_{t}"));
+    }
+    // main calls one wrapper from each family so everything is
+    // referenced; it is also the scan's entry symbol.
+    {
+        let sec = sec_of["main"];
+        let mut code = Vec::new();
+        let mut offs = Vec::new();
+        for _ in 0..3 {
+            offs.push(code.len() as u64 + 1);
+            code.extend_from_slice(&[0xe8, 0, 0, 0, 0]);
+        }
+        code.push(0xc3);
+        obj.section_mut(sec).set_data(code, 16);
+        for (off, target) in offs.into_iter().zip(["wrap_0", "wrap_a", "wrap_b"]) {
+            obj.add_relocation(
+                sec,
+                WRelocation {
+                    offset: off,
+                    symbol: sym_of[target],
+                    addend: -4,
+                    flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PLT32 },
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    let path = d.join("towers.o");
+    std::fs::write(&path, obj.write().unwrap()).unwrap();
+
+    let scan = graft::scan::run(&[path], &[] as &[PathBuf], &[], &[], Some("main")).unwrap();
+    let th = |name: &str| {
+        let (nid, _) = scan
+            .graph
+            .symbols
+            .resolve_global(name)
+            .unwrap_or_else(|| panic!("{name} not in symbol index"));
+        scan.trans_hash[nid as usize]
+    };
+
+    // The ring towers differ two hops down: wrappers and helpers must
+    // NOT collide even though their bytes and one-hop target bytes
+    // are identical.
+    assert_ne!(th("wrap_0"), th("wrap_1"));
+    assert_ne!(th("wrap_1"), th("wrap_2"));
+    assert_ne!(th("wrap_0"), th("wrap_2"));
+    assert_ne!(th("helper_0"), th("helper_1"));
+    assert_ne!(th("helper_1"), th("helper_2"));
+    assert_ne!(th("leaf_0"), th("leaf_1"));
+
+    // Same-SCC members stay pairwise distinct (M2: by_section[th]
+    // needs a well-defined address per hash).
+    assert_ne!(th("wrap_0"), th("helper_0"));
+    assert_ne!(th("helper_0"), th("leaf_0"));
+
+    // True copies still collide across SCCs — the identity that ICF
+    // and positional resolution are built on.
+    assert_eq!(th("wrap_a"), th("wrap_b"));
+    assert_eq!(th("helper_a"), th("helper_b"));
+    assert_eq!(th("leaf_a"), th("leaf_b"));
+    // ...but the identical-copy family must not leak into the ring
+    // family (wrap_a's tower self-cycles; wrap_0's rings through
+    // distinct leaves).
+    assert_ne!(th("wrap_a"), th("wrap_0"));
+}
+
 #[test]
 fn archive_rebuild_is_parse_equivalent_without_edits() {
     if !have("ar") {

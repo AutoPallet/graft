@@ -1,28 +1,56 @@
 //! Transitive hash computation.
 //!
-//! Processes SCCs in reverse topological order (successors first),
-//! computes one transitive hash per SCC, then derives each node's
-//! `trans_hash` by mixing the node's own member hash back in — so two
-//! members of one cycle (e.g. xtensa code ↔ its literal pool) stay
-//! distinguishable while still reflecting all transitive content.
+//! Processes SCCs in reverse topological order (successors first) and
+//! derives each node's `trans_hash` from a per-SCC **color refinement**
+//! (partition refinement to the coarsest bisimulation — the same
+//! fixpoint gold/lld ICF iterate toward, 1-WL in graph-isomorphism
+//! terms):
 //!
 //! ```text
 //! member_hash(n) = blake3(n.bytes || nominal_salt(n)?
 //!                          || postcard(canonical_relocs(n)))
-//! scc_hash(scc) = blake3(
-//!     concat(sorted(member_hash(m) for m in scc))
-//!     || concat(sorted(
-//!         scc_hash(succ) for succ in distinct out-of-SCC successors
-//!         ++ [[0u8;16] repeated external_edge_count times]
-//!     ))
-//! )[:16]
-//! trans_hash(n) = blake3(scc_hash(scc_of(n)) || member_hash(n))[:16]
+//! seed(n)  = blake3(member_hash(n) || slot stream: per reloc, in order,
+//!            EXT | POOL | INTRA marker | OUT(trans_hash(target)))
+//! color(n) = refine within the SCC until no round splits the
+//!            partition:  c' = blake3(c(n) || c(t) for each INTRA
+//!            slot target t, in slot order)
+//! scc_hash(scc) = blake3(concat(sorted(color(m) for m in scc)))[:16]
+//! trans_hash(n) = blake3(scc_hash(scc_of(n)) || color(n))[:16]
 //! ```
 //!
-//! Members contribute a "bytes+relocs" hash so the SCC's final hash is
-//! invariant under permutations of member order in the `.o` file.
-//! Successor hashes are sorted so edge-order shifts (e.g. reloc
-//! dedup / resort) don't affect the result.
+//! Why refinement and not "sorted member hashes + sorted successor
+//! hashes" (the previous formula): inside an SCC there is no
+//! well-founded recursion, so the old formula gave every member the
+//! same transitive component and distinguished them only by their
+//! one-hop member hash — whose reloc targets are canonicalized to
+//! *bytes-only* fingerprints. Two same-SCC nodes whose difference sat
+//! ≥2 hops away behind byte-identical intermediates collided (#42:
+//! `<Adapter<Vec<u8>>/<Adapter<Stderr>>/<String> as fmt::Write>::
+//! write_fmt` — identical wrapper text, identical literal bytes,
+//! identical *vtable bytes*, genuinely different `write_str` targets —
+//! ICF folded all three onto one vtable; null `self` in `spec_extend`
+//! on hardware). Refinement propagates any intra-SCC distinction to
+//! fixpoint: the vtables split on round 1 (their `write_str` targets'
+//! seeds differ), literals on round 2, texts on round 3.
+//!
+//! Members that still tie at fixpoint are bisimilar — their reachable
+//! graphs unroll to the same infinite tree — hence genuinely
+//! interchangeable to any caller; equal trans_hash is exactly right
+//! for them (the base-side ambiguity machinery in prune handles
+//! same-hash-at-several-addresses). Cross-scan stability: the round
+//! count is "first round with no split", a function of the SCC's own
+//! content plus its (already-final) successor hashes — no global
+//! iteration count leaks into unrelated hashes.
+//!
+//! Slot streams are reloc-ordered, NOT a sorted/deduped successor
+//! set: wiring matters (a node whose slot 1 targets X and slot 2
+//! targets Y is not the node with the slots swapped, even when X and
+//! Y are byte-identical). POOL slots (string-pool section refs) carry
+//! no target hash — the member hash already embeds the precise
+//! per-string fingerprint, strings are leaves, and naming the pool's
+//! first-string node here would couple callers to unrelated pool
+//! reshuffles. Entry-targeted relocs are EXT: the trampoline cut
+//! means callers depend on the entry's *address*, never its content.
 //!
 //! `nominal_salt` applies only to sections that are NOT content-
 //! addressable (see `SectionInfo::content_addressable`): mutable data
@@ -35,14 +63,12 @@
 //! churn the identity of an otherwise-unchanged static (which would
 //! silently *duplicate* its state into the overlay).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use crate::graph::{Graph, SccResult};
 use crate::elf::{CanonicalReloc, ParsedObject};
 
 pub type TransHash = [u8; 16];
-
-pub const EXTERNAL_SENTINEL: TransHash = [0u8; 16];
 
 // Identity is keyed purely on `TransHash` (the section's transitive
 // content hash). The former per-symbol `symhash` (name ‖ trans_hash) and
@@ -190,66 +216,182 @@ pub fn compute(
         })
         .collect();
 
-    // Per-SCC trans_hash, in topological order (leaves first).
-    let mut scc_hash: Vec<TransHash> = vec![[0u8; 16]; scc.members.len()];
-
-    for (sid, members) in scc.members.iter().enumerate() {
-        let mut h = blake3::Hasher::new();
-
-        // Part 1: sorted member (bytes+relocs) hashes.
-        let mut parts: Vec<[u8; 32]> = members
-            .iter()
-            .map(|&nid| *member_input_hash[nid as usize].as_bytes())
-            .collect();
-        parts.sort();
-        for p in &parts { h.update(p); }
-
-        // Part 2: sorted successor-SCC hashes, plus external sentinels.
-        let self_sid = sid as u32;
-        let mut succ_hashes: Vec<TransHash> = Vec::new();
-        let mut seen_succ: BTreeSet<u32> = BTreeSet::new();
-        let mut ext_count: u32 = 0;
-        for &nid in members {
-            for &dst in &graph.edges[nid as usize] {
-                let dst_sid = scc.scc_of_node[dst as usize];
-                if dst_sid == self_sid { continue; } // intra-SCC
-                if seen_succ.insert(dst_sid) {
-                    succ_hashes.push(scc_hash[dst_sid as usize]);
+    // Per-node dependency slot stream, reloc-ordered — the SAME
+    // resolutions that built the graph edges (`reloc_targets`), with
+    // the trampoline cut applied (entry target → EXT, address-only
+    // dependency) and string-pool section refs collapsed to POOL (the
+    // member hash already carries the precise per-string fingerprint).
+    #[derive(Clone, Copy, PartialEq)]
+    enum Slot {
+        Node(u32),
+        Ext,
+        Pool,
+    }
+    use crate::graph::ResolvedTarget;
+    let slots: Vec<Vec<Slot>> = graph
+        .nodes
+        .par_iter()
+        .map(|nm| {
+            let mut v = Vec::new();
+            for seg in &nm.segments {
+                if seg.range.is_some() {
+                    continue; // per-string nodes own no relocs
+                }
+                let sec = &objects[seg.object as usize].sections[seg.section as usize];
+                if sec.relocs.is_empty() {
+                    continue;
+                }
+                let recorded = graph.reloc_targets.get(&(seg.object, seg.section));
+                for r in &sec.relocs {
+                    let slot = match recorded.and_then(|m| m.get(&(r.offset, r.r_type))) {
+                        None | Some(ResolvedTarget::External) => Slot::Ext,
+                        Some(&ResolvedTarget::Symbol { nid, .. })
+                        | Some(&ResolvedTarget::Section { nid }) => {
+                            if graph.entry_node == Some(nid) {
+                                Slot::Ext
+                            } else if r
+                                .target_section
+                                .is_some_and(|si| resolver.is_string_pool(seg.object, si))
+                            {
+                                Slot::Pool
+                            } else {
+                                Slot::Node(nid)
+                            }
+                        }
+                    };
+                    v.push(slot);
                 }
             }
-            ext_count += graph.external_edge_counts[nid as usize];
+            v
+        })
+        .collect();
+
+    // Reverse-topological SCC walk (leaves first): successors' final
+    // trans_hashes exist before any SCC that references them is
+    // seeded, so seeds are content-deterministic — no global iteration
+    // count, no cross-scan instability.
+    let mut th: Vec<TransHash> = vec![[0u8; 16]; graph.nodes.len()];
+
+    for (sid, members) in scc.members.iter().enumerate() {
+        let self_sid = sid as u32;
+        let member_index: HashMap<u32, u32> = members
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| (n, i as u32))
+            .collect();
+
+        // Intra-SCC slot targets as member indexes, in slot order.
+        let intra: Vec<Vec<u32>> = members
+            .iter()
+            .map(|&n| {
+                slots[n as usize]
+                    .iter()
+                    .filter_map(|s| match s {
+                        Slot::Node(t) if scc.scc_of_node[*t as usize] == self_sid => {
+                            Some(member_index[t])
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let seeds: Vec<[u8; 32]> = members
+            .iter()
+            .map(|&n| {
+                let mut h = blake3::Hasher::new();
+                h.update(member_input_hash[n as usize].as_bytes());
+                for s in &slots[n as usize] {
+                    match s {
+                        Slot::Ext => {
+                            h.update(&[1u8]);
+                        }
+                        Slot::Pool => {
+                            h.update(&[2u8]);
+                        }
+                        Slot::Node(t) => {
+                            if scc.scc_of_node[*t as usize] == self_sid {
+                                // Intra: position marker only; the
+                                // refinement rounds supply the identity.
+                                h.update(&[3u8]);
+                            } else {
+                                h.update(&[4u8]);
+                                h.update(&th[*t as usize]);
+                            }
+                        }
+                    }
+                }
+                *h.finalize().as_bytes()
+            })
+            .collect();
+
+        // Color refinement: fold each intra slot target's previous
+        // color in (slot order — wiring matters) until a round splits
+        // nothing. New colors embed old colors, so the partition only
+        // ever refines: ≤ |SCC| rounds, and the stop condition is a
+        // function of this SCC's content alone.
+        let mut colors = seeds;
+        if members.len() > 1 {
+            let mut distinct = count_distinct(&colors);
+            loop {
+                let refine = |i: usize| -> [u8; 32] {
+                    let mut h = blake3::Hasher::new();
+                    h.update(&colors[i]);
+                    for &t in &intra[i] {
+                        h.update(&colors[t as usize]);
+                    }
+                    *h.finalize().as_bytes()
+                };
+                let next: Vec<[u8; 32]> = if members.len() >= 256 {
+                    (0..members.len()).into_par_iter().map(refine).collect()
+                } else {
+                    (0..members.len()).map(refine).collect()
+                };
+                let nd = count_distinct(&next);
+                colors = next;
+                if nd == distinct {
+                    break;
+                }
+                distinct = nd;
+            }
         }
-        for _ in 0..ext_count { succ_hashes.push(EXTERNAL_SENTINEL); }
-        succ_hashes.sort();
-        for s in &succ_hashes { h.update(s); }
 
-        let digest = *h.finalize().as_bytes();
-        let mut trunc = [0u8; 16];
-        trunc.copy_from_slice(&digest[..16]);
-        scc_hash[sid] = trunc;
-    }
-
-    // Fan out: each node's trans_hash = SCC transitive hash ‖ its own
-    // member-input hash. Members of a multi-node SCC share transitive
-    // content but are DISTINCT sections that base places at distinct
-    // addresses — on xtensa, code and its literal pool reference each
-    // other (`.rwtext` ↔ `.rwtext.literal`) and so *always* form a
-    // cycle. Folding an SCC onto one shared hash made `by_section[th]`
-    // ill-defined: base's vote flagged the pair ambiguous and the
-    // "representative" copy resolved `ram_resident_step` into the
-    // middle of the literal pool. Mixing in the member hash keeps every
-    // change-detection property (any transitive change still changes
-    // the SCC hash, hence every member's value) while giving each
-    // member a well-defined address mapping.
-    graph.nodes.iter().enumerate().map(|(nid, _)| {
-        let sid = scc.scc_of_node[nid];
+        // scc_hash: order-invariant fold of the final colors (member
+        // order in the object file must not matter).
+        let mut sorted = colors.clone();
+        sorted.sort_unstable();
         let mut h = blake3::Hasher::new();
-        h.update(&scc_hash[sid as usize]);
-        h.update(member_input_hash[nid].as_bytes());
-        let mut out = [0u8; 16];
-        out.copy_from_slice(&h.finalize().as_bytes()[..16]);
-        out
-    }).collect()
+        for c in &sorted {
+            h.update(c);
+        }
+        let mut scch = [0u8; 16];
+        scch.copy_from_slice(&h.finalize().as_bytes()[..16]);
+
+        // Per-node trans_hash = scc_hash ‖ the member's refined color.
+        // Members of a multi-node SCC are DISTINCT sections that base
+        // places at distinct addresses (xtensa code ↔ literal pool
+        // always cycle); the color keeps them distinguishable so
+        // `by_section[th]` stays well-defined (M2). Members whose
+        // colors tie at fixpoint are bisimilar — interchangeable — and
+        // sharing a trans_hash routes them through prune's ambiguity
+        // machinery, which is the correct treatment for true copies.
+        for (i, &n) in members.iter().enumerate() {
+            let mut h = blake3::Hasher::new();
+            h.update(&scch);
+            h.update(&colors[i]);
+            let mut out = [0u8; 16];
+            out.copy_from_slice(&h.finalize().as_bytes()[..16]);
+            th[n as usize] = out;
+        }
+    }
+    th
+}
+
+fn count_distinct(colors: &[[u8; 32]]) -> usize {
+    let mut s: Vec<&[u8; 32]> = colors.iter().collect();
+    s.sort_unstable();
+    s.dedup();
+    s.len()
 }
 
 fn encode_relocs(
@@ -384,6 +526,14 @@ impl ContentResolver {
             v.sort_by_key(|&(off, _, _)| off);
         }
         Self { section, string_pool, global, local }
+    }
+
+    /// Whether `(object, section)` is a split string pool (per-string
+    /// LogicalNodes). Hash slot streams need this: pool refs carry no
+    /// target hash of their own — the member hash already embeds the
+    /// precise per-string fingerprint via `canonicalize_reloc`.
+    pub fn is_string_pool(&self, object: u32, section: u32) -> bool {
+        self.string_pool.contains_key(&(object, section))
     }
 
     pub fn canonicalize_reloc(
