@@ -206,6 +206,81 @@ fn run_combined(path: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// The snapshot auto mode manages, in `deps/.graft-auto/` next to
+/// cargo's real `-o` output (NOT next to the `debug/app` hardlink).
+fn find_snapshot(fx: &Fixture) -> Option<PathBuf> {
+    let dir = fx
+        .dir
+        .join("target/x86_64-unknown-linux-musl/debug/deps/.graft-auto");
+    for e in std::fs::read_dir(&dir).ok()? {
+        let p = e.ok()?.path();
+        if p.to_string_lossy().ends_with(".base.elf") {
+            return Some(p);
+        }
+    }
+    None
+}
+
+#[test]
+#[ignore]
+fn auto_mode_cycle() {
+    let fx = Fixture::new();
+    // Determinism across runs: drop any snapshot a previous invocation
+    // left in the persistent target dir.
+    if let Some(stale) = find_snapshot(&fx) {
+        std::fs::remove_file(stale).unwrap();
+    }
+    let log_env = fx.graft_log_path().to_string_lossy().into_owned();
+
+    // 1) No snapshot → auto takes the base path and creates one.
+    fx.cargo_build(&[("GRAFT", "auto"), ("GRAFT_MAP_ORACLE", "1")]);
+    let snap = find_snapshot(&fx).expect("auto base link must create the snapshot");
+    let snap0 = std::fs::read(&snap).unwrap();
+    let out = run_combined(&fx.app_bin());
+    assert!(out.contains("sum = 105"), "auto baseline: {out}");
+
+    // 2) Edit → auto takes the overlay path: summary sidecar written,
+    //    one trampoline, snapshot bytes untouched, edit visible.
+    let _ = std::fs::remove_file(fx.graft_log_path());
+    fx.edit("base/src/lib.rs", "wrapping_mul(7)", "wrapping_mul(13)");
+    fx.cargo_build(&[("GRAFT", "auto"), ("GRAFT_LOG", log_env.as_str())]);
+    assert!(
+        fx.graft_summary().contains("closure"),
+        "second auto link must go through overlay"
+    );
+    assert_eq!(fx.combine_stats().trampolines, 1, "auto overlay trampoline count");
+    assert_eq!(
+        std::fs::read(&snap).unwrap(),
+        snap0,
+        "overlay must not rewrite the base snapshot"
+    );
+    let out = run_combined(&fx.app_bin());
+    assert!(out.contains("sum = 195"), "auto overlay edit: {out}");
+
+    // 3) GRAFT_REBASE=1 → forced base relink; snapshot refreshed (the
+    //    edit is now IN the base), no overlay sidecar written.
+    let _ = std::fs::remove_file(fx.graft_log_path());
+    fx.cargo_build(&[
+        ("GRAFT", "auto"),
+        ("GRAFT_REBASE", "1"),
+        ("GRAFT_MAP_ORACLE", "1"),
+        ("GRAFT_LOG", log_env.as_str()),
+    ]);
+    let log = fx.graft_summary();
+    assert!(
+        log.contains("GRAFT_REBASE=1") && !log.contains("closure"),
+        "rebase must take the base path, not overlay: {log}"
+    );
+    assert_ne!(
+        std::fs::read(&snap).unwrap(),
+        snap0,
+        "rebase must refresh the snapshot"
+    );
+    let out = run_combined(&fx.app_bin());
+    assert!(out.contains("sum = 195"), "rebased baseline keeps the edit: {out}");
+    // Fixture Drop restores the source edit.
+}
+
 #[test]
 #[ignore]
 fn full_cycle() {

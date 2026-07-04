@@ -41,6 +41,16 @@ pub fn link(argv: Vec<String>) -> ExitCode {
 }
 
 fn run(argv: Vec<String>) -> Result<()> {
+    let base_path: PathBuf = std::env::var("GRAFT_BASE_ELF")
+        .map(PathBuf::from)
+        .map_err(|_| anyhow!("GRAFT_BASE_ELF not set"))?;
+    run_with_base(argv, base_path)
+}
+
+/// Overlay link against an explicit base ELF. Plain `GRAFT=overlay`
+/// resolves `GRAFT_BASE_ELF` first; auto mode passes its snapshot
+/// path directly.
+pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()> {
     let t_start = std::time::Instant::now();
 
     // Mirror base mode's `--ldproxy-cwd` handling so relative archive
@@ -57,9 +67,6 @@ fn run(argv: Vec<String>) -> Result<()> {
         .clone()
         .ok_or_else(|| anyhow!("no -o <path> in argv"))?;
 
-    let base_path: PathBuf = std::env::var("GRAFT_BASE_ELF")
-        .map(PathBuf::from)
-        .map_err(|_| anyhow!("GRAFT_BASE_ELF not set"))?;
     let mut base = load_base_metadata(&base_path)?;
 
     let driver = crate::argv::driver_path(&argv);

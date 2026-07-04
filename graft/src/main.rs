@@ -30,13 +30,17 @@ fn main() -> ExitCode {
         Ok(v) => match v.as_str() {
             "base" => graft::base::link(args),
             "overlay" => graft::overlay::link(args),
+            // Self-managing: base on first link (snapshot kept next to
+            // the output), overlay against the snapshot afterwards,
+            // bail-to-full-relink on any overlay failure. See auto.rs.
+            "auto" => graft::auto::link(args),
             // Explicit opt-out. Empty string is treated as unset — a
             // shell exporting `GRAFT=` almost always means "off".
             "passthrough" | "" => passthrough(&args),
             other => {
                 eprintln!(
                     "graft: GRAFT={other:?} is not a recognized mode \
-                     (expected `base`, `overlay`, or `passthrough`). \
+                     (expected `base`, `overlay`, `auto`, or `passthrough`). \
                      Refusing to silently fall through to the real linker. \
                      Unset GRAFT for passthrough."
                 );

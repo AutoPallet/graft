@@ -6,6 +6,7 @@
 pub mod arch;
 pub mod archive;
 pub mod argv;
+pub mod auto;
 pub mod base;
 pub mod basemap;
 pub mod combine;

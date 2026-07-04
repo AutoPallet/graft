@@ -30,7 +30,7 @@ pub fn link(argv: Vec<String>) -> ExitCode {
     }
 }
 
-fn run(argv: Vec<String>) -> Result<()> {
+pub(crate) fn run(argv: Vec<String>) -> Result<()> {
     // ldproxy (esp-idf-sys's link wrapper) can ask the real linker
     // to chdir before resolving relative archive paths via the
     // `--ldproxy-cwd <dir>` flag. Inputs in argv after that flag
