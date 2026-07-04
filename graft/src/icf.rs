@@ -158,6 +158,10 @@ pub struct IcfOutcome {
     /// original canonical input path → rewritten replacement path.
     /// base mode substitutes matching argv tokens before running ld.
     pub replacements: HashMap<PathBuf, PathBuf>,
+    /// `<output>.graft-icf/` — the rewritten-input scratch dir. base
+    /// mode deletes it after a successful link (kept on failure, or
+    /// when `GRAFT_ICF_KEEP=1`).
+    pub work_dir: PathBuf,
 }
 
 /// One planned edit to one on-disk input file (loose `.o` or archive
@@ -444,7 +448,7 @@ pub fn run(scan: &ScanResult, output: &Path) -> Result<Option<IcfOutcome>> {
     stats.rewritten_archives = rebuilt.len();
     replacements.extend(rebuilt);
 
-    Ok(Some(IcfOutcome { stats, replacements }))
+    Ok(Some(IcfOutcome { stats, replacements, work_dir }))
 }
 
 /// The linker-script scooping class of an input section name: the

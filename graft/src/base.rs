@@ -106,6 +106,7 @@ fn run(argv: Vec<String>) -> Result<()> {
             .join()
             .map_err(|_| anyhow!("pre-scan thread panicked"))?;
         let scan_result = scan_result.context("pre-scan failed")?;
+        let mut icf_work_dir = None;
         if let Some(outcome) = crate::icf::run(&scan_result, &output)? {
             let s = &outcome.stats;
             eprintln!(
@@ -124,9 +125,22 @@ fn run(argv: Vec<String>) -> Result<()> {
                 s.skipped_mechanical,
             );
             argv = crate::icf::substitute_argv(argv, &outcome.replacements);
+            icf_work_dir = Some(outcome.work_dir);
         }
         let t_link_start = std::time::Instant::now();
         let ld_status = exec_real_linker(&argv)?;
+        // The rewritten-input scratch dir (~size of the participating
+        // rlibs) is only needed while ld reads it. Keep it on link
+        // failure so the failing inputs can be inspected, or when
+        // GRAFT_ICF_KEEP=1.
+        if let Some(dir) = icf_work_dir {
+            let keep = std::env::var("GRAFT_ICF_KEEP").is_ok_and(|v| !v.is_empty());
+            if !ld_status.success() || keep {
+                eprintln!("graft icf: keeping rewritten inputs at {}", dir.display());
+            } else if let Err(e) = std::fs::remove_dir_all(&dir) {
+                eprintln!("graft icf: failed to remove {}: {e}", dir.display());
+            }
+        }
         (ld_status, t_link_start.elapsed(), scan_result, t_scan)
     } else {
         let t_link_start = std::time::Instant::now();
