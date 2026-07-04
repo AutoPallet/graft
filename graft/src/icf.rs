@@ -59,9 +59,13 @@
 //! member to satisfy a strong undef against a *weak* definition
 //! (verified empirically on x86 and xtensa esp-12.2 binutils), and an
 //! already-loaded weak def short-circuits the search. Alias count is
-//! quadratic in group size, so only the first
-//! [`MAX_PARTICIPANTS`] copies of a group participate — later copies
-//! are left untouched (correct, just unfolded).
+//! quadratic in group size, so groups larger than
+//! [`MAX_PARTICIPANTS`] are split into independent chunks of at most
+//! that many copies. Each chunk folds under its own weak name
+//! (`__graft_icf_<th>` for the first, `__graft_icf_<th>_c<n>` after)
+//! so weak resolution never crosses chunks — one survivor per chunk,
+//! full alias coverage within it. A trailing single-copy chunk is
+//! left untouched (correct, just unfolded).
 //! - **Identical section-name *class* across the group** — the name
 //!   prefix before the per-function mangled tail (`.llvm.<id>`
 //!   internalization suffixes stripped). Linker scripts scoop input
@@ -136,15 +140,17 @@ pub struct IcfStats {
     /// Groups skipped for mechanical reasons (section index beyond
     /// SHN_LORESERVE, REL-format relocs, unsupported ELF shape).
     pub skipped_mechanical: usize,
-    /// Groups larger than MAX_PARTICIPANTS: only the first
-    /// MAX_PARTICIPANTS copies folded, the tail left as-is.
-    pub groups_capped: usize,
+    /// Groups larger than MAX_PARTICIPANTS, folded as multiple
+    /// independent chunks (one survivor per chunk instead of one
+    /// per group).
+    pub groups_chunked: usize,
 }
 
-/// Cross-alias count is quadratic in participants; cap it. 16 keeps
-/// the worst symtab/strtab growth per group in the tens of KB while
-/// covering the bulk of the waste (group-size distribution is heavily
-/// skewed toward small groups).
+/// Cross-alias count is quadratic in participants; larger groups are
+/// split into chunks of this size. 16 keeps the worst symtab/strtab
+/// growth per chunk in the tens of KB while covering the bulk of the
+/// waste (group-size distribution is heavily skewed toward small
+/// groups).
 pub const MAX_PARTICIPANTS: usize = 16;
 
 pub struct IcfOutcome {
@@ -284,56 +290,72 @@ pub fn run(scan: &ScanResult, output: &Path) -> Result<Option<IcfOutcome>> {
         }
 
         if copies.len() > MAX_PARTICIPANTS {
-            copies.truncate(MAX_PARTICIPANTS);
-            copy_globals.truncate(MAX_PARTICIPANTS);
-            stats.groups_capped += 1;
+            stats.groups_chunked += 1;
         }
-
-        let icf_name = {
-            let hex: String = th.iter().map(|b| format!("{b:02x}")).collect();
-            format!("__graft_icf_{hex}")
-        };
-        // Any copy can win the weak resolution, so every copy's
-        // alignment must satisfy the group's strictest requirement.
-        let mut max_align = 0u64;
-        for &(o, s) in &copies {
-            let inp = &scan.inputs[o];
-            max_align = max_align.max(
-                surgery::section_addralign(&inp.bytes, s).unwrap_or(0),
-            );
-        }
-        // Symmetric: every participant defines the weak group name at
-        // its own copy, redirects its own references through it,
-        // demotes its own global defs to WEAK, and carries WEAK
-        // aliases for every other participant's global names.
-        for (ci, &(o, s)) in copies.iter().enumerate() {
-            let inp = &scan.inputs[o];
-            let key = (
-                std::fs::canonicalize(&inp.source_path)
-                    .unwrap_or_else(|_| inp.source_path.clone()),
-                inp.member_name.clone(),
-            );
-            let plan = plans.entry(key).or_default();
-            plan.adds.push((icf_name.clone(), s, 0, scan.objects[o].sections[s as usize].sh_size));
-            plan.align_bumps.push((s, max_align));
-            plan.redirects.insert(s, icf_name.clone());
-            for (cj, globals) in copy_globals.iter().enumerate() {
-                if cj == ci {
-                    for (name, _, _) in globals {
-                        plan.weaken.push((s, name.clone()));
-                    }
-                } else {
-                    for (name, value, size) in globals {
-                        plan.adds.push((name.clone(), s, *value, *size));
+        let hex: String = th.iter().map(|b| format!("{b:02x}")).collect();
+        // Oversized groups fold as independent ≤MAX_PARTICIPANTS
+        // chunks, each under its own weak name so resolution never
+        // crosses chunk boundaries: one survivor per chunk, and every
+        // chunk member carries aliases for all of its chunk-mates'
+        // names. A trailing single-copy chunk has nothing to fold
+        // against and is left untouched.
+        for (chunk_idx, (chunk, chunk_globals)) in copies
+            .chunks(MAX_PARTICIPANTS)
+            .zip(copy_globals.chunks(MAX_PARTICIPANTS))
+            .enumerate()
+        {
+            if chunk.len() < 2 {
+                continue;
+            }
+            let icf_name = if chunk_idx == 0 {
+                format!("__graft_icf_{hex}")
+            } else {
+                format!("__graft_icf_{hex}_c{chunk_idx}")
+            };
+            // Any chunk member can win the weak resolution, so every
+            // member's alignment must satisfy the chunk's strictest
+            // requirement.
+            let mut max_align = 0u64;
+            for &(o, s) in chunk {
+                let inp = &scan.inputs[o];
+                max_align = max_align.max(
+                    surgery::section_addralign(&inp.bytes, s).unwrap_or(0),
+                );
+            }
+            // Symmetric: every participant defines the weak chunk name
+            // at its own copy, redirects its own references through
+            // it, demotes its own global defs to WEAK, and carries
+            // WEAK aliases for every other chunk member's global
+            // names.
+            for (ci, &(o, s)) in chunk.iter().enumerate() {
+                let inp = &scan.inputs[o];
+                let key = (
+                    std::fs::canonicalize(&inp.source_path)
+                        .unwrap_or_else(|_| inp.source_path.clone()),
+                    inp.member_name.clone(),
+                );
+                let plan = plans.entry(key).or_default();
+                plan.adds.push((icf_name.clone(), s, 0, scan.objects[o].sections[s as usize].sh_size));
+                plan.align_bumps.push((s, max_align));
+                plan.redirects.insert(s, icf_name.clone());
+                for (cj, globals) in chunk_globals.iter().enumerate() {
+                    if cj == ci {
+                        for (name, _, _) in globals {
+                            plan.weaken.push((s, name.clone()));
+                        }
+                    } else {
+                        for (name, value, size) in globals {
+                            plan.adds.push((name.clone(), s, *value, *size));
+                        }
                     }
                 }
             }
+            stats.copies_dropped += chunk.len() - 1;
+            stats.bytes_dropped += chunk[1..]
+                .iter()
+                .map(|&(o, s)| scan.objects[o].sections[s as usize].sh_size)
+                .sum::<u64>();
         }
-        stats.copies_dropped += copies.len() - 1;
-        stats.bytes_dropped += copies[1..]
-            .iter()
-            .map(|&(o, s)| scan.objects[o].sections[s as usize].sh_size)
-            .sum::<u64>();
         stats.groups_folded += 1;
     }
 

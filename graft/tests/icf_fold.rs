@@ -127,6 +127,58 @@ fn build_main() -> Vec<u8> {
     obj.write().unwrap()
 }
 
+/// int main(void) { return use_0() + use_1() + ...; }  (sum in ebx)
+fn build_main_many(callers: &[String]) -> Vec<u8> {
+    let mut obj = WObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+    let mut code: Vec<u8> = vec![
+        0x53, // push rbx
+        0x31, 0xdb, // xor ebx, ebx
+    ];
+    let mut reloc_offsets = Vec::new();
+    for _ in callers {
+        reloc_offsets.push(code.len() as u64 + 1);
+        code.extend_from_slice(&[0xe8, 0, 0, 0, 0]); // call rel32
+        code.extend_from_slice(&[0x01, 0xc3]); // add ebx, eax
+    }
+    code.extend_from_slice(&[0x89, 0xd8, 0x5b, 0xc3]); // mov eax,ebx; pop rbx; ret
+    let size = code.len() as u64;
+    let sec = obj.add_section(Vec::new(), b".text.main".to_vec(), SectionKind::Text);
+    obj.section_mut(sec).set_data(code, 16);
+    obj.add_symbol(WSymbol {
+        name: b"main".to_vec(),
+        value: 0,
+        size,
+        kind: SymbolKind::Text,
+        scope: object::write::SymbolScope::Linkage,
+        weak: false,
+        section: SymbolSection::Section(sec),
+        flags: object::write::SymbolFlags::None,
+    });
+    for (off, name) in reloc_offsets.iter().zip(callers) {
+        let sym = obj.add_symbol(WSymbol {
+            name: name.as_bytes().to_vec(),
+            value: 0,
+            size: 0,
+            kind: SymbolKind::Unknown,
+            scope: object::write::SymbolScope::Dynamic,
+            weak: false,
+            section: SymbolSection::Undefined,
+            flags: object::write::SymbolFlags::None,
+        });
+        obj.add_relocation(
+            sec,
+            WRelocation {
+                offset: *off,
+                symbol: sym,
+                addend: -4,
+                flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PLT32 },
+            },
+        )
+        .unwrap();
+    }
+    obj.write().unwrap()
+}
+
 fn have(cmd: &str) -> bool {
     Command::new(cmd)
         .arg("--version")
@@ -294,6 +346,130 @@ fn fold_local_duplicate_across_rlib_members() {
                 .address()
         };
         assert_eq!(addr("use_a"), addr("use_b"), "caller twins share one body");
+    }
+}
+
+/// Groups larger than MAX_PARTICIPANTS split into independent chunks,
+/// each folding under its own weak name: 18 copies → a 16-chunk and a
+/// 2-chunk → exactly TWO survivors, and the program still runs right.
+#[test]
+fn oversized_group_folds_as_chunks() {
+    if !have("cc") || !have("ar") {
+        eprintln!("skipping: cc/ar not available");
+        return;
+    }
+    let n = graft::icf::MAX_PARTICIPANTS + 2; // 18: chunks of 16 + 2
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+
+    let callers: Vec<String> = (0..n).map(|i| format!("use_{i:02}")).collect();
+    let members: Vec<String> = (0..n)
+        .map(|i| format!("dup_{i:02}-0123456789abcdef.rcgu.o"))
+        .collect();
+    for (m, c) in members.iter().zip(&callers) {
+        std::fs::write(d.join(m), build_rcgu(c)).unwrap();
+    }
+    std::fs::write(d.join("main.o"), build_main_many(&callers)).unwrap();
+
+    let rlib = d.join("libdup.rlib");
+    let st = Command::new("ar")
+        .current_dir(d)
+        .args(["crs", "libdup.rlib"])
+        .args(&members)
+        .status()
+        .unwrap();
+    assert!(st.success(), "ar failed");
+
+    // main's exit code is (n * 42) & 0xff.
+    let expected_exit = ((n as i32) * 42) & 0xff;
+
+    // Control link: every copy survives.
+    let control = d.join("control");
+    assert!(link("cc", &control, &[&d.join("main.o"), &rlib]));
+    let control_bytes = std::fs::read(&control).unwrap();
+    assert_eq!(count_pattern(&control_bytes, DUPFN), n, "control keeps all copies");
+    assert_eq!(run_exit_code(&control), expected_exit);
+
+    // Scan + fold. Two groups of 18 (dupfn twins, caller twins); each
+    // splits 16+2, dropping (16-1)+(2-1) = 16 copies per group.
+    let scan = graft::scan::run(
+        &[d.join("main.o"), rlib.clone()],
+        &[] as &[PathBuf],
+        &[],
+        &[],
+        Some("main"),
+    )
+    .unwrap();
+    let outcome = graft::icf::run(&scan, &d.join("out.elf"))
+        .unwrap()
+        .expect("fold should find the duplicates");
+    assert_eq!(outcome.stats.groups_folded, 2);
+    assert_eq!(outcome.stats.groups_chunked, 2);
+    assert_eq!(outcome.stats.copies_dropped, 2 * (n - 2));
+    assert_eq!(
+        outcome.stats.bytes_dropped,
+        ((n - 2) * (DUPFN.len() + CALLER.len())) as u64
+    );
+
+    let new_rlib = outcome
+        .replacements
+        .get(&std::fs::canonicalize(&rlib).unwrap())
+        .expect("rlib rewritten");
+
+    // Per group: one unsuffixed chunk-0 name + one `_c1` name. No UNDs
+    // ever (weak defs self-resolve within each member).
+    {
+        use object::{Object, ObjectSymbol, read::archive::ArchiveFile};
+        let bytes = std::fs::read(new_rlib).unwrap();
+        let ar = ArchiveFile::parse(&*bytes).unwrap();
+        let mut icf_names: std::collections::HashSet<String> = Default::default();
+        for m in ar.members() {
+            let m = m.unwrap();
+            let data = m.data(&*bytes).unwrap();
+            let obj = object::File::parse(data).unwrap();
+            for sym in obj.symbols() {
+                let name = sym.name().unwrap_or("");
+                if !name.starts_with("__graft_icf_") {
+                    continue;
+                }
+                assert!(!sym.is_undefined(), "no cross-object UND allowed: {name}");
+                assert!(sym.is_weak(), "fold definitions must be weak: {name}");
+                icf_names.insert(name.to_string());
+            }
+        }
+        assert_eq!(icf_names.len(), 4, "2 groups × 2 chunks: {icf_names:?}");
+        assert_eq!(
+            icf_names.iter().filter(|n| n.ends_with("_c1")).count(),
+            2,
+            "one _c1 name per group: {icf_names:?}"
+        );
+    }
+
+    // Folded link: one dupfn survivor per chunk (2 total), callers
+    // collapse to 2 distinct addresses with multiplicity {16, 2}.
+    let folded = d.join("folded");
+    assert!(
+        link("cc", &folded, &[&d.join("main.o"), new_rlib]),
+        "link with rewritten rlib failed"
+    );
+    let folded_bytes = std::fs::read(&folded).unwrap();
+    assert_eq!(count_pattern(&folded_bytes, DUPFN), 2, "one dupfn survivor per chunk");
+    assert_eq!(run_exit_code(&folded), expected_exit);
+    {
+        use object::{Object, ObjectSymbol};
+        let elf = object::File::parse(&*folded_bytes).unwrap();
+        let mut by_addr: std::collections::HashMap<u64, usize> = Default::default();
+        for c in &callers {
+            let addr = elf
+                .symbols()
+                .find(|s| s.name() == Ok(c.as_str()))
+                .unwrap_or_else(|| panic!("{c} missing"))
+                .address();
+            *by_addr.entry(addr).or_default() += 1;
+        }
+        let mut mult: Vec<usize> = by_addr.values().copied().collect();
+        mult.sort();
+        assert_eq!(mult, vec![2, n - 2], "callers fold per chunk");
     }
 }
 
