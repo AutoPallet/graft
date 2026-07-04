@@ -252,6 +252,37 @@ pub fn run(scan: &ScanResult, output: &Path) -> Result<Option<IcfOutcome>> {
         .filter(|(_, v)| v.len() >= 2)
         .collect();
     group_list.sort_by_key(|(th, _)| *th); // deterministic output
+    // Debug bisect knob: fold only the first N groups of the sorted
+    // list. Strict parse — a typo must not silently fold everything.
+    match std::env::var("GRAFT_ICF_LIMIT") {
+        Err(std::env::VarError::NotPresent) => {}
+        Err(e) => return Err(anyhow!("GRAFT_ICF_LIMIT: {e}")),
+        Ok(v) => {
+            let n: usize = v
+                .parse()
+                .map_err(|e| anyhow!("GRAFT_ICF_LIMIT={v:?}: {e}"))?;
+            eprintln!(
+                "graft icf: GRAFT_ICF_LIMIT={n} — folding only the first {n} of {} groups",
+                group_list.len()
+            );
+            group_list.truncate(n);
+            // Bisect support: identify the boundary group (the one a
+            // limit=N vs limit=N-1 A/B isolates).
+            if let Some((th, copies)) = group_list.last() {
+                let hex: String = th.iter().map(|b| format!("{b:02x}")).collect();
+                eprintln!("graft icf: group #{n} th={hex} ({} copies):", copies.len());
+                for &(o, s) in copies {
+                    let inp = &scan.inputs[o];
+                    eprintln!(
+                        "graft icf:   {}::{} {}",
+                        inp.source_path.display(),
+                        inp.member_name.as_deref().unwrap_or("-"),
+                        scan.objects[o].sections[s as usize].name,
+                    );
+                }
+            }
+        }
+    }
     for (th, mut copies) in group_list {
         copies.sort();
         let class0 = name_class(&scan.objects[copies[0].0].sections[copies[0].1 as usize].name);
