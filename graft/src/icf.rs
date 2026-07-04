@@ -160,7 +160,7 @@ pub struct IcfOutcome {
     pub replacements: HashMap<PathBuf, PathBuf>,
     /// `<output>.graft-icf/` — the rewritten-input scratch dir. base
     /// mode deletes it after a successful link (kept on failure, or
-    /// when `GRAFT_ICF_KEEP=1`).
+    /// with `GRAFT_DEBUG=preserve-icf-inputs`).
     pub work_dir: PathBuf,
 }
 

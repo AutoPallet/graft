@@ -131,10 +131,10 @@ fn run(argv: Vec<String>) -> Result<()> {
         let ld_status = exec_real_linker(&argv)?;
         // The rewritten-input scratch dir (~size of the participating
         // rlibs) is only needed while ld reads it. Keep it on link
-        // failure so the failing inputs can be inspected, or when
-        // GRAFT_ICF_KEEP=1.
+        // failure so the failing inputs can be inspected, or with
+        // GRAFT_DEBUG=preserve-icf-inputs.
         if let Some(dir) = icf_work_dir {
-            let keep = std::env::var("GRAFT_ICF_KEEP").is_ok_and(|v| !v.is_empty());
+            let keep = crate::debug_flags::enabled("preserve-icf-inputs")?;
             if !ld_status.success() || keep {
                 eprintln!("graft icf: keeping rewritten inputs at {}", dir.display());
             } else if let Err(e) = std::fs::remove_dir_all(&dir) {
