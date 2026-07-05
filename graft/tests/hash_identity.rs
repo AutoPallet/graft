@@ -605,3 +605,86 @@ fn swapped_wiring_to_byte_identical_targets_does_not_collide() {
     // And the wrappers themselves differ (transitively different).
     assert_ne!(th(&scan, "wx"), th(&scan, "wy"));
 }
+
+/// Mid-pool symbol attack (task #46 dissection, the roborack
+/// "Down\0time\0" shape): LLVM places two string constants in one pool
+/// section and a named symbol points at the SECOND entry (st_value ≠ 0).
+/// Another TU carries only "time\0" at offset 0. The two callers
+/// reference byte-identical content and MUST collide — this is the pin
+/// for `ContentResolver::rebased` (10ccafa double-counted st_value,
+/// computed offset 8, missed the pool, and fell back to a TU-unique
+/// name: 159 sound ICF groups split spuriously). The other direction:
+/// same shape but different second entry must NOT collide.
+#[test]
+fn mid_pool_symbol_ref_is_positional_content() {
+    let build = |pool: &[u8], symval: u64| {
+        let mut obj =
+            WObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let psec = obj.add_section(
+            Vec::new(),
+            b".rodata.str1.1".to_vec(),
+            SectionKind::ReadOnlyString,
+        );
+        obj.section_mut(psec).set_data(pool.to_vec(), 1);
+        // Named data symbol into the pool (the anon.<hash>.N shape).
+        let strsym = obj.add_symbol(WSymbol {
+            name: b"anon_str".to_vec(),
+            value: symval,
+            size: (pool.len() as u64) - symval,
+            kind: SymbolKind::Data,
+            scope: object::write::SymbolScope::Compilation,
+            weak: false,
+            section: SymbolSection::Section(psec),
+            flags: object::write::SymbolFlags::None,
+        });
+
+        let csec = obj.add_section(Vec::new(), b".text.caller".to_vec(), SectionKind::Text);
+        // lea rel32; ret — reloc at +3.
+        obj.section_mut(csec)
+            .set_data(vec![0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xc3], 16);
+        global_text_symbol(&mut obj, "caller", csec, 0);
+        obj.add_relocation(
+            csec,
+            WRelocation {
+                offset: 3,
+                symbol: strsym,
+                addend: -4,
+                flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PC32 },
+            },
+        )
+        .unwrap();
+
+        let msec = obj.add_section(Vec::new(), b".text.main".to_vec(), SectionKind::Text);
+        obj.section_mut(msec).set_data(call_ret(), 16);
+        global_text_symbol(&mut obj, "main", msec, 0);
+        let caller = obj.symbol_id(b"caller").unwrap();
+        obj.add_relocation(
+            msec,
+            WRelocation {
+                offset: 1,
+                symbol: caller,
+                addend: -4,
+                flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PLT32 },
+            },
+        )
+        .unwrap();
+        scan_one(obj, "main")
+    };
+
+    let tail = build(b"Down\0time\0", 5); // symbol at entry #2, "time"
+    let whole = build(b"time\0", 0); // sole entry, same bytes
+    assert_eq!(
+        th(&tail, "caller"),
+        th(&whole, "caller"),
+        "a mid-pool symbol ref denotes its entry's CONTENT: callers of \
+         byte-identical strings must collide regardless of pool layout"
+    );
+
+    let other = build(b"Down\0tame\0", 5); // same layout, different string
+    assert_ne!(
+        th(&other, "caller"),
+        th(&whole, "caller"),
+        "callers of different strings must not collide even when pool \
+         layout and symbol shape match"
+    );
+}

@@ -51,6 +51,14 @@ fn stripped_label(label: &str) -> String {
 ///                        the SCC computation hashes in, in the SAME
 ///                        ORDER), so you can diff "what successors
 ///                        contributed to this node's trans_hash."
+///   `nid`              — this node's per-scan node id. NOT stable
+///                        across scans; exists because `obj|sec` keys
+///                        are ambiguous (same-named sections, and
+///                        string pools split into per-entry nodes that
+///                        all share the input section's name).
+///   `edge_nids`        — comma-joined dst node ids for each outgoing
+///                        edge, same order as `edge_targets`. The only
+///                        unambiguous way to follow edges offline.
 ///
 /// All hashes are *prefixes* of the underlying blake3 output, sized
 /// for diff readability while still producing collision-resistant
@@ -100,7 +108,7 @@ pub fn dump_graph(path: &Path, scan: &ScanResult) -> std::io::Result<()> {
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
     writeln!(
         f,
-        "obj\ttu_id\tsec\tbytes_hash\tmih\tenc_relocs_hash\ttrans_hash\tedges\texternal\tscc_id\tscc_hash\tedge_targets\tsucc_scc_hashes"
+        "obj\ttu_id\tsec\tbytes_hash\tmih\tenc_relocs_hash\ttrans_hash\tedges\texternal\tscc_id\tscc_hash\tedge_targets\tsucc_scc_hashes\tnid\tedge_nids"
     )?;
 
     for (nid, nm) in g.nodes.iter().enumerate() {
@@ -137,6 +145,12 @@ pub fn dump_graph(path: &Path, scan: &ScanResult) -> std::io::Result<()> {
         }
         succ_scc_hashes.sort();
         let succ_str = succ_scc_hashes.join(",");
+
+        let edge_nids_str: String = g.edges[nid]
+            .iter()
+            .map(|&dst| dst.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
 
         // One row per segment. nid/trans_hash/scc are node-level and
         // shared across segment rows; bytes/mih/enc_relocs are
@@ -191,7 +205,7 @@ pub fn dump_graph(path: &Path, scan: &ScanResult) -> std::io::Result<()> {
                 scch_of_node[nid].iter().map(|b| format!("{b:02x}")).collect();
             writeln!(
                 f,
-                "{stripped}\t{tu_id_hex}\t{}\t{bh}\t{mih}\t{enc_h}\t{th}\t{edges_count}\t{ext}\t{sid}\t{scch}\t{edges_str}\t{succ_str}",
+                "{stripped}\t{tu_id_hex}\t{}\t{bh}\t{mih}\t{enc_h}\t{th}\t{edges_count}\t{ext}\t{sid}\t{scch}\t{edges_str}\t{succ_str}\t{nid}\t{edge_nids_str}",
                 sec.name,
             )?;
         }
