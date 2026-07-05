@@ -130,6 +130,82 @@ fn callers_of_different_offsets_in_one_section_do_not_collide() {
     );
 }
 
+/// Section-form string-pool attack (task #43): a PC32 reloc against a
+/// SHF_MERGE|SHF_STRINGS *section symbol* with addend −4 (string at
+/// pool offset 0 → negative addend, the rip-relative shape). Real
+/// toolchains never emit this — GAS refuses to reduce symbols against
+/// SEC_MERGE sections — but graft used to degrade it to the bare
+/// section NAME (identical across objects: callers of "cat" and "dog"
+/// collided, and editing the string was invisible to the hash) while
+/// ALSO dropping the closure edge. Now: whole-pool fingerprint + a
+/// retained pool edge.
+#[test]
+fn negative_addend_pool_ref_keeps_string_content_and_edge() {
+    let build = |s: &str| {
+        let mut obj =
+            WObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let pool = obj.add_section(
+            Vec::new(),
+            b".rodata.str1.1".to_vec(),
+            SectionKind::ReadOnlyString,
+        );
+        let mut bytes = s.as_bytes().to_vec();
+        bytes.push(0);
+        obj.section_mut(pool).set_data(bytes, 1);
+        let pool_sym = obj.section_symbol(pool);
+
+        let csec = obj.add_section(Vec::new(), b".text.caller".to_vec(), SectionKind::Text);
+        // lea rel32; ret — reloc at +3, addend −4 → string at offset 0.
+        obj.section_mut(csec)
+            .set_data(vec![0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xc3], 16);
+        global_text_symbol(&mut obj, "caller", csec, 0);
+        obj.add_relocation(
+            csec,
+            WRelocation {
+                offset: 3,
+                symbol: pool_sym,
+                addend: -4,
+                flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PC32 },
+            },
+        )
+        .unwrap();
+
+        let msec = obj.add_section(Vec::new(), b".text.main".to_vec(), SectionKind::Text);
+        obj.section_mut(msec).set_data(call_ret(), 16);
+        global_text_symbol(&mut obj, "main", msec, 0);
+        let caller = obj.symbol_id(b"caller").unwrap();
+        obj.add_relocation(
+            msec,
+            WRelocation {
+                offset: 1,
+                symbol: caller,
+                addend: -4,
+                flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PLT32 },
+            },
+        )
+        .unwrap();
+        scan_one(obj, "main")
+    };
+
+    let cat = build("cat");
+    let dog = build("dog");
+    // Different referenced string ⇒ different caller hash (this is
+    // simultaneously the collision pin and the change-detection pin).
+    assert_ne!(
+        th(&cat, "caller"),
+        th(&dog, "caller"),
+        "callers of different pool strings must not collide, and a \
+         string edit must reach the referrer's hash"
+    );
+    // The closure dependency survives: the caller keeps at least one
+    // edge into the pool instead of degrading to an external sentinel.
+    let (nid, _) = cat.graph.symbols.resolve_global("caller").unwrap();
+    assert!(
+        !cat.graph.edges[nid as usize].is_empty(),
+        "negative-addend pool ref must keep a pool edge"
+    );
+}
+
 /// Wiring-swap attack: P references (X, Y) and Q references (Y, X) —
 /// same reloc offsets, byte-identical X/Y wrappers whose *transitive*
 /// content differs (distinct leaves). A hash that encodes a node's

@@ -555,21 +555,39 @@ impl ContentResolver {
         // Try the per-string pool first (pool and ordinary section maps
         // are mutually exclusive for any given section).
         if let Some(si) = r.target_section {
-            if r.addend >= 0
-                && let Some(strings) = self.string_pool.get(&(obj_idx, si))
-            {
-                let a = r.addend as u32;
-                let idx = strings.partition_point(|&(off, _, _)| off <= a);
-                if idx > 0 {
-                    let (off, len, h) = strings[idx - 1];
-                    if a < off + len {
-                        return (format!("@{}", hex8(&h)), (a - off) as i64);
+            if let Some(strings) = self.string_pool.get(&(obj_idx, si)) {
+                if r.addend >= 0 {
+                    let a = r.addend as u32;
+                    let idx = strings.partition_point(|&(off, _, _)| off <= a);
+                    if idx > 0 {
+                        let (off, len, h) = strings[idx - 1];
+                        if a < off + len {
+                            return (format!("@{}", hex8(&h)), (a - off) as i64);
+                        }
                     }
                 }
-                // Out-of-bounds addend in a string pool: fall through
-                // to the section-level lookup (which won't have an
-                // entry — pool and section are mutually exclusive),
-                // then to the unmodified-name fallback.
+                // Negative or out-of-range addend: no containing
+                // entry. ld's own merged-offset lookup (BFD
+                // `_bfd_merged_section_offset`, plain st_value+addend,
+                // no pc-rel bias correction) would be equally lost —
+                // GAS never reduces symbols against SEC_MERGE sections
+                // to section+offset precisely so that lookup stays
+                // unambiguous, so this shape is outside the toolchain
+                // contract. Still, encode a whole-pool fingerprint,
+                // NEVER the bare section name: `.rodata.str1.1` is
+                // identical across objects, so the name collided
+                // referrers of different strings and carried no
+                // content — string edits were invisible to the hash
+                // (review find, task #43).
+                let mut h = blake3::Hasher::new();
+                for &(off, len, fp) in strings {
+                    h.update(&off.to_le_bytes());
+                    h.update(&len.to_le_bytes());
+                    h.update(&fp);
+                }
+                let mut fp8 = [0u8; 8];
+                fp8.copy_from_slice(&h.finalize().as_bytes()[..8]);
+                return (format!("@{}", hex8(&fp8)), r.addend);
             }
             if let Some(h) = self.section.get(&(obj_idx, si)) {
                 return (format!("@{}", hex8(h)), r.addend);

@@ -487,7 +487,25 @@ pub fn build(
                     // the disposition path anchors at the section's
                     // recovered base with the addend riding along.
                     let edge = if let Some(entries) = merge_pool_entries.get(&key) {
-                        find_pool_entry_node(entries, &string_node_of, key, r.addend as u32)
+                        // Negative addends used to wrap through `as
+                        // u32` and out-of-range addends missed; both
+                        // silently dropped the edge to an external
+                        // sentinel — the referrer lost its string
+                        // dependency and the closure walk never saw
+                        // it (task #43). Keep a dependency on the
+                        // pool (first entry) whenever the precise
+                        // entry can't be identified.
+                        let precise = if r.addend >= 0 {
+                            find_pool_entry_node(entries, &string_node_of, key, r.addend as u32)
+                        } else {
+                            None
+                        };
+                        precise.or_else(|| {
+                            entries
+                                .first()
+                                .and_then(|&(off, _)| string_node_of.get(&(key.0, key.1, off)))
+                                .copied()
+                        })
                     } else {
                         node_of.get(&key).copied()
                     };
