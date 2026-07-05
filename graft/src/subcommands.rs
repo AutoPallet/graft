@@ -36,6 +36,17 @@ fn run_cache_info(path: &Path) -> anyhow::Result<()> {
 
     println!("manifest:");
     println!("  version          {}", m.version);
+    println!("  hash_algo        {}", m.hash_algo_version);
+    if m.version != metadata::SCHEMA_VERSION
+        || m.hash_algo_version != metadata::HASH_ALGO_VERSION
+    {
+        println!(
+            "  ⚠ STALE: this graft is schema v{} / hash-algo v{} — the \
+             printed trans_hash values are not comparable to current ones",
+            metadata::SCHEMA_VERSION,
+            metadata::HASH_ALGO_VERSION
+        );
+    }
     println!("  base_abi         {}", hex(&m.base_abi));
     println!("  entry_symbol     {}", m.entry_symbol);
     println!("  toolchain_stamp  {}", m.toolchain_stamp);

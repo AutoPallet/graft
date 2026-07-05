@@ -82,6 +82,24 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
     .context("overlay pre-scan")?;
     let t_scan = t_scan_start.elapsed();
 
+    // Weak/weak-diverged names: ld binds the first weak def in link
+    // order; graft's index is content-tiebroken for cross-scan
+    // stability. The two are irreconcilable (rlib member order churns
+    // per rebuild), and tracking a body ld didn't bind makes edits to
+    // the ld-bound body invisible to callers' hashes — the stale-bind
+    // class. Overlay mode refuses; base mode (plain ld semantics)
+    // only warns.
+    if !scan.graph.weak_diverged_referenced.is_empty() {
+        bail!(
+            "overlay refused: {} weak symbol(s) have multiple weak \
+             definitions with differing content and no strong \
+             override — ld's bind is link-order-dependent and graft \
+             cannot track it soundly: {}",
+            scan.graph.weak_diverged_referenced.len(),
+            scan.graph.weak_diverged_referenced.join(", ")
+        );
+    }
+
     // esp-idf's linker scripts mark `.flash.rodata` with SHF_TLS (a
     // workaround for ld's IROM/DROM vaddr-overlap error), leaving a
     // fake megabyte-scale PT_TLS covering all of DROM. Real ELF TLS
@@ -1196,6 +1214,15 @@ fn load_base_metadata(path: &std::path::Path) -> Result<BaseMetadata> {
             path.display(),
             manifest.version,
             SCHEMA_VERSION
+        );
+    }
+    if manifest.hash_algo_version != metadata::HASH_ALGO_VERSION {
+        bail!(
+            "{}: trans_hash algorithm version {} != {} — base was hashed \
+             by a different graft build; relink the base",
+            path.display(),
+            manifest.hash_algo_version,
+            metadata::HASH_ALGO_VERSION
         );
     }
 

@@ -7,7 +7,7 @@
 //! sentinel hashes.
 
 use std::collections::{HashMap, HashSet};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::elf::{ParsedObject, SymbolBind};
 use object::elf::SHF_ALLOC;
@@ -68,6 +68,14 @@ impl SymbolIndex {
     ) -> impl Iterator<Item = (&(String, [u8; 8]), NodeId, u64)> {
         self.locals.iter().map(|(k, &(v, val))| (k, v, val))
     }
+    /// Full any-TU local entries (name, node, st_value). Content-
+    /// diverged names have already been purged at build time, so
+    /// every surviving entry is content-unique across TUs.
+    pub fn locals_any_tu_full_iter(
+        &self,
+    ) -> impl Iterator<Item = (&String, NodeId, u64)> {
+        self.locals_any_tu.iter().map(|(n, &(v, val))| (n, v, val))
+    }
 }
 
 /// Where one relocation points, resolved once at scan time and reused
@@ -115,6 +123,16 @@ pub struct Graph {
     /// dependencies from `reloc_targets` (hash slot streams) must apply
     /// the same cut, so the cut point lives here, not in each consumer.
     pub entry_node: Option<NodeId>,
+    /// Names with ≥2 WEAK definers of NON-identical content, no strong
+    /// def, and at least one reference — sorted. ld binds the first
+    /// weak def in link order; graft's content tiebreak is stable but
+    /// can track a body ld didn't bind, making an edit to the ld-bound
+    /// body invisible to callers' hashes (the strong/weak stale-bind
+    /// class, weak/weak flavor). ld-accuracy and cross-scan stability
+    /// are irreconcilable here (rlib member order churns), so overlay
+    /// mode BAILS on these loudly; base mode (plain ld semantics)
+    /// warns and proceeds.
+    pub weak_diverged_referenced: Vec<String>,
 }
 
 /// A LogicalNode is the unit of inclusion: closure, hashing, and SCC
@@ -336,11 +354,18 @@ pub fn build(
         // bytes-only key degenerated to scan order (review find,
         // task #45: rlib reorder flipped the aggregator's th and
         // re-emitted .init_array into every overlay).
-        let mut contributor_segs: Vec<(SegmentRef, [u8; 32])> = Vec::new();
+        let mut contributor_segs: Vec<(SegmentRef, [u8; 32], [u8; 8])> = Vec::new();
         for (&(oi, si), &owning_agg) in &contributor_to_agg {
             if !std::ptr::eq(owning_agg, agg) { continue; }
             let sec = &objects[oi as usize].sections[si as usize];
             let mut h = blake3::Hasher::new();
+            // Section NAME is part of the key: `.init_array.NNN`
+            // priority suffixes determine ld's run order, and a
+            // bytes+relocs key let two ctors SWAP priorities without
+            // changing the aggregator's hash — an undetected init-
+            // order change (review find).
+            h.update(sec.name.as_bytes());
+            h.update(&[0]);
             h.update(&sec.bytes);
             for r in &sec.relocs {
                 h.update(&r.offset.to_le_bytes());
@@ -350,13 +375,24 @@ pub fn build(
                 h.update(&(t.len() as u32).to_le_bytes());
                 h.update(t.as_bytes());
             }
-            contributor_segs.push((SegmentRef::whole(oi, si), *h.finalize().as_bytes()));
+            contributor_segs.push((
+                SegmentRef::whole(oi, si),
+                *h.finalize().as_bytes(),
+                objects[oi as usize].tu_id,
+            ));
         }
         if contributor_segs.is_empty() { continue; }
-        contributor_segs.sort_by_key(|(seg, h)| (*h, seg.object, seg.section));
+        // Ties (identical name+bytes+stripped-reloc keys — e.g. two
+        // TUs' entries targeting same-named locals) break by tu_id,
+        // which is content-stable, NEVER by scan order: (object,
+        // section) survives only as the intra-object final resort,
+        // where input section order is ELF-stable (review find: key
+        // ties fell back to object order and rlib reorder flipped the
+        // aggregator's hash).
+        contributor_segs.sort_by_key(|(seg, h, tu)| (*h, *tu, seg.object, seg.section));
 
         let agg_nid = nodes.len() as NodeId;
-        let segments: Vec<SegmentRef> = contributor_segs.iter().map(|(s, _)| *s).collect();
+        let segments: Vec<SegmentRef> = contributor_segs.iter().map(|(s, _, _)| *s).collect();
         for seg in &segments {
             node_of.insert((seg.object, seg.section), agg_nid);
         }
@@ -405,17 +441,33 @@ pub fn build(
         }
     }
 
-    // Per-node bytes hash, computed once for use as a content-stable
+    // Per-node content hash, computed once for use as a content-stable
     // tiebreaker across scans whose object-iteration order differs.
     // Per-string nodes hash only their string's bytes (the segment's
     // range), so two scans whose string sits in different CGUs'
-    // `.rodata.str1.1` produce the same fingerprint.
+    // `.rodata.str1.1` produce the same fingerprint. Whole-section
+    // segments ALSO fold in their relocs (offset, r_type, addend,
+    // .llvm-stripped target name): two same-bytes definers with
+    // different relocs are NOT interchangeable, and a bytes-only
+    // tiebreak would call them "identical content" and silently keep
+    // whichever scanned first (review find: divergence detection and
+    // tiebreaks must see one-hop wiring, not just bytes).
     let bytes_hash_of: Vec<[u8; 16]> = nodes
         .iter()
         .map(|nm| {
             let mut h = blake3::Hasher::new();
             for seg in &nm.segments {
                 h.update(seg.bytes_in(&objects[seg.object as usize].sections));
+                if seg.range.is_none() {
+                    for r in &objects[seg.object as usize].sections[seg.section as usize].relocs {
+                        h.update(&r.offset.to_le_bytes());
+                        h.update(&r.r_type.to_le_bytes());
+                        h.update(&r.addend.to_le_bytes());
+                        let t = crate::hash::strip_llvm_suffix(&r.target);
+                        h.update(&(t.len() as u32).to_le_bytes());
+                        h.update(t.as_bytes());
+                    }
+                }
             }
             let mut out = [0u8; 16];
             out.copy_from_slice(&h.finalize().as_bytes()[..16]);
@@ -453,6 +505,19 @@ pub fn build(
     // synthesized — only one definer per name.
     let mut symbols = SymbolIndex::default();
     let mut global_weak: FxHashMap<String, bool> = FxHashMap::default();
+    // Weak-multiplicity bookkeeping for the weak/weak-diverged bail
+    // (see Graph::weak_diverged_referenced).
+    let mut weak_first_hash: FxHashMap<String, [u8; 16]> = FxHashMap::default();
+    let mut weak_diverged: FxHashSet<String> = FxHashSet::default();
+    let mut has_strong: FxHashSet<String> = FxHashSet::default();
+    // Local-map divergence: same key, different content — resolution
+    // would be scan-order-dependent (tu_id collisions for `locals`,
+    // same-named cross-TU statics for `locals_any_tu`). Such names are
+    // REMOVED from the maps below: External is deterministic and
+    // routes through the verified/bailing base_symtab channel instead
+    // of silently picking a copy (review finds).
+    let mut locals_diverged: FxHashSet<(String, [u8; 8])> = FxHashSet::default();
+    let mut any_tu_diverged: FxHashSet<String> = FxHashSet::default();
     for (nid, nm) in nodes.iter().enumerate() {
         let nid = nid as NodeId;
         for sym in &nm.defined_symbols {
@@ -460,6 +525,20 @@ pub fn build(
                 SymbolBind::Global | SymbolBind::Weak => {
                     let new_weak = sym.bind == SymbolBind::Weak;
                     let new_h = bytes_hash_of[nid as usize];
+                    if new_weak {
+                        match weak_first_hash.entry(sym.name.clone()) {
+                            std::collections::hash_map::Entry::Vacant(v) => {
+                                v.insert(new_h);
+                            }
+                            std::collections::hash_map::Entry::Occupied(o) => {
+                                if *o.get() != new_h {
+                                    weak_diverged.insert(sym.name.clone());
+                                }
+                            }
+                        }
+                    } else {
+                        has_strong.insert(sym.name.clone());
+                    }
                     match symbols.globals.entry(sym.name.clone()) {
                         std::collections::hash_map::Entry::Vacant(v) => {
                             v.insert((nid, sym.value));
@@ -480,17 +559,65 @@ pub fn build(
                 }
                 SymbolBind::Local => {
                     let tu_id = sym.tu_id.expect("local symbol must carry tu_id");
-                    symbols
-                        .locals
-                        .insert((sym.name.clone(), tu_id), (nid, sym.value));
-                    symbols
-                        .locals_any_tu
-                        .entry(sym.name.clone())
-                        .or_insert((nid, sym.value));
+                    let new_h = bytes_hash_of[nid as usize];
+                    match symbols.locals.entry((sym.name.clone(), tu_id)) {
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert((nid, sym.value));
+                        }
+                        std::collections::hash_map::Entry::Occupied(o) => {
+                            // Same (name, tu_id), different content =
+                            // a tu_id collision; identical content =
+                            // keep the first (interchangeable).
+                            if bytes_hash_of[o.get().0 as usize] != new_h {
+                                locals_diverged.insert((sym.name.clone(), tu_id));
+                            }
+                        }
+                    }
+                    match symbols.locals_any_tu.entry(sym.name.clone()) {
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert((nid, sym.value));
+                        }
+                        std::collections::hash_map::Entry::Occupied(o) => {
+                            if bytes_hash_of[o.get().0 as usize] != new_h {
+                                any_tu_diverged.insert(sym.name.clone());
+                            }
+                        }
+                    }
                 }
             }
         }
     }
+    // Purge scan-order-dependent local entries (content diverged).
+    // Loud: a diverged (name, tu_id) means a tu_id COLLISION (two
+    // objects sharing a leading STT_FILE name while defining
+    // different same-named locals) — resolution for these names goes
+    // External (deterministic, channel-4-verified or bailing) instead
+    // of silently picking whichever object scanned first.
+    if !locals_diverged.is_empty() {
+        let mut names: Vec<&str> =
+            locals_diverged.iter().map(|(n, _)| n.as_str()).collect();
+        names.sort();
+        names.dedup();
+        eprintln!(
+            "graft scan: WARNING: {} local name(s) collide across objects \
+             with identical tu_id but different content (STT_FILE name \
+             collision?) — treating as unresolvable: {}",
+            names.len(),
+            names[..names.len().min(8)].join(", ")
+        );
+    }
+    for k in &locals_diverged {
+        symbols.locals.remove(k);
+    }
+    for n in &any_tu_diverged {
+        symbols.locals_any_tu.remove(n);
+    }
+    // Weak/weak-diverged names matter only when no strong def exists
+    // (a strong def wins in ld and in graft regardless of order).
+    let weak_poisoned: FxHashSet<String> = weak_diverged
+        .into_iter()
+        .filter(|n| !has_strong.contains(n))
+        .collect();
 
     // The trampoline target node (if the entry symbol resolves). Edges
     // into it are cut to external sentinels below.
@@ -505,6 +632,7 @@ pub fn build(
     // used — resolve once, consume everywhere.
     let mut edges: Vec<Vec<NodeId>> = vec![Vec::new(); nodes.len()];
     let mut external_counts: Vec<u32> = vec![0; nodes.len()];
+    let mut weak_poisoned_referenced: FxHashSet<String> = FxHashSet::default();
     let mut reloc_targets: HashMap<(u32, u32), HashMap<(u64, u32), ResolvedTarget>> =
         HashMap::new();
     for (oi, obj) in objects.iter().enumerate() {
@@ -569,6 +697,9 @@ pub fn build(
                     } else {
                         &r.target
                     };
+                    if weak_poisoned.contains(lookup) {
+                        weak_poisoned_referenced.insert(lookup.to_string());
+                    }
                     match symbols.resolve(lookup, obj.tu_id) {
                         Some((t, value)) => (ResolvedTarget::Symbol { nid: t, value }, Some(t)),
                         None => (ResolvedTarget::External, None),
@@ -601,6 +732,10 @@ pub fn build(
         }
     }
 
+    let mut weak_diverged_referenced: Vec<String> =
+        weak_poisoned_referenced.into_iter().collect();
+    weak_diverged_referenced.sort();
+
     Graph {
         nodes,
         edges,
@@ -608,6 +743,7 @@ pub fn build(
         symbols,
         reloc_targets,
         entry_node,
+        weak_diverged_referenced,
     }
 }
 
@@ -749,6 +885,7 @@ mod tests {
             symbols: SymbolIndex::default(),
             reloc_targets: HashMap::new(),
             entry_node: None,
+            weak_diverged_referenced: Vec::new(),
         }
     }
 

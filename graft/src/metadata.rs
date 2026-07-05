@@ -28,7 +28,22 @@ pub const GRAFT_MAGIC: [u8; 4] = *b"GRFT";
 // relaxation walk needs it to slice base.elf's bytes. A v7 table has
 // vote-recovered addresses that silently drift on relaxing targets
 // and no sizes to walk with.
-pub const SCHEMA_VERSION: u16 = 8;
+// v9: the trans_hash ALGORITHM was overhauled (per-SCC color
+// refinement replacing member-hash mixing; st_value folded into
+// canonical addends; pool-fallback / bind-precedence / aggregator-key
+// / entry-cut / salt-tu_id / segment-framing fixes from the 2026-07
+// review cycle) — empirically a total re-key of the hash domain. The
+// manifest also gains `hash_algo_version` so future algorithm-only
+// changes are self-documenting; the review found the refinement
+// initially shipped WITHOUT a bump, leaving the stale-base guard
+// blind (every by_section lookup missed, the closure silently became
+// whole-program, and only data-dependent slack overflow rescued it).
+pub const SCHEMA_VERSION: u16 = 9;
+
+/// Version of the trans_hash algorithm itself, independent of table
+/// layout. Bump whenever hash VALUES change for unchanged inputs;
+/// `overlay::build_base_index` checks it alongside SCHEMA_VERSION.
+pub const HASH_ALGO_VERSION: u16 = 1;
 
 pub const SECTION_MANIFEST: &str = ".graft.manifest";
 pub const SECTION_SECTIONS: &str = ".graft.sections";
@@ -37,6 +52,8 @@ pub const SECTION_SECTIONS: &str = ".graft.sections";
 pub struct GraftManifest {
     pub magic: [u8; 4],
     pub version: u16,
+    /// Trans_hash algorithm version (HASH_ALGO_VERSION at base link).
+    pub hash_algo_version: u16,
     /// sha1, matches NT_GNU_BUILD_ID when base was linked with --build-id=sha1.
     pub base_abi: [u8; 20],
     pub entry_symbol: String,
@@ -124,6 +141,7 @@ mod tests {
         let m = GraftManifest {
             magic: GRAFT_MAGIC,
             version: SCHEMA_VERSION,
+            hash_algo_version: HASH_ALGO_VERSION,
             base_abi: [0x11; 20],
             entry_symbol: "main".into(),
             toolchain_stamp: "rustc-1.94.1".into(),

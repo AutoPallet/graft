@@ -106,6 +106,18 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
             .join()
             .map_err(|_| anyhow!("pre-scan thread panicked"))?;
         let scan_result = scan_result.context("pre-scan failed")?;
+        // Base links are ld's own semantics — a weak/weak-diverged
+        // bind is ld's (link-order) pick and the output is valid, so
+        // only warn; overlay mode refuses (see overlay.rs).
+        if !scan_result.graph.weak_diverged_referenced.is_empty() {
+            eprintln!(
+                "graft base: WARNING: {} weak symbol(s) with multiple \
+                 differing weak definitions (ld binds link-order-first; \
+                 overlays against this base will refuse): {}",
+                scan_result.graph.weak_diverged_referenced.len(),
+                scan_result.graph.weak_diverged_referenced.join(", ")
+            );
+        }
         let mut icf_work_dir = None;
         if let Some(outcome) = crate::icf::run(&scan_result, &output)? {
             let s = &outcome.stats;
@@ -189,6 +201,7 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
     let manifest = GraftManifest {
         magic: GRAFT_MAGIC,
         version: SCHEMA_VERSION,
+        hash_algo_version: crate::metadata::HASH_ALGO_VERSION,
         base_abi: compute_base_abi(&elf_bytes),
         entry_symbol: entry_for_scan.clone().unwrap_or_else(|| "main".into()),
         toolchain_stamp: toolchain_stamp(),

@@ -139,6 +139,174 @@ fn callers_of_different_offsets_in_one_section_do_not_collide() {
     );
 }
 
+/// TU-blind nominal salt attack (review cycle): two C files' same-named
+/// file-local `.bss` statics — distinct mutable variables — must not
+/// share a trans_hash. NOBITS sections have no bytes, so the salt IS
+/// the identity; without tu_id in the salt they collided (M2 aliasing
+/// class: positional resolution would bind both counters to one base
+/// address).
+#[test]
+fn same_named_bss_locals_across_tus_do_not_collide() {
+    let build_tu = |file: &str, acc: &str| {
+        let mut obj =
+            WObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        obj.add_file_symbol(file.as_bytes().to_vec());
+        let bss = obj.add_section(Vec::new(), b".bss.counter".to_vec(), SectionKind::UninitializedData);
+        obj.section_mut(bss).append_bss(8, 8);
+        let counter = obj.add_symbol(WSymbol {
+            name: b"counter".to_vec(),
+            value: 0,
+            size: 8,
+            kind: SymbolKind::Data,
+            scope: object::write::SymbolScope::Compilation, // LOCAL
+            weak: false,
+            section: SymbolSection::Section(bss),
+            flags: object::write::SymbolFlags::None,
+        });
+        let csec = obj.add_section(
+            Vec::new(),
+            format!(".text.{acc}").into_bytes(),
+            SectionKind::Text,
+        );
+        // lea counter(%rip), %rax ; ret
+        obj.section_mut(csec)
+            .set_data(vec![0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xc3], 16);
+        global_text_symbol(&mut obj, acc, csec, 0);
+        obj.add_relocation(
+            csec,
+            WRelocation {
+                offset: 3,
+                symbol: counter,
+                addend: -4,
+                flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PC32 },
+            },
+        )
+        .unwrap();
+        obj
+    };
+    let mut a = build_tu("aaaa.c", "acc_a");
+    let b = build_tu("bbbb.c", "acc_b");
+    // main in object a, calling acc_a and acc_b.
+    {
+        let msec = a.add_section(Vec::new(), b".text.main".to_vec(), SectionKind::Text);
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0xe8, 0, 0, 0, 0]);
+        code.extend_from_slice(&[0xe8, 0, 0, 0, 0]);
+        code.push(0xc3);
+        a.section_mut(msec).set_data(code, 16);
+        global_text_symbol(&mut a, "main", msec, 0);
+        let acc_a = a.symbol_id(b"acc_a").unwrap();
+        let acc_b = a.add_symbol(WSymbol {
+            name: b"acc_b".to_vec(),
+            value: 0,
+            size: 0,
+            kind: SymbolKind::Unknown,
+            scope: object::write::SymbolScope::Dynamic,
+            weak: false,
+            section: SymbolSection::Undefined,
+            flags: object::write::SymbolFlags::None,
+        });
+        for (off, sym) in [(1u64, acc_a), (6u64, acc_b)] {
+            a.add_relocation(
+                msec,
+                WRelocation {
+                    offset: off,
+                    symbol: sym,
+                    addend: -4,
+                    flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PLT32 },
+                },
+            )
+            .unwrap();
+        }
+    }
+    let scan = scan_two(a, b, "main");
+    // The two .bss twins must have distinct hashes, hence so must
+    // their byte-identical accessors.
+    assert_ne!(
+        th(&scan, "acc_a"),
+        th(&scan, "acc_b"),
+        "same-named file-local .bss statics in different TUs are \
+         distinct mutable variables — their accessors must not collide"
+    );
+}
+
+/// Weak/weak-diverged pin (review cycle, ld-parity lens): two WEAK
+/// definitions with different content and no strong override — ld
+/// binds link-order-first, graft's content tiebreak can't track that,
+/// so overlay mode must REFUSE (base mode only warns). Scan-level
+/// check: the graph flags the referenced diverged name.
+#[test]
+fn weak_weak_diverged_is_flagged_for_overlay_refusal() {
+    let build = |imm: u8, tag: &str| {
+        let mut obj =
+            WObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        obj.add_file_symbol(format!("{tag}.c").into_bytes());
+        let sec = obj.add_section(
+            Vec::new(),
+            format!(".text.handler_{tag}").into_bytes(),
+            SectionKind::Text,
+        );
+        obj.section_mut(sec).set_data(vec![0xb8, imm, 0, 0, 0, 0xc3], 16);
+        obj.add_symbol(WSymbol {
+            name: b"handler".to_vec(),
+            value: 0,
+            size: 0,
+            kind: SymbolKind::Text,
+            scope: object::write::SymbolScope::Linkage,
+            weak: true,
+            section: SymbolSection::Section(sec),
+            flags: object::write::SymbolFlags::None,
+        });
+        obj
+    };
+    let mut a = build(0xAA, "wa");
+    let b = build(0xBB, "wb");
+    {
+        let msec = a.add_section(Vec::new(), b".text.main".to_vec(), SectionKind::Text);
+        a.section_mut(msec).set_data(call_ret(), 16);
+        global_text_symbol(&mut a, "main", msec, 0);
+        let h = a.symbol_id(b"handler").unwrap();
+        a.add_relocation(
+            msec,
+            WRelocation {
+                offset: 1,
+                symbol: h,
+                addend: -4,
+                flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PLT32 },
+            },
+        )
+        .unwrap();
+    }
+    let scan = scan_two(a, b, "main");
+    assert_eq!(
+        scan.graph.weak_diverged_referenced,
+        vec!["handler".to_string()],
+        "referenced weak/weak-diverged name must be flagged"
+    );
+
+    // Control: identical weak twins are the benign shape — no flag.
+    let mut a2 = build(0xAA, "wa");
+    let b2 = build(0xAA, "wb");
+    {
+        let msec = a2.add_section(Vec::new(), b".text.main".to_vec(), SectionKind::Text);
+        a2.section_mut(msec).set_data(call_ret(), 16);
+        global_text_symbol(&mut a2, "main", msec, 0);
+        let h = a2.symbol_id(b"handler").unwrap();
+        a2.add_relocation(
+            msec,
+            WRelocation {
+                offset: 1,
+                symbol: h,
+                addend: -4,
+                flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PLT32 },
+            },
+        )
+        .unwrap();
+    }
+    let scan2 = scan_two(a2, b2, "main");
+    assert!(scan2.graph.weak_diverged_referenced.is_empty());
+}
+
 /// Trampoline-cut pin (task #45): callers of the entry symbol depend
 /// on its (trampolined) ADDRESS, never its content — an entry edit
 /// must not dirty its callers' hashes. The cut existed in edges and

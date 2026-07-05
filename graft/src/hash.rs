@@ -109,7 +109,13 @@ fn node_identity_hashes_with(
         .map(|nm| {
             let mut h = blake3::Hasher::new();
             for seg in &nm.segments {
-                h.update(seg.bytes_in(&objects[seg.object as usize].sections));
+                let bytes = seg.bytes_in(&objects[seg.object as usize].sections);
+                // Per-segment length framing: without it, multi-
+                // segment (aggregator) nodes with different byte
+                // boundaries could concatenate to identical streams
+                // (review find: framing ambiguity).
+                h.update(&(bytes.len() as u64).to_le_bytes());
+                h.update(bytes);
                 if seg.range.is_none()
                     && let Some(salt) = salts.get(&(seg.object, seg.section))
                 {
@@ -123,12 +129,23 @@ fn node_identity_hashes_with(
 
 /// `(object, section) → identity salt` for every section that is NOT
 /// content-addressable (mutable data, NOBITS, zero-size). The salt is a
-/// marker plus the section's sorted (stripped symbol name, st_value)
-/// pairs — nominal identity for sections whose bytes don't define them.
-/// Content-addressable sections have no entry (their hash input is
-/// byte-for-byte what it was before this mechanism existed).
+/// marker plus the section's sorted (stripped symbol name, st_value
+/// [, tu_id for locals]) tuples — nominal identity for sections whose
+/// bytes don't define them. Content-addressable sections have no entry.
+///
+/// LOCAL symbol entries carry the defining object's tu_id: local names
+/// are only unique per TU, and without it two C files' same-named
+/// file-local statics (`static int counter;` in a.c and b.c) produced
+/// identical salts — identical trans_hash for two DISTINCT mutable
+/// variables, the exact M2 aliasing class the salt exists to prevent
+/// (review find: nominal-salt TU-blindness). tu_id is
+/// blake3(STT_FILE)[:8] — content-stable across rebuilds, unlike
+/// object indexes. Global names are program-unique already; salting
+/// them with tu_id would only churn identity when a static moves
+/// between CGUs.
 fn nominal_salts(objects: &[ParsedObject]) -> HashMap<(u32, u32), Vec<u8>> {
-    let mut entries: HashMap<(u32, u32), Vec<(String, u64)>> = HashMap::new();
+    use crate::elf::SymbolBind;
+    let mut entries: HashMap<(u32, u32), Vec<(String, u64, Option<[u8; 8]>)>> = HashMap::new();
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
             if !sec.content_addressable() {
@@ -141,7 +158,11 @@ fn nominal_salts(objects: &[ParsedObject]) -> HashMap<(u32, u32), Vec<u8>> {
                 continue;
             }
             if let Some(v) = entries.get_mut(&(oi as u32, si as u32)) {
-                v.push((strip_llvm_suffix(&sym.name).to_string(), sym.value));
+                let tu = match sym.bind {
+                    SymbolBind::Local => Some(obj.tu_id),
+                    SymbolBind::Global | SymbolBind::Weak => None,
+                };
+                v.push((strip_llvm_suffix(&sym.name).to_string(), sym.value, tu));
             }
         }
     }
@@ -151,10 +172,17 @@ fn nominal_salts(objects: &[ParsedObject]) -> HashMap<(u32, u32), Vec<u8>> {
             syms.sort();
             syms.dedup();
             let mut blob = b"\0graft-nominal\0".to_vec();
-            for (name, value) in &syms {
+            for (name, value, tu) in &syms {
                 blob.extend_from_slice(&(name.len() as u32).to_le_bytes());
                 blob.extend_from_slice(name.as_bytes());
                 blob.extend_from_slice(&value.to_le_bytes());
+                match tu {
+                    Some(id) => {
+                        blob.push(1);
+                        blob.extend_from_slice(id);
+                    }
+                    None => blob.push(0),
+                }
             }
             (k, blob)
         })
@@ -209,7 +237,10 @@ pub fn compute_detailed(
             for seg in &nm.segments {
                 let obj = &objects[seg.object as usize];
                 let sec = &obj.sections[seg.section as usize];
-                h.update(seg.bytes_in(&obj.sections));
+                let bytes = seg.bytes_in(&obj.sections);
+                // Per-segment length framing (see node_identity_hashes).
+                h.update(&(bytes.len() as u64).to_le_bytes());
+                h.update(bytes);
                 // Per-string segments (range = Some) have no relocs
                 // of their own — string bytes don't reference
                 // anything. Skip the section's relocs so each string
@@ -502,6 +533,11 @@ pub struct ContentResolver {
     /// fingerprint, st_value). Locals can repeat by name across TUs;
     /// the tu_id disambiguates.
     local: HashMap<(String, [u8; 8]), ([u8; 8], u64)>,
+    /// Local name → fingerprint regardless of TU — mirrors edge
+    /// building's `locals_any_tu` fallback so hashing and resolution
+    /// see the same world for cross-TU internal-linkage refs.
+    /// Content-diverged names are absent (purged at graph build).
+    local_any: HashMap<String, ([u8; 8], u64)>,
 }
 
 impl ContentResolver {
@@ -555,24 +591,51 @@ impl ContentResolver {
         // external sentinels; leaving the fingerprint here meant an
         // entry edit still dirtied every direct caller's member hash,
         // defeating the cut's documented purpose (review find, #45).
+        // Symbols defined inside a split string pool attach to the
+        // per-string sub-node, whose fingerprint origin is the STRING
+        // start — but st_value is SECTION-relative. Rebase the stored
+        // value to the node's own origin, or the canonical addend
+        // double-counts the string's pool offset and the symbol-form
+        // encoding diverges from section-form for the same byte
+        // (review find: pooled-symbol st_value double-count).
+        let rebased = |nid: crate::graph::NodeId, value: u64| -> u64 {
+            match graph.nodes[nid as usize].segments.first().and_then(|s| s.range) {
+                Some((off, _)) => value.saturating_sub(off as u64),
+                None => value,
+            }
+        };
         let mut global = HashMap::new();
         for (name, nid, value) in graph.symbols.globals_full_iter() {
             if graph.entry_node == Some(nid) {
                 continue;
             }
-            global.insert(name.clone(), (fp8(nid), value));
+            global.insert(name.clone(), (fp8(nid), rebased(nid, value)));
         }
         let mut local = HashMap::new();
         for (key, nid, value) in graph.symbols.locals_full_iter() {
             if graph.entry_node == Some(nid) {
                 continue;
             }
-            local.insert(key.clone(), (fp8(nid), value));
+            local.insert(key.clone(), (fp8(nid), rebased(nid, value)));
+        }
+        // Cross-TU local refs resolve through locals_any_tu in edge
+        // building; without the same fallback here they canonicalized
+        // as their RAW names — which carry `.llvm.<id>` suffixes, the
+        // exact CGU noise this canonicalization exists to erase
+        // (review find: any_tu churn). Diverged names were purged
+        // from the map at graph build, so every entry is content-
+        // unique.
+        let mut local_any = HashMap::new();
+        for (name, nid, value) in graph.symbols.locals_any_tu_full_iter() {
+            if graph.entry_node == Some(nid) {
+                continue;
+            }
+            local_any.insert(name.clone(), (fp8(nid), rebased(nid, value)));
         }
         for v in string_pool.values_mut() {
             v.sort_by_key(|&(off, _, _)| off);
         }
-        Self { section, string_pool, global, local }
+        Self { section, string_pool, global, local, local_any }
     }
 
     /// Whether `(object, section)` is a split string pool (per-string
@@ -640,14 +703,19 @@ impl ContentResolver {
         if let Some(&(h, value)) = self.local.get(&(r.target.clone(), tu_id)) {
             return (format!("@{}", hex8(&h)), value as i64 + r.addend);
         }
-        // Out-of-scope target: keep the original name. It IS encoded
-        // into member_input_hash (postcard of the canonical reloc
-        // list), which is fine for genuine externals — crt/ROM/script
-        // names are stable across scans. Names that are NOT stable
-        // (CGU-fingerprinted locals) only land here when they're
-        // unresolvable in-scope, which already means the scans see
-        // different input sets.
-        (r.target.clone(), r.addend)
+        // Cross-TU internal-linkage ref: same fallback edge building
+        // uses (locals_any_tu), so the fingerprint tracks the copy
+        // resolution actually picked.
+        if let Some(&(h, value)) = self.local_any.get(&r.target) {
+            return (format!("@{}", hex8(&h)), value as i64 + r.addend);
+        }
+        // Out-of-scope target: keep the original name, stripped of
+        // the `.llvm.<id>` per-build suffix (belt for names that leak
+        // here with CGU fingerprints attached). It IS encoded into
+        // member_input_hash (postcard of the canonical reloc list),
+        // which is fine for genuine externals — crt/ROM/script names
+        // are stable across scans.
+        (strip_llvm_suffix(&r.target).to_string(), r.addend)
     }
 }
 
