@@ -164,20 +164,31 @@ fn nominal_salts(objects: &[ParsedObject]) -> HashMap<(u32, u32), Vec<u8>> {
 /// Strip rustc/LLVM's per-build internal-linkage suffix
 /// (`foo.llvm.1234567890`) so the nominal salt doesn't churn when CGU
 /// repartitioning renumbers it.
-fn strip_llvm_suffix(name: &str) -> &str {
+pub(crate) fn strip_llvm_suffix(name: &str) -> &str {
     match name.find(".llvm.") {
         Some(i) => &name[..i],
         None => name,
     }
 }
 
-/// Compute a `TransHash` for every node. All nodes in the same SCC
-/// receive the same hash.
+/// Compute a `TransHash` for every node.
 pub fn compute(
     objects: &[ParsedObject],
     graph: &Graph,
     scc: &SccResult,
 ) -> Vec<TransHash> {
+    compute_detailed(objects, graph, scc).0
+}
+
+/// `compute` plus each node's containing-SCC hash — the diagnostic
+/// dump prints both so divergence localizes to "member color" vs
+/// "SCC transitive content" (its scc_hash column used to just repeat
+/// trans_hash).
+pub fn compute_detailed(
+    objects: &[ParsedObject],
+    graph: &Graph,
+    scc: &SccResult,
+) -> (Vec<TransHash>, Vec<TransHash>) {
     // Two-pass member hashing. Pass 1: per-node blake3 of the section
     // bytes plus, for non-content-addressable sections, the nominal
     // salt — a stable identity fingerprint that doesn't depend on
@@ -271,6 +282,7 @@ pub fn compute(
     // seeded, so seeds are content-deterministic — no global iteration
     // count, no cross-scan instability.
     let mut th: Vec<TransHash> = vec![[0u8; 16]; graph.nodes.len()];
+    let mut scch_of_node: Vec<TransHash> = vec![[0u8; 16]; graph.nodes.len()];
 
     for (sid, members) in scc.members.iter().enumerate() {
         let self_sid = sid as u32;
@@ -382,9 +394,10 @@ pub fn compute(
             let mut out = [0u8; 16];
             out.copy_from_slice(&h.finalize().as_bytes()[..16]);
             th[n as usize] = out;
+            scch_of_node[n as usize] = scch;
         }
     }
-    th
+    (th, scch_of_node)
 }
 
 fn count_distinct(colors: &[[u8; 32]]) -> usize {
@@ -501,6 +514,12 @@ impl ContentResolver {
         let mut section = HashMap::new();
         let mut string_pool: HashMap<(u32, u32), Vec<(u32, u32, [u8; 8])>> = HashMap::new();
         for (nid, nm) in graph.nodes.iter().enumerate() {
+            // Trampoline cut for section-form refs: the entry node's
+            // sections don't get a fingerprint either (edges cut
+            // Section targets to the entry the same way).
+            if graph.entry_node == Some(nid as crate::graph::NodeId) {
+                continue;
+            }
             let mut h = [0u8; 8];
             h.copy_from_slice(&bytes_hashes[nid].as_bytes()[..8]);
             for seg in &nm.segments {
@@ -529,12 +548,25 @@ impl ContentResolver {
             h.copy_from_slice(&bytes_hashes[nid as usize].as_bytes()[..8]);
             h
         };
+        // Trampoline cut, mirrored: symbols defined on the entry node
+        // are omitted, so refs to the entry canonicalize as its bare
+        // NAME (stable, content-free) instead of a content
+        // fingerprint. Edges and slot streams already cut these to
+        // external sentinels; leaving the fingerprint here meant an
+        // entry edit still dirtied every direct caller's member hash,
+        // defeating the cut's documented purpose (review find, #45).
         let mut global = HashMap::new();
         for (name, nid, value) in graph.symbols.globals_full_iter() {
+            if graph.entry_node == Some(nid) {
+                continue;
+            }
             global.insert(name.clone(), (fp8(nid), value));
         }
         let mut local = HashMap::new();
         for (key, nid, value) in graph.symbols.locals_full_iter() {
+            if graph.entry_node == Some(nid) {
+                continue;
+            }
             local.insert(key.clone(), (fp8(nid), value));
         }
         for v in string_pool.values_mut() {
@@ -608,9 +640,13 @@ impl ContentResolver {
         if let Some(&(h, value)) = self.local.get(&(r.target.clone(), tu_id)) {
             return (format!("@{}", hex8(&h)), value as i64 + r.addend);
         }
-        // Out-of-scope target: keep the original name. The SCC
-        // walker counts these as externals (sentinel hash), so the
-        // name itself is never compared between scans.
+        // Out-of-scope target: keep the original name. It IS encoded
+        // into member_input_hash (postcard of the canonical reloc
+        // list), which is fine for genuine externals — crt/ROM/script
+        // names are stable across scans. Names that are NOT stable
+        // (CGU-fingerprinted locals) only land here when they're
+        // unresolvable in-scope, which already means the scans see
+        // different input sets.
         (r.target.clone(), r.addend)
     }
 }

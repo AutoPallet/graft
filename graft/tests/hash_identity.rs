@@ -139,6 +139,47 @@ fn callers_of_different_offsets_in_one_section_do_not_collide() {
     );
 }
 
+/// Trampoline-cut pin (task #45): callers of the entry symbol depend
+/// on its (trampolined) ADDRESS, never its content — an entry edit
+/// must not dirty its callers' hashes. The cut existed in edges and
+/// slot streams but not in ContentResolver, so the entry's content
+/// fingerprint leaked into every direct caller's member hash.
+#[test]
+fn entry_edit_does_not_dirty_callers() {
+    let build = |imm: u8| {
+        let mut obj =
+            WObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let esec = obj.add_section(Vec::new(), b".text.main".to_vec(), SectionKind::Text);
+        obj.section_mut(esec).set_data(vec![0xb8, imm, 0, 0, 0, 0xc3], 16);
+        global_text_symbol(&mut obj, "main", esec, 0);
+        // A runtime-ish caller that references the entry (the shape
+        // the cut exists for: crt/IRAM code calling main).
+        let csec = obj.add_section(Vec::new(), b".text.rt_caller".to_vec(), SectionKind::Text);
+        obj.section_mut(csec).set_data(call_ret(), 16);
+        global_text_symbol(&mut obj, "rt_caller", csec, 0);
+        let m = obj.symbol_id(b"main").unwrap();
+        obj.add_relocation(
+            csec,
+            WRelocation {
+                offset: 1,
+                symbol: m,
+                addend: -4,
+                flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PLT32 },
+            },
+        )
+        .unwrap();
+        scan_one(obj, "main")
+    };
+    let a = build(1);
+    let b = build(2);
+    assert_ne!(th(&a, "main"), th(&b, "main"), "entry's own hash must change");
+    assert_eq!(
+        th(&a, "rt_caller"),
+        th(&b, "rt_caller"),
+        "entry edit must not dirty the entry's callers (trampoline cut)"
+    );
+}
+
 /// Weak+strong attack (task #44): a weak `handler` default and a
 /// strong override coexist; ld binds every reference to the STRONG
 /// def. The old SymbolIndex tiebroke multi-defs by content hash,

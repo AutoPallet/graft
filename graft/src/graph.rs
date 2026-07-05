@@ -329,13 +329,28 @@ pub fn build(
         // (content_hash, object_idx, section_idx) so independently-
         // built scans whose object iteration order differs (rlibs
         // re-emit member ordering nondeterministically) still produce
-        // the same segment list.
+        // the same segment list. The content hash covers bytes AND
+        // relocs (offset, r_type, addend, .llvm-stripped target name):
+        // `.init_array.*` entries are all 8 zero bytes — the reloc to
+        // the init fn is the only distinguishing content, and a
+        // bytes-only key degenerated to scan order (review find,
+        // task #45: rlib reorder flipped the aggregator's th and
+        // re-emitted .init_array into every overlay).
         let mut contributor_segs: Vec<(SegmentRef, [u8; 32])> = Vec::new();
         for (&(oi, si), &owning_agg) in &contributor_to_agg {
             if !std::ptr::eq(owning_agg, agg) { continue; }
-            let bytes = &objects[oi as usize].sections[si as usize].bytes;
-            let h = *blake3::hash(bytes).as_bytes();
-            contributor_segs.push((SegmentRef::whole(oi, si), h));
+            let sec = &objects[oi as usize].sections[si as usize];
+            let mut h = blake3::Hasher::new();
+            h.update(&sec.bytes);
+            for r in &sec.relocs {
+                h.update(&r.offset.to_le_bytes());
+                h.update(&r.r_type.to_le_bytes());
+                h.update(&r.addend.to_le_bytes());
+                let t = crate::hash::strip_llvm_suffix(&r.target);
+                h.update(&(t.len() as u32).to_le_bytes());
+                h.update(t.as_bytes());
+            }
+            contributor_segs.push((SegmentRef::whole(oi, si), *h.finalize().as_bytes()));
         }
         if contributor_segs.is_empty() { continue; }
         contributor_segs.sort_by_key(|(seg, h)| (*h, seg.object, seg.section));

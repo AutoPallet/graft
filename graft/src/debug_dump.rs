@@ -66,6 +66,9 @@ pub fn dump_graph(path: &Path, scan: &ScanResult) -> std::io::Result<()> {
     // reporting fingerprints `compute` never produced).
     let bytes_hashes = crate::hash::node_identity_hashes(g, &scan.objects);
     let resolver = crate::hash::ContentResolver::build(&scan.objects, g, &bytes_hashes);
+    // Real per-node SCC hashes — this column used to just repeat
+    // trans_hash, which misled the #42 dissection.
+    let (_, scch_of_node) = crate::hash::compute_detailed(&scan.objects, g, &scc);
 
     // Per-node logical key (used for cross-scan join AND for emitting
     // edge target keys).
@@ -184,9 +187,11 @@ pub fn dump_graph(path: &Path, scan: &ScanResult) -> std::io::Result<()> {
             let mih: String = h.finalize().as_bytes()[..8]
                 .iter().map(|b| format!("{b:02x}")).collect();
 
+            let scch: String =
+                scch_of_node[nid].iter().map(|b| format!("{b:02x}")).collect();
             writeln!(
                 f,
-                "{stripped}\t{tu_id_hex}\t{}\t{bh}\t{mih}\t{enc_h}\t{th}\t{edges_count}\t{ext}\t{sid}\t{th}\t{edges_str}\t{succ_str}",
+                "{stripped}\t{tu_id_hex}\t{}\t{bh}\t{mih}\t{enc_h}\t{th}\t{edges_count}\t{ext}\t{sid}\t{scch}\t{edges_str}\t{succ_str}",
                 sec.name,
             )?;
         }
