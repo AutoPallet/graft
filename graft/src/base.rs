@@ -374,7 +374,7 @@ fn check_slack_scooped(elf_bytes: &[u8]) -> Result<()> {
         let name = sec.name().unwrap_or("");
         if name.ends_with(".graft_slack") {
             let hint = if name.starts_with(".tdata") {
-                "If this target has no TLS runtime, set GRAFT_TLS_SLACK_LEN=0; \
+                "If this target has no TLS runtime, set GRAFT_SLACK_LEN=tls=0; \
                  otherwise add a `*(.tdata .tdata.*)` rule to the script."
             } else {
                 "Splice mode needs this region — add the matching wildcard \

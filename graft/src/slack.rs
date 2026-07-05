@@ -18,7 +18,7 @@
 //! doesn't drop them. Overlay mode reads the symbol values+sizes back
 //! out of base.elf to drive its layout.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use object::{
     Architecture, BinaryFormat, Endianness, SectionKind, SymbolFlags, SymbolKind, SymbolScope,
     write::{Object, Symbol, SymbolSection},
@@ -41,7 +41,7 @@ const DEFAULT_DATA_LEN: u32 = 4 * 1024;
 // In-template TLS slack for thread-locals an overlay defines or
 // re-emits (changed initializer). Deliberately tiny: every thread
 // copies the template's filesz bytes at spawn, so this is a per-thread
-// RAM cost. Bumpable via GRAFT_TLS_SLACK_LEN.
+// RAM cost. Bumpable via GRAFT_SLACK_LEN (`tls=`).
 const DEFAULT_TLS_LEN: u32 = 64;
 // TLS slack alignment — also a floor for the section's contribution
 // to PT_TLS p_align. New thread-locals needing more than this trip
@@ -54,6 +54,20 @@ pub const RODATA_SYMBOL: &str = "GRAFT_RODATA_SLACK";
 pub const DATA_SYMBOL: &str = "GRAFT_DATA_SLACK";
 pub const TLS_SYMBOL: &str = "GRAFT_TLS_SLACK";
 
+/// The single env var that overrides slack region sizes. Its value is a
+/// comma-separated list of `region=len` pairs, e.g.
+/// `GRAFT_SLACK_LEN="text=2M,tls=0"`. Valid regions are [`REGIONS`];
+/// unset/empty means all defaults, an unlisted region keeps its default,
+/// and any typo (unknown region, malformed pair, bare number, duplicate
+/// region, empty value) is a hard error — never a silent fallback to a
+/// default that's the wrong size for the overlay. Same house policy as
+/// `GRAFT_DEBUG`: refuse to guess.
+pub const ENV: &str = "GRAFT_SLACK_LEN";
+
+/// Region names accepted in a `GRAFT_SLACK_LEN` pair. Order is the order
+/// listed in error messages (also the natural section order).
+pub const REGIONS: &[&str] = &["text", "rodata", "data", "tls"];
+
 #[derive(Debug, Clone, Copy)]
 pub struct SlackParams {
     pub text_len: u32,
@@ -63,35 +77,88 @@ pub struct SlackParams {
 }
 
 impl SlackParams {
+    /// Per-region defaults, before any `GRAFT_SLACK_LEN` override.
+    fn defaults() -> Self {
+        Self {
+            text_len: DEFAULT_TEXT_LEN,
+            rodata_len: DEFAULT_RODATA_LEN,
+            data_len: DEFAULT_DATA_LEN,
+            tls_len: DEFAULT_TLS_LEN,
+        }
+    }
+
     pub fn from_env() -> Result<Self> {
-        Ok(Self {
-            text_len: env_u32("GRAFT_TEXT_SLACK_LEN")?.unwrap_or(DEFAULT_TEXT_LEN),
-            rodata_len: env_u32("GRAFT_RODATA_SLACK_LEN")?.unwrap_or(DEFAULT_RODATA_LEN),
-            data_len: env_u32("GRAFT_DATA_SLACK_LEN")?.unwrap_or(DEFAULT_DATA_LEN),
-            tls_len: env_u32("GRAFT_TLS_SLACK_LEN")?.unwrap_or(DEFAULT_TLS_LEN),
-        })
+        let Some(raw) = std::env::var_os(ENV) else { return Ok(Self::defaults()) };
+        let s = raw
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("{ENV}: value is not valid UTF-8"))?;
+        Self::parse(s)
+    }
+
+    /// Parse a `GRAFT_SLACK_LEN` value into params, applying each
+    /// `region=len` pair on top of the per-region defaults. See [`ENV`].
+    fn parse(raw: &str) -> Result<Self> {
+        let mut params = Self::defaults();
+        let mut seen: Vec<&str> = Vec::new();
+        for tok in raw.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            let Some((region, value)) = tok.split_once('=') else {
+                bail!(
+                    "{ENV}: pair {tok:?} has no `=` — name the region explicitly, \
+                     e.g. `text={tok}` (valid regions: {}). Refusing to guess which \
+                     region a bare number means.",
+                    REGIONS.join(", ")
+                );
+            };
+            let region = region.trim();
+            if !REGIONS.contains(&region) {
+                bail!(
+                    "{ENV}: unknown region {region:?} (valid: {}). Refusing to guess.",
+                    REGIONS.join(", ")
+                );
+            }
+            if seen.contains(&region) {
+                bail!("{ENV}: region {region:?} set more than once");
+            }
+            seen.push(region);
+            let len = parse_len(region, value.trim())?;
+            match region {
+                "text" => params.text_len = len,
+                "rodata" => params.rodata_len = len,
+                "data" => params.data_len = len,
+                "tls" => params.tls_len = len,
+                _ => unreachable!("region validated against REGIONS above"),
+            }
+        }
+        Ok(params)
     }
 }
 
-/// `Ok(None)` if unset (caller uses its default); `Ok(Some(n))` if set
-/// and parseable; `Err` if set but malformed. A typo'd slack size must
-/// fail the build, not silently fall back to a default that's the wrong
-/// size for the overlay — an undersized slack would surface much later
-/// as a confusing "section will not fit in region" link error, and an
-/// oversized one silently wastes flash.
-fn env_u32(name: &str) -> Result<Option<u32>> {
-    let Some(raw) = std::env::var_os(name) else { return Ok(None) };
-    let s = raw
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("{name}: value is not valid UTF-8"))?;
-    let parsed = if let Some(hex) = s.strip_prefix("0x") {
-        u32::from_str_radix(hex, 16)
-    } else {
-        s.parse::<u32>()
+/// Parse one region's length. Accepts a decimal or `0x`-prefixed hex
+/// number, with an optional case-insensitive `K` (×1024) or `M`
+/// (×1048576) suffix — the compound `region=len` syntax invites those.
+/// An empty value, non-numeric digits, a lone unit suffix, or a value
+/// past `u32::MAX` are all hard errors naming the region.
+fn parse_len(region: &str, s: &str) -> Result<u32> {
+    if s.is_empty() {
+        bail!("{ENV}: region {region:?} has an empty value — give it a length, e.g. `{region}=64K`");
+    }
+    let (num, mult): (&str, u64) = match s.as_bytes()[s.len() - 1] {
+        b'k' | b'K' => (&s[..s.len() - 1], 1024),
+        b'm' | b'M' => (&s[..s.len() - 1], 1024 * 1024),
+        _ => (s, 1),
     };
-    parsed
-        .map(Some)
-        .map_err(|e| anyhow::anyhow!("{name}={s:?}: not a valid u32 ({e})"))
+    if num.is_empty() {
+        bail!("{ENV}: region {region:?} value {s:?} is a unit suffix with no number");
+    }
+    let base = if let Some(hex) = num.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16)
+    } else {
+        num.parse::<u64>()
+    }
+    .map_err(|e| anyhow::anyhow!("{ENV}: region {region:?} value {s:?} is not a valid number ({e})"))?;
+    base.checked_mul(mult)
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| anyhow::anyhow!("{ENV}: region {region:?} value {s:?} overflows u32"))
 }
 
 /// Build a relocatable ELF for the given architecture (mirrored from
@@ -229,4 +296,102 @@ pub fn detect_architecture(inputs: &[std::path::PathBuf]) -> Result<Architecture
         return architecture_from_e_machine(e_machine);
     }
     anyhow::bail!("graft slack: no parseable ELF input to detect architecture from");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(raw: &str) -> Result<SlackParams> {
+        SlackParams::parse(raw)
+    }
+
+    #[test]
+    fn empty_and_whitespace_keep_all_defaults() {
+        for raw in ["", "   ", ",", " , ,"] {
+            let p = parse(raw).unwrap();
+            assert_eq!(p.text_len, DEFAULT_TEXT_LEN);
+            assert_eq!(p.rodata_len, DEFAULT_RODATA_LEN);
+            assert_eq!(p.data_len, DEFAULT_DATA_LEN);
+            assert_eq!(p.tls_len, DEFAULT_TLS_LEN);
+        }
+    }
+
+    #[test]
+    fn unspecified_regions_keep_their_defaults() {
+        let p = parse("text=123").unwrap();
+        assert_eq!(p.text_len, 123);
+        assert_eq!(p.rodata_len, DEFAULT_RODATA_LEN);
+        assert_eq!(p.data_len, DEFAULT_DATA_LEN);
+        assert_eq!(p.tls_len, DEFAULT_TLS_LEN);
+    }
+
+    #[test]
+    fn multiple_regions_and_surrounding_whitespace() {
+        let p = parse(" text = 2M , tls = 0 , data=0x1000 ").unwrap();
+        assert_eq!(p.text_len, 2 * 1024 * 1024);
+        assert_eq!(p.tls_len, 0);
+        assert_eq!(p.data_len, 0x1000);
+        assert_eq!(p.rodata_len, DEFAULT_RODATA_LEN);
+    }
+
+    #[test]
+    fn numeric_formats_and_suffixes() {
+        assert_eq!(parse("text=0").unwrap().text_len, 0);
+        assert_eq!(parse("text=64").unwrap().text_len, 64);
+        assert_eq!(parse("text=0xff").unwrap().text_len, 0xff);
+        assert_eq!(parse("text=1k").unwrap().text_len, 1024);
+        assert_eq!(parse("text=1K").unwrap().text_len, 1024);
+        assert_eq!(parse("text=2m").unwrap().text_len, 2 * 1024 * 1024);
+        assert_eq!(parse("text=2M").unwrap().text_len, 2 * 1024 * 1024);
+        // hex with a suffix
+        assert_eq!(parse("text=0x10K").unwrap().text_len, 16 * 1024);
+    }
+
+    #[test]
+    fn unknown_region_is_hard_error() {
+        let e = parse("txt=1").unwrap_err().to_string();
+        assert!(e.contains("unknown region"), "{e}");
+        assert!(e.contains("text, rodata, data, tls"), "{e}");
+    }
+
+    #[test]
+    fn bare_number_without_region_is_rejected() {
+        let e = parse("0").unwrap_err().to_string();
+        assert!(e.contains("no `=`"), "{e}");
+        assert!(e.contains("name the region explicitly"), "{e}");
+    }
+
+    #[test]
+    fn empty_value_is_parse_error() {
+        let e = parse("tls=").unwrap_err().to_string();
+        assert!(e.contains("empty value"), "{e}");
+    }
+
+    #[test]
+    fn lone_suffix_is_parse_error() {
+        let e = parse("text=K").unwrap_err().to_string();
+        assert!(e.contains("unit suffix with no number"), "{e}");
+    }
+
+    #[test]
+    fn non_numeric_is_parse_error() {
+        assert!(parse("text=abc").is_err());
+        assert!(parse("text=12x").is_err());
+    }
+
+    #[test]
+    fn overflow_past_u32_is_error() {
+        // 4096 M = 4 GiB > u32::MAX.
+        let e = parse("text=4096M").unwrap_err().to_string();
+        assert!(e.contains("overflows u32"), "{e}");
+        // and a bare number past u32 too
+        assert!(parse("text=5000000000").is_err());
+    }
+
+    #[test]
+    fn duplicate_region_is_hard_error() {
+        let e = parse("text=1,text=2").unwrap_err().to_string();
+        assert!(e.contains("set more than once"), "{e}");
+    }
 }

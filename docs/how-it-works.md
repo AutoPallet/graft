@@ -74,9 +74,11 @@ real link, and graft rides alongside to record where everything landed.
    layout (this crash-looped the ESP ROM bootloader once, no link-time
    symptom). `check_slack_scooped` re-opens the output and fails the
    build loudly on any orphaned `*.graft_slack` output section. Sizes are
-   env-driven (`GRAFT_TEXT_SLACK_LEN`, …); slack is reserved once here and
-   can never grow at combine time. Bare-metal targets with no TLS runtime
-   set `GRAFT_TLS_SLACK_LEN=0` to opt the TLS balloon out.
+   env-driven via `GRAFT_SLACK_LEN` (a comma-separated list of
+   `region=len` pairs over `text`/`rodata`/`data`/`tls`); slack is
+   reserved once here and can never grow at combine time. Bare-metal
+   targets with no TLS runtime set `GRAFT_SLACK_LEN=tls=0` to opt the
+   TLS balloon out.
 
 3. **Address oracle.** graft always adds `-Wl,-Map=<output>.graft-map`.
    The linker map is the authoritative source of each input section's

@@ -93,7 +93,7 @@ GRAFT = "auto"                            # engage graft (see modes below)
 GRAFT_REAL_LD = "xtensa-esp32s3-elf-gcc"  # real linker graft forwards to
 ```
 
-Bare-metal xtensa also needs `GRAFT_TLS_SLACK_LEN = "0"` (no TLS runtime;
+Bare-metal xtensa also needs `GRAFT_SLACK_LEN = "tls=0"` (no TLS runtime;
 see env table) — full working config in
 `esp32s3-hello/.cargo/config.toml`.
 
@@ -136,10 +136,7 @@ Subcommands: `graft combine` (splice a base + overlay pair),
 | `GRAFT_BASE_ELF` | `overlay` mode: base ELF to prune against. `auto` uses its own snapshot instead. |
 | `GRAFT_REBASE` | `auto` mode: `1` forces a fresh base link, discarding the snapshot. |
 | `GRAFT_ENTRY_SYMBOL` | Move the single overlay trampoline off `main` (debugging; default `main`). |
-| `GRAFT_TEXT_SLACK_LEN` | Bytes of `.text` slack the base link reserves for future overlays. |
-| `GRAFT_RODATA_SLACK_LEN` | Bytes of `.rodata` slack reserved at base link. |
-| `GRAFT_DATA_SLACK_LEN` | Bytes of `.data` slack reserved at base link. |
-| `GRAFT_TLS_SLACK_LEN` | Bytes of TLS slack reserved; `0` opts out (bare-metal xtensa has no TLS runtime). |
+| `GRAFT_SLACK_LEN` | Slack bytes the base link reserves for future overlays, as a comma-separated list of `region=len` pairs over regions `text`, `rodata`, `data`, `tls` (e.g. `"text=2M,tls=0"`). Lengths accept decimal, `0x` hex, and case-insensitive `K`/`M` suffixes. Unset/empty keeps all defaults; an unlisted region keeps its default (`text`/`rodata` 64K, `data` 4K, `tls` 64B). `tls=0` opts out of TLS slack (bare-metal xtensa has no TLS runtime). Unknown region, malformed pair, or bare number is a hard error. |
 | `GRAFT_ICF` | `1` to enable identical-code folding (ICF): fold identical Rust code sections at base link (default off). |
 | `GRAFT_ICF_VERIFY` | Byte-level fold verifier (default on); `0` disables. |
 | `GRAFT_LOG` | Path for the per-link decision/telemetry log. |

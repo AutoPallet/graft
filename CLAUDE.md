@@ -178,7 +178,7 @@ flipped it writable, and the ESP ROM bootloader crash-looped (no
 link-time symptom; found on hardware). `check_slack_scooped` in
 base.rs now fails the build on any orphaned `*.graft_slack` output
 section; bare-metal targets without a TLS runtime opt out via
-`GRAFT_TLS_SLACK_LEN=0` (the esp32s3-hello fixture does).
+`GRAFT_SLACK_LEN=tls=0` (the esp32s3-hello fixture does).
 
 ## Content identity is only sound for immutable content
 

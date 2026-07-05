@@ -840,7 +840,7 @@ fn write_overlay_layout_ld_splice(
     let _ = writeln!(
         script,
         "ASSERT(_graft_data_end <= {:#x}, \"overlay .data/.bss overflows GRAFT_DATA_SLACK \
-         (bump GRAFT_DATA_SLACK_LEN and rebuild base)\")",
+         (raise data= in GRAFT_SLACK_LEN and rebuild base)\")",
         slack.data_start + slack.data_len
     );
     let _ = writeln!(
@@ -852,7 +852,7 @@ fn write_overlay_layout_ld_splice(
         let _ = writeln!(
             script,
             "ASSERT(_graft_tls_end <= {:#x}, \"overlay thread-locals overflow \
-             GRAFT_TLS_SLACK (bump GRAFT_TLS_SLACK_LEN and rebuild base)\")",
+             GRAFT_TLS_SLACK (raise tls= in GRAFT_SLACK_LEN and rebuild base)\")",
             t.hole_end
         );
     }
