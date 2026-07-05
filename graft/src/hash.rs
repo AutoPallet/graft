@@ -497,12 +497,9 @@ impl ContentResolver {
         graph: &Graph,
         bytes_hashes: &[blake3::Hash],
     ) -> Self {
-        use crate::elf::SymbolBind;
         let _ = objects;
         let mut section = HashMap::new();
         let mut string_pool: HashMap<(u32, u32), Vec<(u32, u32, [u8; 8])>> = HashMap::new();
-        let mut global = HashMap::new();
-        let mut local = HashMap::new();
         for (nid, nm) in graph.nodes.iter().enumerate() {
             let mut h = [0u8; 8];
             h.copy_from_slice(&bytes_hashes[nid].as_bytes()[..8]);
@@ -519,17 +516,26 @@ impl ContentResolver {
                     }
                 }
             }
-            for sym in &nm.defined_symbols {
-                match sym.bind {
-                    SymbolBind::Global | SymbolBind::Weak => {
-                        global.insert(sym.name.clone(), (h, sym.value));
-                    }
-                    SymbolBind::Local => {
-                        let tu_id = sym.tu_id.expect("local symbol must carry tu_id");
-                        local.insert((sym.name.clone(), tu_id), (h, sym.value));
-                    }
-                }
-            }
+        }
+        // Name → fingerprint maps come FROM the SymbolIndex, not from
+        // re-walking nodes: the index applies ld's bind precedence
+        // (strong over weak) and the content tiebreak for multi-defs,
+        // while the previous node-walk was last-write-wins in scan
+        // order — hashing could track a definer that resolution never
+        // binds to (review finds, task #44). One authority, per the
+        // resolve-once doctrine.
+        let fp8 = |nid: crate::graph::NodeId| -> [u8; 8] {
+            let mut h = [0u8; 8];
+            h.copy_from_slice(&bytes_hashes[nid as usize].as_bytes()[..8]);
+            h
+        };
+        let mut global = HashMap::new();
+        for (name, nid, value) in graph.symbols.globals_full_iter() {
+            global.insert(name.clone(), (fp8(nid), value));
+        }
+        let mut local = HashMap::new();
+        for (key, nid, value) in graph.symbols.locals_full_iter() {
+            local.insert(key.clone(), (fp8(nid), value));
         }
         for v in string_pool.values_mut() {
             v.sort_by_key(|&(off, _, _)| off);

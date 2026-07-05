@@ -53,6 +53,21 @@ impl SymbolIndex {
     pub fn globals_iter(&self) -> impl Iterator<Item = (&String, NodeId)> {
         self.globals.iter().map(|(n, &(v, _))| (n, v))
     }
+    /// Full global entries (name, node, st_value) — for consumers that
+    /// must agree with resolution EXACTLY (ContentResolver derives its
+    /// name→fingerprint maps from these instead of re-walking nodes,
+    /// so hashing and edge resolution cannot disagree about a name's
+    /// definer — bind precedence and tiebreaks included).
+    pub fn globals_full_iter(&self) -> impl Iterator<Item = (&String, NodeId, u64)> {
+        self.globals.iter().map(|(n, &(v, val))| (n, v, val))
+    }
+    /// Full local entries ((name, tu_id), node, st_value) — same
+    /// purpose as `globals_full_iter`.
+    pub fn locals_full_iter(
+        &self,
+    ) -> impl Iterator<Item = (&(String, [u8; 8]), NodeId, u64)> {
+        self.locals.iter().map(|(k, &(v, val))| (k, v, val))
+    }
 }
 
 /// Where one relocation points, resolved once at scan time and reused
@@ -409,27 +424,41 @@ pub fn build(
     // up overlay closures with sections whose bytes match base
     // verbatim.
     //
-    // Tiebreaker: lowest bytes_hash among all definers for the same
-    // name. Identical content → identical bytes_hash → both scans
-    // pick the same canonical. Bracket symbols (tu_id = None) are
-    // synthesized — only one definer per name, so the tiebreaker is
-    // a no-op for them.
+    // Precedence: STRONG over weak first — ld binds every reference
+    // to the strong def when both exist (the weak-default-handler /
+    // strong-override shape), and tracking the weak definer here made
+    // an edit to the STRONG body invisible to its callers' hashes
+    // (review find, task #44: scan must mirror ld's binds, not just
+    // its inclusion). Within one strength, tiebreak by lowest
+    // bytes_hash: identical content → identical bytes_hash → both
+    // scans pick the same canonical. (Two strong defs of one name are
+    // an ld error; equal-strength different-content only arises for
+    // weak+weak, where ld is link-order-dependent — content tiebreak
+    // is at least deterministic.) Bracket symbols (tu_id = None) are
+    // synthesized — only one definer per name.
     let mut symbols = SymbolIndex::default();
+    let mut global_weak: FxHashMap<String, bool> = FxHashMap::default();
     for (nid, nm) in nodes.iter().enumerate() {
         let nid = nid as NodeId;
         for sym in &nm.defined_symbols {
             match sym.bind {
                 SymbolBind::Global | SymbolBind::Weak => {
+                    let new_weak = sym.bind == SymbolBind::Weak;
                     let new_h = bytes_hash_of[nid as usize];
                     match symbols.globals.entry(sym.name.clone()) {
                         std::collections::hash_map::Entry::Vacant(v) => {
                             v.insert((nid, sym.value));
+                            global_weak.insert(sym.name.clone(), new_weak);
                         }
                         std::collections::hash_map::Entry::Occupied(mut o) => {
                             let existing = o.get().0;
+                            let existing_weak = global_weak[&sym.name];
                             let existing_h = bytes_hash_of[existing as usize];
-                            if new_h < existing_h {
+                            let wins = (existing_weak && !new_weak)
+                                || (existing_weak == new_weak && new_h < existing_h);
+                            if wins {
                                 o.insert((nid, sym.value));
+                                global_weak.insert(sym.name.clone(), new_weak);
                             }
                         }
                     }

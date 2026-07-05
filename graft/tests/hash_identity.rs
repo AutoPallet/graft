@@ -46,6 +46,15 @@ fn scan_one(obj: WObject, entry: &str) -> graft::scan::ScanResult {
     graft::scan::run(&[path], &[] as &[PathBuf], &[], &[], Some(entry)).unwrap()
 }
 
+fn scan_two(a: WObject, b: WObject, entry: &str) -> graft::scan::ScanResult {
+    let dir = tempfile::tempdir().unwrap();
+    let pa = dir.path().join("a.o");
+    let pb = dir.path().join("b.o");
+    std::fs::write(&pa, a.write().unwrap()).unwrap();
+    std::fs::write(&pb, b.write().unwrap()).unwrap();
+    graft::scan::run(&[pa, pb], &[] as &[PathBuf], &[], &[], Some(entry)).unwrap()
+}
+
 fn th(scan: &graft::scan::ScanResult, name: &str) -> [u8; 16] {
     let (nid, _) = scan
         .graph
@@ -127,6 +136,88 @@ fn callers_of_different_offsets_in_one_section_do_not_collide() {
         "byte-identical callers of different offsets in one target \
          section must not share a trans_hash (st_value lost in \
          canonicalization?)"
+    );
+}
+
+/// Weak+strong attack (task #44): a weak `handler` default and a
+/// strong override coexist; ld binds every reference to the STRONG
+/// def. The old SymbolIndex tiebroke multi-defs by content hash,
+/// ignoring bind — when the weak definer won, resolution and hashing
+/// tracked a body ld never binds, and editing the strong body was
+/// invisible to callers' hashes (stale bind after combine).
+#[test]
+fn strong_def_beats_weak_for_resolution_and_hashing() {
+    let build = |strong_imm: u8| {
+        // Object A: weak default handler + the caller.
+        let mut a = WObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let wsec = a.add_section(Vec::new(), b".text.handler_weak".to_vec(), SectionKind::Text);
+        // NB: these exact bytes WIN the content tiebreak against both
+        // strong variants below (blake3 checked offline) — the pin is
+        // only a pin if the pre-fix tiebreak would pick the weak def.
+        a.section_mut(wsec).set_data(vec![0xb8, 7, 0, 0, 0, 0xc3], 16);
+        a.add_symbol(WSymbol {
+            name: b"handler".to_vec(),
+            value: 0,
+            size: 0,
+            kind: SymbolKind::Text,
+            scope: object::write::SymbolScope::Linkage,
+            weak: true,
+            section: SymbolSection::Section(wsec),
+            flags: object::write::SymbolFlags::None,
+        });
+        let csec = a.add_section(Vec::new(), b".text.caller".to_vec(), SectionKind::Text);
+        a.section_mut(csec).set_data(call_ret(), 16);
+        global_text_symbol(&mut a, "caller", csec, 0);
+        let h = a.symbol_id(b"handler").unwrap();
+        a.add_relocation(
+            csec,
+            WRelocation {
+                offset: 1,
+                symbol: h,
+                addend: -4,
+                flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PLT32 },
+            },
+        )
+        .unwrap();
+        let msec = a.add_section(Vec::new(), b".text.main".to_vec(), SectionKind::Text);
+        a.section_mut(msec).set_data(call_ret(), 16);
+        global_text_symbol(&mut a, "main", msec, 0);
+        let c = a.symbol_id(b"caller").unwrap();
+        a.add_relocation(
+            msec,
+            WRelocation {
+                offset: 1,
+                symbol: c,
+                addend: -4,
+                flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PLT32 },
+            },
+        )
+        .unwrap();
+
+        // Object B: the strong override.
+        let mut b = WObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let ssec = b.add_section(Vec::new(), b".text.handler_strong".to_vec(), SectionKind::Text);
+        b.section_mut(ssec).set_data(vec![0xb8, strong_imm, 0, 0, 0, 0xc3], 16);
+        global_text_symbol(&mut b, "handler", ssec, 0);
+
+        scan_two(a, b, "main")
+    };
+
+    let scan = build(5);
+    // Resolution must pick the strong definer, like ld.
+    let (nid, _) = scan.graph.symbols.resolve_global("handler").unwrap();
+    let seg = scan.graph.nodes[nid as usize].segments[0];
+    assert_eq!(
+        scan.objects[seg.object as usize].sections[seg.section as usize].name,
+        ".text.handler_strong",
+        "resolution must bind the strong def, like ld"
+    );
+    // And an edit to the STRONG body must reach the caller's hash.
+    let scan2 = build(6);
+    assert_ne!(
+        th(&scan, "caller"),
+        th(&scan2, "caller"),
+        "editing the strong (ld-bound) body must change its caller's hash"
     );
 }
 
