@@ -483,15 +483,14 @@ pub fn run(scan: &ScanResult, output: &Path) -> Result<Option<IcfOutcome>> {
     group_list.sort_by_key(|(th, _)| *th); // deterministic output
     // Debug bisect knob: fold only the first N groups of the sorted
     // list. Strict parse — a typo must not silently fold everything.
-    match std::env::var("GRAFT_ICF_LIMIT") {
-        Err(std::env::VarError::NotPresent) => {}
-        Err(e) => return Err(anyhow!("GRAFT_ICF_LIMIT: {e}")),
-        Ok(v) => {
+    match crate::debug_flags::value("icf-limit")? {
+        None => {}
+        Some(v) => {
             let n: usize = v
                 .parse()
-                .map_err(|e| anyhow!("GRAFT_ICF_LIMIT={v:?}: {e}"))?;
+                .map_err(|e| anyhow!("GRAFT_DEBUG icf-limit={v:?}: {e}"))?;
             eprintln!(
-                "graft icf: GRAFT_ICF_LIMIT={n} — folding only the first {n} of {} groups",
+                "graft icf: icf-limit={n} — folding only the first {n} of {} groups",
                 group_list.len()
             );
             group_list.truncate(n);

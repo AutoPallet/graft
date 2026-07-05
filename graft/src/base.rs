@@ -78,7 +78,6 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
     // Splice is the only overlay mode, so base always carries slack
     // regions for the overlay to splice into. Detect the target arch
     // from the inputs to mirror it into the synthetic slack `.o`.
-    crate::slack::ensure_splice_mode()?;
     let arch = crate::slack::detect_architecture(&link_args.inputs)
         .context("detect target architecture from input objects")?;
     let mut argv = inject_slack(argv, arch, &output)?;
@@ -177,11 +176,11 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
     let t_post = std::time::Instant::now();
     let elf_bytes = std::fs::read(&output).with_context(|| format!("read {}", output.display()))?;
     check_slack_scooped(&elf_bytes)?;
-    if let Ok(p) = std::env::var("GRAFT_DEBUG_DUMP_GRAPH")
+    if let Some(p) = crate::debug_flags::value("dump-graph")?
         && !p.is_empty()
     {
         if let Err(e) = crate::debug_dump::dump_graph(std::path::Path::new(&p), &scan_result) {
-            eprintln!("graft base: GRAFT_DEBUG_DUMP_GRAPH write {p} failed: {e}");
+            eprintln!("graft base: GRAFT_DEBUG dump-graph write {p} failed: {e}");
         }
     }
     let map_text = std::fs::read_to_string(&map_path)

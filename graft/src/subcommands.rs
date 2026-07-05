@@ -5,17 +5,40 @@
 use std::path::Path;
 use std::process::ExitCode;
 
+use anyhow::Context;
+
 use crate::{combine, elf_attach, metadata, scan};
 
 pub fn cache_info(args: &[String]) -> ExitCode {
-    let path = match args.first() {
-        Some(p) => Path::new(p),
-        None => {
-            eprintln!("usage: graft cache-info <base.elf>");
-            return ExitCode::from(2);
+    // Positional <base.elf>, plus optional section-table filters:
+    //   --grep <substr>  only entries whose trans_hash hex contains it
+    //   --addr <addr>    only entries at this address (hex, 0x-optional)
+    let mut path: Option<&str> = None;
+    let mut grep: Option<&str> = None;
+    let mut addr: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--grep" => {
+                grep = args.get(i + 1).map(String::as_str);
+                i += 2;
+            }
+            "--addr" => {
+                addr = args.get(i + 1).map(String::as_str);
+                i += 2;
+            }
+            other if !other.starts_with('-') && path.is_none() => {
+                path = Some(other);
+                i += 1;
+            }
+            _ => i += 1,
         }
+    }
+    let Some(path) = path else {
+        eprintln!("usage: graft cache-info <base.elf> [--grep <substr>] [--addr <addr>]");
+        return ExitCode::from(2);
     };
-    match run_cache_info(path) {
+    match run_cache_info(Path::new(path), grep, addr) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("graft cache-info: {e:#}");
@@ -24,7 +47,7 @@ pub fn cache_info(args: &[String]) -> ExitCode {
     }
 }
 
-fn run_cache_info(path: &Path) -> anyhow::Result<()> {
+fn run_cache_info(path: &Path, grep: Option<&str>, addr: Option<&str>) -> anyhow::Result<()> {
     let bytes = std::fs::read(path)?;
     let manifest_bytes = elf_attach::read_section(&bytes, metadata::SECTION_MANIFEST)?
         .ok_or_else(|| anyhow::anyhow!("no {} in {}", metadata::SECTION_MANIFEST, path.display()))?;
@@ -59,21 +82,19 @@ fn run_cache_info(path: &Path) -> anyhow::Result<()> {
         sections_bytes.len()
     );
 
-    if let Ok(pat) = std::env::var("GRAFT_GREP")
-        && !pat.is_empty()
-    {
+    if let Some(pat) = grep.filter(|p| !p.is_empty()) {
         println!();
         println!("entries with trans_hash prefix matching {pat:?}:");
         for e in &table.entries {
             let hh: String = e.trans_hash.iter().map(|b| format!("{b:02x}")).collect();
-            if hh.contains(&pat) {
+            if hh.contains(pat) {
                 println!("  {:#010x}  trans_hash={hh}", e.address);
             }
         }
     }
-    if let Ok(addr_str) = std::env::var("GRAFT_ADDR")
-        && let Ok(want) = u64::from_str_radix(addr_str.trim_start_matches("0x"), 16)
-    {
+    if let Some(addr_str) = addr {
+        let want = u64::from_str_radix(addr_str.trim_start_matches("0x"), 16)
+            .with_context(|| format!("--addr {addr_str:?}: not a hex address"))?;
         println!();
         println!("entries at address {want:#x}:");
         for e in &table.entries {

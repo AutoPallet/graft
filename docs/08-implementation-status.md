@@ -561,11 +561,12 @@ Cleanup pass on M1.k:
   it to the linker argv along with `-Wl,--undefined=GRAFT_*_SLACK`
   (so `--gc-sections` keeps them). Fixtures no longer carry slack
   boilerplate.
-- **`GRAFT_OVERLAY_MODE` flag** (`splice` | `append`). Defaults to
+- **Overlay-mode flag** (`splice` | `append`). Defaults to
   `splice` on xtensa (the bootloader requires it), `append` on x86
   hosted (legacy default; can be opted into splice for delta-flash
   benefits and identical-shape images). Resolved in
-  `slack::Mode::resolve(e_machine)`.
+  `slack::Mode::resolve(e_machine)`. (Later retired: splice became
+  the only mode and the mode knob was removed entirely — see below.)
 - **Arch-neutral splice path.** `combine_xtensa_splice` →
   `combine_splice`; dispatched on `Mode` rather than `e_machine`. A
   matching x86 `write_overlay_layout_ld_splice` places overlay's
@@ -583,7 +584,7 @@ Cleanup pass on M1.k:
 
 Verified:
 - x86 e2e cycle (default `append`) — unchanged, passes.
-- x86 splice mode — `GRAFT_OVERLAY_MODE=splice` end-to-end works;
+- x86 splice mode — splice end-to-end works;
   combined ELF identical size to base, 964-byte overlay payload
   spliced, single trampoline.
 - xtensa hardware — `Hello`→`Howdy` overlay boots and runs;
@@ -742,13 +743,15 @@ gone.
 
 ### Append overlay mode retired — splice only
 
-`GRAFT_OVERLAY_MODE=append` and the entire x86-hosted append path
+The append overlay mode and the entire x86-hosted append path
 (fresh PT_LOAD past base, overlap-trim, AT_PHDR-stretch, PHT/SHT
 rewrite — the trickiest, least-tested ELF surgery in the tree) are
 gone. Splice is the only mode on every target; x86 hosted now produces
-an identical-shape combined ELF the same way xtensa does. A stale
-`GRAFT_OVERLAY_MODE=append` is a hard error (`slack::ensure_splice_mode`),
-not a silent switch. `~250` lines deleted from `combine.rs`/`overlay.rs`.
+an identical-shape combined ELF the same way xtensa does. `~250` lines
+deleted from `combine.rs`/`overlay.rs`. (The overlay-mode env knob was
+initially kept as a hard-error guard against a stale `append` value,
+then removed outright in the env-var consolidation pass — splice is
+simply the only behavior, with no env check.)
 
 ### Hardware validation (esp32s3) + section-surrogate improvement
 

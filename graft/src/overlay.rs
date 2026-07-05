@@ -118,11 +118,11 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
         base.tls = None;
     }
 
-    if let Ok(p) = std::env::var("GRAFT_DEBUG_DUMP_GRAPH")
+    if let Some(p) = crate::debug_flags::value("dump-graph")?
         && !p.is_empty()
     {
         if let Err(e) = crate::debug_dump::dump_graph(std::path::Path::new(&p), &scan) {
-            eprintln!("graft overlay: GRAFT_DEBUG_DUMP_GRAPH write {p} failed: {e}");
+            eprintln!("graft overlay: GRAFT_DEBUG dump-graph write {p} failed: {e}");
         }
     }
 
@@ -281,7 +281,6 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
     //   ORIGIN/len so overlay code/data lands in the slack past base's
     //   used flash. Everything else (alias.x, esp32s3.x, hal-defaults.x,
     //   the per-section INSERT BEFORE machinery) keeps working as-is.
-    crate::slack::ensure_splice_mode()?;
     let base_bytes_for_layout =
         std::fs::read(&base_path).with_context(|| format!("read {}", base_path.display()))?;
     let e_machine = base_e_machine(&base_bytes_for_layout)?;
@@ -1532,7 +1531,10 @@ fn node_content_addressable(nid: NodeId, scan: &ScanResult) -> bool {
 fn classify_provided(nid: NodeId, scan: &ScanResult, base: &BaseMetadata) -> bool {
     let th = scan.trans_hash[nid as usize];
     let provided = base.by_section.contains_key(&th) || base.ambiguous_sections.contains(&th);
-    if !provided && let Ok(p) = std::env::var("GRAFT_DEBUG_MISMATCH") {
+    if !provided
+        && let Some(p) = crate::debug_flags::value("mismatch").ok().flatten()
+        && !p.is_empty()
+    {
         let nm = &scan.graph.nodes[nid as usize];
         let oh: String = th[..8].iter().map(|b| format!("{b:02x}")).collect();
         let names: Vec<&str> = nm.defined_symbols.iter().map(|s| s.name.as_str()).collect();

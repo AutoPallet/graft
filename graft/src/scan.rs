@@ -58,9 +58,9 @@ pub fn run<P: AsRef<Path> + Sync>(
     // the same name for their trans_hashes to match.
     entry_symbol: Option<&str>,
 ) -> Result<ScanResult> {
-    // Optional phase-timing dump (GRAFT_SCAN_TIMINGS=<path>) — rustc
-    // swallows linker stderr on success, so a file is the only way to
-    // see this from a cargo build.
+    // Optional per-phase timing dump (`GRAFT_DEBUG=scan-timings`),
+    // written to stderr. rustc swallows linker stderr on success, so
+    // capture it via a direct `graft` invocation or `GRAFT_LOG`.
     let t0 = std::time::Instant::now();
     let mut marks: Vec<(&'static str, std::time::Duration)> = Vec::new();
 
@@ -214,9 +214,7 @@ pub fn run<P: AsRef<Path> + Sync>(
     marks.push(("tarjan", t0.elapsed()));
     let trans_hash = hash::compute(&objects, &graph, &scc);
     marks.push(("hash_compute", t0.elapsed()));
-    if let Ok(p) = std::env::var("GRAFT_SCAN_TIMINGS")
-        && !p.is_empty()
-    {
+    if crate::debug_flags::enabled("scan-timings")? {
         let mut s = String::new();
         let mut prev = std::time::Duration::ZERO;
         for (name, at) in &marks {
@@ -224,7 +222,7 @@ pub fn run<P: AsRef<Path> + Sync>(
             let _ = writeln!(s, "{name}: {:?} (cum {:?})", *at - prev, at);
             prev = *at;
         }
-        let _ = std::fs::write(&p, s);
+        eprint!("{s}");
     }
 
     Ok(ScanResult {

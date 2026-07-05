@@ -54,32 +54,6 @@ pub const RODATA_SYMBOL: &str = "GRAFT_RODATA_SLACK";
 pub const DATA_SYMBOL: &str = "GRAFT_DATA_SLACK";
 pub const TLS_SYMBOL: &str = "GRAFT_TLS_SLACK";
 
-/// Validate the `GRAFT_OVERLAY_MODE` env var. Splice is the only overlay
-/// layout strategy now: overlay's `.text` / `.rodata` are placed at
-/// base-link-time-reserved slack vaddrs and byte-spliced into base's
-/// existing segments, giving identical image shape and delta-flash
-/// friendliness on every target. The old `append` mode (a fresh PT_LOAD
-/// past base, with PHT/SHT rewrites) is gone — it was never usable on
-/// xtensa (the bootloader maps only one IROM/DROM segment) and carried
-/// the trickiest, least-tested ELF surgery in the codebase.
-///
-/// A stale `GRAFT_OVERLAY_MODE=append` (or any non-`splice` value) is a
-/// hard error rather than a silent fall-through to splice, so an old
-/// config can't quietly change layout strategy under the user.
-pub fn ensure_splice_mode() -> anyhow::Result<()> {
-    match std::env::var("GRAFT_OVERLAY_MODE").ok().as_deref() {
-        None | Some("") | Some("splice") => Ok(()),
-        Some("append") => anyhow::bail!(
-            "GRAFT_OVERLAY_MODE=append is no longer supported — splice is the only \
-             overlay mode. Unset GRAFT_OVERLAY_MODE."
-        ),
-        Some(other) => anyhow::bail!(
-            "GRAFT_OVERLAY_MODE={other:?}: the only accepted value is `splice` (the default); \
-             unset it."
-        ),
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct SlackParams {
     pub text_len: u32,

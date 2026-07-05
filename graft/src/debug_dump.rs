@@ -8,7 +8,7 @@
 //! and on which input.
 //!
 //! Wired into both `base::link` and `overlay::link` via the
-//! `GRAFT_DEBUG_DUMP_GRAPH` env var; off by default.
+//! `GRAFT_DEBUG=dump-graph=<path>` flag; off by default.
 
 use std::io::Write;
 use std::path::Path;

@@ -94,14 +94,15 @@ passthrough (a typo would otherwise ship an un-instrumented "base").
 
 Subcommands: `graft combine` (splice a base + overlay pair),
 `graft scan-dump` / `graft dup-stats` (inspect the section/hash table),
-`graft cache-info`.
+`graft cache-info <base.elf>` (dump the manifest + section table;
+`--grep <substr>` filters entries by `trans_hash` hex substring,
+`--addr <addr>` by placed address).
 
 ## Environment variables
 
 | Variable | Effect |
 |---|---|
 | `GRAFT` | Mode: unset/`passthrough`, `auto`, `base`, `overlay`. Unrecognized value is a hard error. |
-| `GRAFT_OVERLAY_MODE` | Overlay layout strategy: only `splice` (or unset) is accepted; any other value is a hard error. |
 | `GRAFT_REAL_LD` | Real linker graft execs (default `cc`; bare-metal sets e.g. `xtensa-esp32s3-elf-gcc`). |
 | `GRAFT_BASE_ELF` | `overlay` mode: base ELF to prune against. `auto` uses its own snapshot instead. |
 | `GRAFT_REBASE` | `auto` mode: `1` forces a fresh base link, discarding the snapshot. |
@@ -112,14 +113,8 @@ Subcommands: `graft combine` (splice a base + overlay pair),
 | `GRAFT_TLS_SLACK_LEN` | Bytes of TLS slack reserved; `0` opts out (bare-metal xtensa has no TLS runtime). |
 | `GRAFT_ICF` | `1` to enable identical-code folding (ICF): fold identical Rust code sections at base link (default off). |
 | `GRAFT_ICF_VERIFY` | Byte-level fold verifier (default on); `0` disables. |
-| `GRAFT_ICF_LIMIT` | Fold only the first N sorted groups (bisect knob). |
 | `GRAFT_LOG` | Path for the per-link decision/telemetry log. |
-| `GRAFT_DEBUG` | Comma-separated debug flags (`preserve-icf-inputs`). Unknown flag is a hard error. |
-| `GRAFT_DEBUG_DUMP_GRAPH` | Path to dump the closure graph. |
-| `GRAFT_DEBUG_MISMATCH` | Path to log nodes that missed a base-section match. |
-| `GRAFT_SCAN_TIMINGS` | Path for per-phase scan timing breakdown. |
-| `GRAFT_GREP` | Debug/inspection: `dup-stats` prints only section-table entries whose `trans_hash` hex contains this substring. |
-| `GRAFT_ADDR` | Debug/inspection: `dup-stats` prints only section-table entries at this address (hex, `0x`-optional). |
+| `GRAFT_DEBUG` | Comma-separated debug flags; unknown flag is a hard error. Flags: `preserve-icf-inputs`, `dump-graph=<path>` (dump the closure graph), `scan-timings` (per-phase scan timings to stderr), `icf-limit=<N>` (fold only the first N sorted ICF groups — bisect knob), `mismatch=<path>` (log nodes that missed a base-section match). |
 
 Slack is reserved once at base-link time and can never grow at combine
 time; the overlay link asserts its payload fits and bails (to a full
