@@ -10,7 +10,7 @@
 //!   5. Prune each input `.o`            (separate `prune` module; base-bound
 //!                                        relocs become UND anchor references)
 //!   6. Synthesize the base-map object   (basemap.rs: map sections at base's
-//!                                        layout define the anchors; docs/15)
+//!                                        layout define the anchors; docs/worklogs/15)
 //!   7. Exec real linker                 (pruned .o's + base map, into slack)
 //!   8. Package                          (write overlay.elf)
 //!
@@ -262,7 +262,7 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
     // either defined in the closure's own pruned .o's or resolved to a
     // constant base-derived address through a `__graft_assumed_<vaddr>`
     // anchor. Each such anchor is emitted UND by prune and defined by the
-    // synthesized base-map object (`basemap.rs`; docs/15) as a section
+    // synthesized base-map object (`basemap.rs`; docs/worklogs/15) as a section
     // symbol placed at base's layout. Combine just splices the resulting
     // sections into base; no relocation work at combine time.
     //
@@ -300,7 +300,7 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
     // pruned objects reference — section symbols in map sections
     // placed at base's layout (positional), SHF_TLS map sections for
     // template vaddrs, SHN_ABS for out-of-image constants (ROM). See
-    // `basemap.rs` / docs/15.
+    // `basemap.rs` / docs/worklogs/15.
     let slack = compute_slack(&base_bytes_for_layout)?;
     let mut anchors: Vec<(u64, bool)> = pruned
         .iter()
@@ -380,7 +380,7 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
     // detect it (scan doesn't see archive-member contributors that
     // ld pulls via `KEEP(*(.init_array .init_array.*))`). Letting
     // verify fail loud is the only signal we have. See
-    // docs/13-early-trampoline.md.
+    // docs/worklogs/13-early-trampoline.md.
     let mut assumed_names: HashMap<String, u64> = HashMap::new();
     for p in &pruned {
         for (name, addr) in &p.assumed_names {
@@ -961,7 +961,7 @@ fn verify_assumed_names(overlay_bytes: &[u8], assumed: &HashMap<String, u64>) ->
                  / etc. Their values are layout-derived and the overlay's pruned\n\
                  link produces different values from base's. graft does not yet\n\
                  patch the overlay's linker scripts to PROVIDE base's values back\n\
-                 — see docs/13-early-trampoline.md for the design and what's\n\
+                 — see docs/worklogs/13-early-trampoline.md for the design and what's\n\
                  left to implement before early-trampoline / init-code-change\n\
                  handling is real.",
             );
@@ -1063,7 +1063,7 @@ fn run_real_linker(
     // No PROVIDE-based symbol resolution: every base-bound reloc in
     // graft's pruned `.o`s is already encoded at prune time as a UND
     // reference to a `__graft_assumed_<vaddr>` anchor, which the
-    // synthesized base-map object (`basemap.rs`; docs/15) defines at
+    // synthesized base-map object (`basemap.rs`; docs/worklogs/15) defines at
     // base's layout. Every `-l<name>` archive whose content reaches the
     // closure has been walked + emitted as a filtered `.a`. Linker
     // scripts that PROVIDE() defaults for would-be-UND base symbols are

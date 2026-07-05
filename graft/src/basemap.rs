@@ -2,7 +2,7 @@
 //!
 //! Prune emits every base-bound reloc as an UND reference to
 //! `__graft_assumed_<vaddr>`; this module synthesizes the single ET_REL
-//! object that *defines* those names. The encoding rule (docs/15):
+//! object that *defines* those names. The encoding rule (docs/worklogs/15):
 //!
 //!   - vaddr inside a base PT_LOAD → ordinary symbol defined inside a
 //!     NOBITS map section placed (by layout script / `--section-start`)

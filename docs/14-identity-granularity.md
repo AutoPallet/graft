@@ -1,7 +1,7 @@
 # 14 — Identity granularity: nodes, sections, symbols
 
 Status: design note (2026-06-10, rev 3). Motivated by the open xtensa
-overlay bug (see `docs/08` § "Open: classify-vs-resolve inconsistency"
+overlay bug (see `docs/worklogs/08` § "Open: classify-vs-resolve inconsistency"
 and `CLAUDE.md`).
 
 > **Rev history.** Rev 1 proposed per-*symbol* nodes — retracted as

@@ -25,7 +25,7 @@ encoding):
 - many of those 24 have byte-identical content to base — they ride
   along purely because there's no name to PROVIDE against
 
-Cf. `docs/10-mutation-experiments.md` §"Hypothesis", which ascribes
+Cf. `docs/worklogs/10-mutation-experiments.md` §"Hypothesis", which ascribes
 the original `fallback-string` cliff to the same pattern at 1000×
 scale.
 
@@ -187,7 +187,7 @@ Replicate on x86 fixture first:
    misresolution, no boot regression.
 
 Then rerun the reference-corpus mutation matrix
-(`docs/10-mutation-experiments.md`) and look for:
+(`docs/worklogs/10-mutation-experiments.md`) and look for:
 
 - wifi-numeric: 100 → ~70 sections (drop the 24 anon ride-alongs +
   cascade tail).

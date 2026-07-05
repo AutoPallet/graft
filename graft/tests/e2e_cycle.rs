@@ -389,7 +389,7 @@ fn full_cycle() {
     assert!(out.contains("ticks = 1,1,2,2"), "G: {out}");
     fx.edit("base/src/lib.rs", ".wrapping_add(100)", ".wrapping_add(0)");
 
-    // H. TLS reference (docs/15 mechanism (c)): re-emit `tl_step` while
+    // H. TLS reference (docs/worklogs/15 mechanism (c)): re-emit `tl_step` while
     //    TL_ACC / TL_ZERO stay base-resident. The re-emitted code's
     //    TPOFF relocs anchor into graft's SHF_TLS map sections and ld
     //    recomputes the SAME TP offsets from the reproduced template

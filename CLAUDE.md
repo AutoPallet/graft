@@ -86,7 +86,7 @@ populates the GOT slot with the symbol *value* `S` (= 0), not
 
 The fix is per-target SHN_ABS symbols (`__graft_sym_<symhash>`,
 st_value = vaddr) where the GOT slot ends up holding `vaddr`
-directly. See `docs/11-anon-provide.md` and M1.t.
+directly. See `docs/worklogs/11-anon-provide.md` and M1.t.
 
 If you're tempted to special-case a reloc type by patching
 instruction bytes (mov→lea, etc.), step back and check whether
@@ -125,7 +125,7 @@ cosmetic:
    absolutes, ROM/PROVIDE, prebuilt libs). Ambiguous base names
    (multiple distinct addresses) bail.
 
-Anchor encoding (docs/15, `basemap.rs`): prune emits anchors as UND
+Anchor encoding (docs/worklogs/15, `basemap.rs`): prune emits anchors as UND
 `__graft_assumed_<vaddr>` references; ONE synthetic base-map object
 defines them — as section symbols inside NOBITS map sections placed at
 base's layout (positional content; PIE-compatible), in SHF_TLS map
@@ -207,8 +207,10 @@ members share a hash, `by_section[th]` is ill-defined: base records
 one hash at two addresses, the ambiguity machinery treats them as
 "identical copies", and resolution lands in the wrong section (M2:
 `ram_resident_step` resolved into the middle of the literal pool —
-runtime jump to garbage). The per-node hash is
-`blake3(scc_hash ‖ member_input_hash)` (see `hash::compute`). Never
+runtime jump to garbage). The per-node hash comes from per-SCC
+color refinement: `trans_hash(n) = blake3(scc_hash ‖ color(n))`,
+where `color(n)` is n's class in the coarsest bisimulation partition
+of the SCC (see `hash.rs` header). Never
 "simplify" it back to the bare SCC hash; equality of trans_hash must
 mean "interchangeable bytes at a recoverable address."
 

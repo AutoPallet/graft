@@ -25,7 +25,7 @@
 //! one place (`resolve::Resolver`), shared with the closure walk, so
 //! inclusion and resolution cannot drift.
 //!
-//! See `docs/11-anon-provide.md` and `docs/14-identity-granularity.md`.
+//! See `docs/worklogs/11-anon-provide.md` and `docs/14-identity-granularity.md`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -162,7 +162,7 @@ pub fn prune_object(
     // holds the target's address; with S=0 the slot would hold 0
     // and the addend would miscombine into the instruction's disp.
     // PC32/ABS-style relocs are unaffected — they fold S+A directly.
-    // See `docs/11-anon-provide.md` and docs/15.
+    // See `docs/worklogs/11-anon-provide.md` and docs/worklogs/15.
     let mut addr_syms: HashMap<u64, (SymbolId, bool)> = HashMap::new();
     // UND symbols emitted on request, deduped by (name, weak).
     let mut und_syms: HashMap<(String, bool), SymbolId> = HashMap::new();

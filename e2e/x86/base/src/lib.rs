@@ -83,7 +83,7 @@ pub fn cycle_run(x: u32) -> u32 {
     STEP_TABLE[(x & 1) as usize](x).wrapping_add(0)
 }
 
-// Thread-local state, exercising the TLS resolution paths (docs/15
+// Thread-local state, exercising the TLS resolution paths (docs/worklogs/15
 // mechanism (c)): `.tdata` (non-zero const init → initialized template
 // bytes) and `.tbss` (zero init). `tl_step` is the edit site for the
 // "reference unchanged base TLS" scenario; editing the *initializer*

@@ -5,6 +5,8 @@ edit changed, splice it into the previous binary, and flash only the
 sectors that differ. No hot-patching, no runtime — the output is an
 ordinary ELF that boots the normal way.
 
+How it actually works: [`docs/how-it-works.md`](docs/how-it-works.md).
+
 A full build links a **base** image once, recording where every input
 section landed. After an edit, graft links only the transitive closure of
 sections whose content changed — everything else resolves positionally
@@ -13,6 +15,33 @@ base link reserves up front — so the base image's layout never shifts. A
 sector-diff flasher (`docker/flash-diff.py`) then writes
 only the changed 4KB sectors, identified through per-sector hash
 manifests keyed by the image's appended SHA-256.
+
+```
+BASE IMAGE (linked once; slack balloons reserved up front)
+
+  +----------+----------------+------------+-------------+-----------+------------+
+  |  .text   | GRAFT_TEXT     |  .rodata   | GRAFT_RO... |  .data    | GRAFT_DATA |
+  |  code    |  _SLACK        |  consts    |  _SLACK     |  statics  |  _SLACK    |
+  |          | (0xFF balloon) |            | (balloon)   |           | (balloon)  |
+  +----------+----------------+------------+-------------+-----------+------------+
+     foo()          ^                                        ^
+                    |                                        |
+   edit foo() -> overlay link emits only the changed closure |
+                    |                                        |
+                    v  splice new foo' into .text balloon    v  new/changed statics
+  +----------+----------------+------------+-------------+-----------+------------+
+  |  .text   | foo'  (spliced |  .rodata   | (unchanged) |  .data    | (spliced)  |
+  |  code    |  into slack)   |  consts    |             |  statics  |            |
+  +----+-----+----------------+------------+-------------+-----------+------------+
+       |          ^                             ^
+       | trampoline (long jump)                 | unchanged refs in foo' resolve
+       +--> foo'                                 | POSITIONALLY into base via
+   old foo() entry redirected to new copy        anchors (base addr as constant)
+```
+
+Unchanged references never move: an anchor pins them to base's address
+as a constant. Only foo's entry is trampolined; the rest of base is
+byte-for-byte untouched, which is what makes the sector-diff flash cheap.
 
 **Status:** research prototype. Validated on ESP32-S3 hardware (xtensa,
 bare metal and esp-idf/std) and on x86_64-musl (rust-analyzer). Not
@@ -125,9 +154,13 @@ relink under `auto`) if not.
 GNU ld rewrites xtensa code as it links (deleting, narrowing, and
 widening instructions), so an input byte's address in the base image
 can't be computed by offset. graft replays ld's exact set of edits —
-transcribed from binutils source — to locate each byte, and forces a
-re-link of any section it can't fully account for
-(`docs/16-relaxation-walk.md`). It accounts for all 10,000 relaxed
+transcribed from binutils source — to locate each byte
+(`docs/16-relaxation-walk.md`). When it can't account for a byte, a
+read-only or executable target is re-emitted into the overlay (base's
+code keeps calling its own copy), while a refusal on mutable data is a
+hard error, since re-emitting would fork the variable into two live
+copies. Under `GRAFT=auto` any such error falls back to a full relink.
+It accounts for all 10,000 relaxed
 sections in the reference corpus, and the same engine verifies
 470,558/470,558 sections on x86-64 (where no relaxation occurs) as a
 self-check.
@@ -138,7 +171,8 @@ self-check.
 - `esp32s3-hello/` — bare-metal fixture
 - `docker/` (repo root) — `hw-test.sh` hardware loop, `flash-diff.py`
   manifest-based sector-diff flasher
-- `docs/` — design notes and post-mortems (start at `docs/README.md`)
+- `docs/` — maintained design docs (`how-it-works.md`, 14, 16, 07) plus
+  `docs/worklogs/` write-once records (start at `docs/README.md`)
 
 ## License
 

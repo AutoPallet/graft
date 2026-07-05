@@ -17,7 +17,7 @@ Everything through M1.l held; the substantial changes since:
   mutable (writable/bss) sections get a nominal salt so distinct
   variables never content-fold. Resolution lives in one place
   (`resolve.rs`); prune is a dumb rewriter. See docs/14.
-- **Section anchors via a base-map object** (docs/15): overlay emits
+- **Section anchors via a base-map object** (docs/worklogs/15): overlay emits
   `__graft_assumed_<vaddr>` UND refs, one synthetic object defines them
   as section symbols in NOBITS/TLS map sections at base's layout.
   PIE-compatible; ld owns all TLS/tpoff arithmetic. PIE/dynamic and the
