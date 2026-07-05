@@ -4,7 +4,7 @@ Status: knowledge dump from the `relaxwalk` prototype
 (`graft/src/bin/relaxwalk.rs`, commit `37c6916`), written to enable a
 clean-sheet reimplementation. The prototype hit **100.0% (10,000/10,000)**
 (early drafts said 9,204; that was a v1 map-parser bug — see below) on
-the roborack deploy corpus using only transforms transcribed from
+the reference ESP32 corpus using only transforms transcribed from
 binutils source. It is also ~1,400 lines of very ISA-specific code; the
 goal of the rewrite is the same result with a small generic engine and
 the xtensa knowledge reduced to data tables.
@@ -54,8 +54,8 @@ Ground rules (standing, from CLAUDE.md and Eric):
 ## 2. The transform alphabet (binutils `bfd/elf32-xtensa.c`)
 
 Source of truth: espressif/binutils-gdb tag **`esp-2.45.0_20250920`**
-(what crosstool-NG esp-15.2.0_20250920 builds; this is roborack's
-toolchain — *not* esp-12.2 as an earlier note claimed). Fetch:
+(what crosstool-NG esp-15.2.0_20250920 builds; this is the reference
+corpus's toolchain — *not* esp-12.2 as an earlier note claimed). Fetch:
 
     https://raw.githubusercontent.com/espressif/binutils-gdb/esp-2.45.0_20250920/bfd/elf32-xtensa.c
 
@@ -362,12 +362,12 @@ Corpus (12,123 relaxed-section map annotations; 9,206 exec/literal):
 - regenerate: in container `graft-rr2`, replay the captured link argv
   (`/tmp/link-argv.txt`, wrapper `/tmp/capture-linker.sh` — must NOT
   be named `*-ld` or rustc flips linker flavor) adding
-  `-Wl,-Map=/workspaces/roborack/target/corpus.map`;
-- linked ELF: `~/roborack2/target/xtensa-esp32s3-espidf/vehicle/deps/deploy-2a131fb3ee41be93`;
+  `-Wl,-Map=/path/to/project/target/corpus.map`;
+- linked ELF: `/path/to/project/target/xtensa-esp32s3-espidf/vehicle/deps/deploy-2a131fb3ee41be93`;
 - run from
-  `~/roborack2/target/xtensa-esp32s3-espidf/vehicle/build/esp-idf-sys-b8b4dafca91fe4cc/out/build`
+  `/path/to/project/target/xtensa-esp32s3-espidf/vehicle/build/esp-idf-sys-b8b4dafca91fe4cc/out/build`
   (map archive paths are relative to it) with
-  `--path-map /workspaces/roborack=/path/to/roborack2`.
+  `--path-map /workspaces/project=/path/to/project`.
 
 A reimplementation is accepted when, on this exact corpus:
 

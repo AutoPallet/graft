@@ -17,7 +17,7 @@ contains an entry under its symbol name with a matching trans_hash.
 Anons have no symbol → can't appear in symhash → can never be
 Provided → always Included whenever the closure walk reaches them.
 
-Empirical impact (roborack3 wifi-numeric, post content-stable
+Empirical impact (reference-corpus wifi-numeric, post content-stable
 encoding):
 
 - 100 sections in closure
@@ -118,7 +118,7 @@ linker scale limits.
 ### Cost
 
 - One extra symtab row per *unique base-resolution target* per
-  pruned `.o` (~24 bytes ELF64 each). Roborack3-scale: order
+  pruned `.o` (~24 bytes ELF64 each). Reference-corpus scale: order
   hundreds-to-low-thousands across the whole build.
 - O(reloc-records-touching-base) byte rewrites in `.rela.*`
   sections of input `.o`s. Cheap; happens during prune.
@@ -186,7 +186,7 @@ Replicate on x86 fixture first:
 4. End-to-end: overlay loads on hardware, no NVS-style address
    misresolution, no boot regression.
 
-Then rerun the roborack3 mutation matrix
+Then rerun the reference-corpus mutation matrix
 (`docs/10-mutation-experiments.md`) and look for:
 
 - wifi-numeric: 100 → ~70 sections (drop the 24 anon ride-alongs +

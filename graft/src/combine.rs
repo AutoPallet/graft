@@ -490,8 +490,8 @@ pub struct Trampoline {
 
 /// Locate an image's build-id bytes: the window between
 /// `__build_id_start` and `__build_id_end` minus the 16-byte ELF note
-/// header (esp-idf linker-script convention; same layout roborack's
-/// `read_deploy_bin_build_id` reads). Returns (file_offset, id_len).
+/// header (esp-idf linker-script convention; same layout the reference
+/// ESP32 application's `read_deploy_bin_build_id` reads). Returns (file_offset, id_len).
 fn build_id_window(obj: &object::File, loads: &[Phdr]) -> Result<Option<(usize, usize)>> {
     use object::{Object, ObjectSymbol};
 

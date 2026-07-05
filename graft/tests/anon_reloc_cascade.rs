@@ -10,7 +10,7 @@
 //! are the same and its semantic dependency is the same content. If
 //! `encode_relocs` includes the (unstable, build-noise) anon section
 //! name verbatim, the hashes will differ instead, which is the
-//! cascade we observed in the roborack3 mutation experiments.
+//! cascade we observed in the reference-corpus mutation experiments.
 //!
 //! Background: rustc emits compiler-generated rodata constants under
 //! names like `.rodata..Lanon.<cgu-fingerprint>.<n>`. Both the
@@ -131,7 +131,7 @@ fn foo_hash_stable_under_anon_section_rename() {
         "foo's trans_hash should be stable when the only difference between two builds is \
          compiler-internal anon-section naming (CGU fingerprint + sequence index). \
          Differing here means encode_relocs serializes the unstable target name verbatim, \
-         which is the cascade observed in the roborack3 fallback-string experiment."
+         which is the cascade observed in the reference-corpus fallback-string experiment."
     );
 }
 

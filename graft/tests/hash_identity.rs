@@ -679,7 +679,7 @@ fn icf_verifier_rejects_transitively_different_pairs() {
     );
 }
 
-/// Mid-pool symbol attack (task #46 dissection, the roborack
+/// Mid-pool symbol attack (task #46 dissection, the reference-corpus
 /// "Down\0time\0" shape): LLVM places two string constants in one pool
 /// section and a named symbol points at the SECOND entry (st_value ≠ 0).
 /// Another TU carries only "time\0" at offset 0. The two callers

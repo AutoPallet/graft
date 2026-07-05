@@ -503,7 +503,7 @@ fn entry_cut_keeps_caller_in_base() {
 /// assert on payload bytes and leave room for the closure to carry
 /// dozens of trivial-pass-through sections.
 ///
-/// This test mirrors the M1.q.1 roborack3 mutation matrix on x86 so
+/// This test mirrors the M1.q.1 reference-corpus mutation matrix on x86 so
 /// we can iterate the canonicalization fixes locally.
 #[test]
 #[ignore]
@@ -563,7 +563,7 @@ fn payload_sizes_for_typical_edits() {
     fx.edit("app/src/main.rs", r#"greet("world")"#, r#"greet("graft")"#);
 
     // D. introduce a format/println call into a function that
-    //    previously had none. This is the roborack3 fallback-string
+    //    previously had none. This is the reference-corpus fallback-string
     //    pattern. Format infra is already in base (app uses println!
     //    everywhere); reaching it from compute should hit Provided
     //    after one hop, not cascade through everything.

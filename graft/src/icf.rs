@@ -4,7 +4,7 @@
 //! GNU ld has no ICF, and on xtensa-espidf rustc emits cross-crate
 //! monomorphization copies as internalized LOCAL symbols with no COMDAT
 //! groups and no weak symbols — so nothing in the toolchain ever folds
-//! them (measured on roborack: 1.23 MB of exec bytes = 22.5% of the
+//! them (measured on the reference corpus: 1.23 MB of exec bytes = 22.5% of the
 //! image; see `graft dup-stats`). graft's `trans_hash` is a sound fold
 //! criterion: equality means the sections' bytes, canonicalized relocs,
 //! and entire successor subgraphs are identical — strictly stronger
@@ -31,7 +31,7 @@
 //! makes a member in an earlier archive satisfy a reference that only
 //! materializes when a later archive's member loads — ld never
 //! revisits, and the link dies with "hidden symbol isn't defined"
-//! (observed on roborack). With a weak definition in the same object
+//! (observed on the reference corpus). With a weak definition in the same object
 //! as every reference, no cross-object undef ever exists: archive
 //! member selection is bit-identical to the unfolded link, any loaded
 //! subset of copies self-resolves, and the winner is simply the first
@@ -107,7 +107,7 @@ pub const ENV: &str = "GRAFT_ICF";
 
 /// Parse `GRAFT_ICF`. Unset/empty → off (graft itself stays
 /// conservative; projects that have validated folding on their target
-/// opt in via config — roborack sets `GRAFT_ICF=1` in `.cargo/config`).
+/// opt in via config — the reference ESP32 app sets `GRAFT_ICF=1` in `.cargo/config`).
 /// `1`/`on`/`rust` → on, `0`/`off` → off. Anything else is a hard
 /// error — never a silent fallthrough (same policy as the `GRAFT`
 /// mode variable).

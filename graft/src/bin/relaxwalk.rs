@@ -17,7 +17,7 @@
 //! against. Examples:
 //!
 //!   relaxwalk --map corpus.map --elf <linked-elf> \
-//!             --path-map /workspaces/roborack=/path/to/roborack2
+//!             --path-map /workspaces/project=/path/to/project
 //!   relaxwalk --arch x86 --map base.graft-map --elf <base-elf>
 
 use graft::relax::engine;

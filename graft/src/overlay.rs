@@ -203,7 +203,7 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
         HashSet::new()
     };
     let resolver_wrapped: HashSet<String> = link_args.wrapped.iter().cloned().collect();
-    // Count how many anchors the walk actually re-homed — the roborack
+    // Count how many anchors the walk actually re-homed — the reference-corpus
     // failure mode was exactly these, so surface them in the summary.
     let walk_translated = std::cell::Cell::new(0usize);
     let translate: Box<crate::resolve::TranslateFn<'_>> = match &walker {

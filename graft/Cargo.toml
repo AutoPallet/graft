@@ -4,6 +4,8 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+description = "Incremental linker: relinks only what an edit changed and splices it into the previous binary"
+license = "MIT OR Apache-2.0"
 
 [lib]
 path = "src/lib.rs"

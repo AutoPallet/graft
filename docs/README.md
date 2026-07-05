@@ -54,15 +54,12 @@ shares none of Subsecond's runtime; these are kept for context only.
   M1-era milestone log (built-vs-plan, decisions changed, numbers).
   Historical; the "Current state" header at the top points to what
   shipped since.
-- [`09-roborack3.md`](./09-roborack3.md) — bring-up notes for running
-  graft as the base linker on a large real ESP32-S3 firmware.
 - [`10-mutation-experiments.md`](./10-mutation-experiments.md) — closure
-  cost / per-phase timing under small source mutations on that firmware.
+  cost / per-phase timing under small source mutations on the reference
+  ESP32 firmware.
 - [`11-anon-provide.md`](./11-anon-provide.md) — how anonymous
   (symbol-less) sections are resolved via per-target SHN_ABS symbols.
   Implemented.
-- [`12-roborack3-demo.md`](./12-roborack3-demo.md) — recipe for the
-  hardware overlay-flash demo.
 - [`13-early-trampoline.md`](./13-early-trampoline.md) — design note,
   not implemented: what breaks if the trampoline moves before startup
   finishes.

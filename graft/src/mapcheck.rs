@@ -4,7 +4,7 @@
 //! back-computing per-input addresses from symbols drifts the moment ld
 //! relaxes a section (xtensa: deleted bytes shift every later symbol,
 //! so `final − st_value` no longer points at the section start — the
-//! roborack deploy failure). The linker map states the placement fact
+//! reference-corpus link failure). The linker map states the placement fact
 //! directly per input section — address, size, and the pre-relaxation
 //! size — so base mode always asks the real linker for a map and builds
 //! the section table from it.

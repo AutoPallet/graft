@@ -478,7 +478,7 @@ fn oversized_group_folds_as_chunks() {
 /// Three "wrapper towers" `wrap_i → helper_i → leaf_i` where the wrap
 /// and helper bytes are identical across towers and only the leaves
 /// differ (`mov eax, 42+i`), cross-linked `leaf_i → wrap_{(i+1)%3}` so
-/// all nine sections weld into ONE SCC — the roborack fmt/panic
+/// all nine sections weld into ONE SCC — the reference-corpus fmt/panic
 /// mega-SCC in miniature (write_fmt text / literal+vtable / write_str).
 /// The pre-refinement hash gave every member `H(shared scc_hash ‖
 /// one-hop bytes-only member hash)`, so the wrappers collided and ICF
