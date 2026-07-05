@@ -641,10 +641,13 @@ pub fn run(scan: &ScanResult, output: &Path) -> Result<Option<IcfOutcome>> {
              verification — refusing to fold (GRAFT_ICF_VERIFY=0 bypasses, \
              at the cost of shipping the unverified fold)",
         )?;
-        eprintln!(
-            "graft icf: verified {} fold pairs byte-interchangeable in {:.1?}",
-            verify_pairs.len(),
-            t.elapsed()
+        crate::telemetry::note(
+            output,
+            &format!(
+                "graft icf: verified {} fold pairs byte-interchangeable in {:.1?}",
+                verify_pairs.len(),
+                t.elapsed()
+            ),
         );
     }
 

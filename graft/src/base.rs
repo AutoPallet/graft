@@ -122,20 +122,23 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
         let mut icf_work_dir = None;
         if let Some(outcome) = crate::icf::run(&scan_result, &output)? {
             let s = &outcome.stats;
-            eprintln!(
-                "graft icf: folded {} groups ({} chunked at {} copies) · dropped {} \
-                 copies · {} input bytes · rewrote {} objects in {} archives \
-                 (skipped: {} weak-def, {} name-mismatch, {} mechanical)",
-                s.groups_folded,
-                s.groups_chunked,
-                crate::icf::MAX_PARTICIPANTS,
-                s.copies_dropped,
-                s.bytes_dropped,
-                s.rewritten_objects,
-                s.rewritten_archives,
-                s.skipped_weak_def,
-                s.skipped_name_mismatch,
-                s.skipped_mechanical,
+            crate::telemetry::note(
+                &output,
+                &format!(
+                    "graft icf: folded {} groups ({} chunked at {} copies) · dropped {} \
+                     copies · {} input bytes · rewrote {} objects in {} archives \
+                     (skipped: {} weak-def, {} name-mismatch, {} mechanical)",
+                    s.groups_folded,
+                    s.groups_chunked,
+                    crate::icf::MAX_PARTICIPANTS,
+                    s.copies_dropped,
+                    s.bytes_dropped,
+                    s.rewritten_objects,
+                    s.rewritten_archives,
+                    s.skipped_weak_def,
+                    s.skipped_name_mismatch,
+                    s.skipped_mechanical,
+                ),
             );
             argv = crate::icf::substitute_argv(argv, &outcome.replacements);
             icf_work_dir = Some(outcome.work_dir);

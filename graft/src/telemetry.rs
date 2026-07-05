@@ -6,6 +6,36 @@ use std::time::Duration;
 
 use crate::argv::LinkArgs;
 
+/// Resolve the graft log path for a link output: `$GRAFT_LOG`, or
+/// `<output>.graft.log` next to the output.
+fn log_path_for(output: &std::path::Path) -> PathBuf {
+    env::var_os("GRAFT_LOG").map(PathBuf::from).unwrap_or_else(|| {
+        let mut q = output.to_path_buf();
+        let name = format!(
+            "{}.graft.log",
+            output.file_name().and_then(|s| s.to_str()).unwrap_or("link")
+        );
+        q.set_file_name(name);
+        q
+    })
+}
+
+/// Print a status line to stderr AND append it to the graft log.
+/// rustc captures the linker's stderr and filters non-diagnostic output
+/// on successful links, so any line that should be visible after a
+/// plain `cargo build` must also go to the log file.
+pub fn note(output: &std::path::Path, line: &str) {
+    eprintln!("{line}");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path_for(output))
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 /// Append one telemetry line to `<output>.graft.log` (override with
 /// `$GRAFT_LOG`). rustc captures the linker's stderr and filters
 /// non-diagnostic output, so file logging is the only reliable channel.

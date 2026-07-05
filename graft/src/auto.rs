@@ -73,22 +73,7 @@ fn rebase_requested() -> Result<bool> {
 /// mirror every decision into the graft log file (`$GRAFT_LOG`, or
 /// `<output dir>/<output>.graft.log`), same channel telemetry uses.
 fn note(output: &Path, msg: &str) {
-    eprintln!("graft auto: {msg}");
-    let log_path = std::env::var_os("GRAFT_LOG").map(PathBuf::from).unwrap_or_else(|| {
-        let mut q = output.to_path_buf();
-        let name = format!(
-            "{}.graft.log",
-            output.file_name().and_then(|s| s.to_str()).unwrap_or("link")
-        );
-        q.set_file_name(name);
-        q
-    });
-    if let Ok(mut f) =
-        std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
-    {
-        use std::io::Write;
-        let _ = writeln!(f, "graft auto: {msg}");
-    }
+    crate::telemetry::note(output, &format!("graft auto: {msg}"));
 }
 
 fn run(argv: Vec<String>) -> Result<()> {
