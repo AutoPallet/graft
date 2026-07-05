@@ -112,8 +112,7 @@ fn node_identity_hashes_with(
                 let bytes = seg.bytes_in(&objects[seg.object as usize].sections);
                 // Per-segment length framing: without it, multi-
                 // segment (aggregator) nodes with different byte
-                // boundaries could concatenate to identical streams
-                // (review find: framing ambiguity).
+                // boundaries could concatenate to identical streams.
                 h.update(&(bytes.len() as u64).to_le_bytes());
                 h.update(bytes);
                 if seg.range.is_none()
@@ -137,9 +136,9 @@ fn node_identity_hashes_with(
 /// are only unique per TU, and without it two C files' same-named
 /// file-local statics (`static int counter;` in a.c and b.c) produced
 /// identical salts — identical trans_hash for two DISTINCT mutable
-/// variables, the exact M2 aliasing class the salt exists to prevent
-/// (review find: nominal-salt TU-blindness). tu_id is
-/// blake3(STT_FILE)[:8] — content-stable across rebuilds, unlike
+/// variables, the exact M2 aliasing class the salt exists to prevent.
+/// tu_id is blake3(STT_FILE)[:8] — content-stable across rebuilds,
+/// unlike
 /// object indexes. Global names are program-unique already; salting
 /// them with tu_id would only churn identity when a static moves
 /// between CGUs.
@@ -210,8 +209,7 @@ pub fn compute(
 
 /// `compute` plus each node's containing-SCC hash — the diagnostic
 /// dump prints both so divergence localizes to "member color" vs
-/// "SCC transitive content" (its scc_hash column used to just repeat
-/// trans_hash).
+/// "SCC transitive content".
 pub fn compute_detailed(
     objects: &[ParsedObject],
     graph: &Graph,
@@ -577,8 +575,7 @@ impl ContentResolver {
         // (strong over weak) and the content tiebreak for multi-defs,
         // while the previous node-walk was last-write-wins in scan
         // order — hashing could track a definer that resolution never
-        // binds to (review finds, task #44). One authority, per the
-        // resolve-once doctrine.
+        // binds to. One authority, per the resolve-once doctrine.
         let fp8 = |nid: crate::graph::NodeId| -> [u8; 8] {
             let mut h = [0u8; 8];
             h.copy_from_slice(&bytes_hashes[nid as usize].as_bytes()[..8]);
@@ -590,14 +587,13 @@ impl ContentResolver {
         // fingerprint. Edges and slot streams already cut these to
         // external sentinels; leaving the fingerprint here meant an
         // entry edit still dirtied every direct caller's member hash,
-        // defeating the cut's documented purpose (review find, #45).
+        // defeating the cut's documented purpose.
         // Symbols defined inside a split string pool attach to the
         // per-string sub-node, whose fingerprint origin is the STRING
         // start — but st_value is SECTION-relative. Rebase the stored
         // value to the node's own origin, or the canonical addend
         // double-counts the string's pool offset and the symbol-form
-        // encoding diverges from section-form for the same byte
-        // (review find: pooled-symbol st_value double-count).
+        // encoding diverges from section-form for the same byte.
         let rebased = |nid: crate::graph::NodeId, value: u64| -> u64 {
             match graph.nodes[nid as usize].segments.first().and_then(|s| s.range) {
                 Some((off, _)) => value.saturating_sub(off as u64),
@@ -621,8 +617,8 @@ impl ContentResolver {
         // Cross-TU local refs resolve through locals_any_tu in edge
         // building; without the same fallback here they canonicalized
         // as their RAW names — which carry `.llvm.<id>` suffixes, the
-        // exact CGU noise this canonicalization exists to erase
-        // (review find: any_tu churn). Diverged names were purged
+        // exact CGU noise this canonicalization exists to erase.
+        // Diverged names were purged
         // from the map at graph build, so every entry is content-
         // unique.
         let mut local_any = HashMap::new();
@@ -678,8 +674,7 @@ impl ContentResolver {
                 // NEVER the bare section name: `.rodata.str1.1` is
                 // identical across objects, so the name collided
                 // referrers of different strings and carried no
-                // content — string edits were invisible to the hash
-                // (review find, task #43).
+                // content — string edits were invisible to the hash.
                 let mut h = blake3::Hasher::new();
                 for &(off, len, fp) in strings {
                     h.update(&off.to_le_bytes());

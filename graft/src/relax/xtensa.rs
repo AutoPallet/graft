@@ -423,8 +423,7 @@ pub fn extract_input(
 
 // Ground-truth bytes assembled with xtensa-esp32s3-elf-as
 // (esp-15.2.0_20250920) and read back with readelf -x; ported verbatim
-// from the v1 prototype per docs/16 §3. These catch every field-layout
-// mistake made along the way.
+// from the v1 prototype per docs/16 §3.
 #[cfg(test)]
 mod tests {
     use super::*;

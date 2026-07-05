@@ -111,9 +111,6 @@ fn callers_of_different_offsets_in_one_section_do_not_collide() {
     code.push(0xc3);
     obj.section_mut(msec).set_data(code, 16);
     global_text_symbol(&mut obj, "main", msec, 0);
-    // Symbols were already added; look them up again by re-adding
-    // relocations against fresh undefined refs is wrong — reuse the
-    // defined ids via a second pass instead.
     let call_lo_sym = obj.symbol_id(b"call_lo").unwrap();
     let call_hi_sym = obj.symbol_id(b"call_hi").unwrap();
     for (off, sym) in [(1u64, call_lo_sym), (6u64, call_hi_sym)] {

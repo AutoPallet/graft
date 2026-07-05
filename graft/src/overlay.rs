@@ -1,19 +1,21 @@
 //! Overlay mode: re-link, pruned against a prior base build.
 //!
-//! Pipeline (per doc 06 § "Overlay mode"):
+//! Pipeline:
 //!   1. Parse argv                       (argv::parse)
 //!   2. Load base metadata               (from `GRAFT_BASE_ELF`)
 //!   3. Hash + graph overlay's inputs    (scan::run)
 //!   4. Compute closure                  (reachability walk from `main`,
 //!                                        with per-section trans_hash
 //!                                        match against base's section table)
-//!   5. Prune each input `.o`            (separate `prune` module)
-//!   6. Generate base_symbols.ld         (PROVIDE entries for hits)
-//!   7. Exec real linker                 (with pruned .o's + scripts)
-//!   8. Package                          (M0.5: just write overlay.elf)
+//!   5. Prune each input `.o`            (separate `prune` module; base-bound
+//!                                        relocs become UND anchor references)
+//!   6. Synthesize the base-map object   (basemap.rs: map sections at base's
+//!                                        layout define the anchors; docs/15)
+//!   7. Exec real linker                 (pruned .o's + base map, into slack)
+//!   8. Package                          (write overlay.elf)
 //!
-//! Steps 1–4 + 6 live here; pruning lives in `prune.rs`; step 7 shells
-//! out to the real `ld` via `$GRAFT_REAL_LD`.
+//! Steps 1–4 live here; pruning in `prune.rs`, the map object in
+//! `basemap.rs`; step 7 shells out to the real `ld` via `$GRAFT_REAL_LD`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -257,15 +259,17 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
         .collect();
 
     // Overlay is a **full** static link — every symbol it references is
-    // either defined in the closure's own pruned .o's or PROVIDEd at a
-    // constant base-derived address by `base_symbols.ld`. Combine just
-    // splices the resulting sections into base; no relocation work at
-    // combine time.
+    // either defined in the closure's own pruned .o's or resolved to a
+    // constant base-derived address through a `__graft_assumed_<vaddr>`
+    // anchor. Each such anchor is emitted UND by prune and defined by the
+    // synthesized base-map object (`basemap.rs`; docs/15) as a section
+    // symbol placed at base's layout. Combine just splices the resulting
+    // sections into base; no relocation work at combine time.
     //
-    // Full-linking requires that base is a non-PIE static ELF so every
-    // symbol has a permanent absolute address we can PROVIDE. (The
-    // fixture's cargo config wires this up via the musl target +
-    // `relocation-model=static`.)
+    // Full-linking requires that base is a non-PIE ET_EXEC so every
+    // base-resident byte has a permanent absolute address the base-map
+    // object can pin an anchor to. (The fixture's cargo config wires this
+    // up via the musl target + `relocation-model=static`.)
     // Splice layout, by target:
     //
     // - x86_64 hosted (e2e/x86 fixture): a SECTIONS block in
@@ -857,14 +861,6 @@ fn write_overlay_layout_ld_splice(
     Ok(())
 }
 
-/// Build a `name → vaddr` map of every defined symbol in base.elf's
-/// `.symtab`. Used by prune to resolve overlay reloc targets, and
-/// (until lazy-archive walking lands fully) emitted as a global
-/// PROVIDE script so ld can resolve UND references inside forwarded
-/// `-l<lib>` content that graft doesn't yet expand.
-/// First-seen-wins on duplicate names — base occasionally has
-/// same-named locals across TUs, but for global-name resolution any
-/// of their addresses suffices (ld would have picked one).
 /// After overlay link, verify every `assumed_names` entry: walk
 /// overlay's output `.symtab`, find each name, and confirm the linker
 /// placed it at the address graft assumed. A mismatch means a symbol
@@ -1066,12 +1062,13 @@ fn run_real_linker(
     cmd.arg("-nostartfiles");
 
     // No PROVIDE-based symbol resolution: every base-bound reloc in
-    // graft's pruned `.o`s is already encoded as
-    // `(__graft_const, base_vaddr + addend)` at prune time, and every
-    // `-l<name>` archive whose content reaches the closure has been
-    // walked + emitted as a filtered `.a`. Linker scripts that
-    // PROVIDE() defaults for would-be-UND base symbols are harmless:
-    // nothing references those names anymore.
+    // graft's pruned `.o`s is already encoded at prune time as a UND
+    // reference to a `__graft_assumed_<vaddr>` anchor, which the
+    // synthesized base-map object (`basemap.rs`; docs/15) defines at
+    // base's layout. Every `-l<name>` archive whose content reaches the
+    // closure has been walked + emitted as a filtered `.a`. Linker
+    // scripts that PROVIDE() defaults for would-be-UND base symbols are
+    // harmless: nothing references those names anymore.
 
     if let Some(x) = xtensa {
         // Prepend our work_dir so ld's INCLUDE "memory.x" /

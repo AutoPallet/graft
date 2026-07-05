@@ -351,9 +351,7 @@ pub fn build(
         // relocs (offset, r_type, addend, .llvm-stripped target name):
         // `.init_array.*` entries are all 8 zero bytes — the reloc to
         // the init fn is the only distinguishing content, and a
-        // bytes-only key degenerated to scan order (review find,
-        // task #45: rlib reorder flipped the aggregator's th and
-        // re-emitted .init_array into every overlay).
+        // bytes-only key degenerated to scan order.
         let mut contributor_segs: Vec<(SegmentRef, [u8; 32], [u8; 8])> = Vec::new();
         for (&(oi, si), &owning_agg) in &contributor_to_agg {
             if !std::ptr::eq(owning_agg, agg) { continue; }
@@ -363,7 +361,7 @@ pub fn build(
             // priority suffixes determine ld's run order, and a
             // bytes+relocs key let two ctors SWAP priorities without
             // changing the aggregator's hash — an undetected init-
-            // order change (review find).
+            // order change.
             h.update(sec.name.as_bytes());
             h.update(&[0]);
             h.update(&sec.bytes);
@@ -386,9 +384,7 @@ pub fn build(
         // TUs' entries targeting same-named locals) break by tu_id,
         // which is content-stable, NEVER by scan order: (object,
         // section) survives only as the intra-object final resort,
-        // where input section order is ELF-stable (review find: key
-        // ties fell back to object order and rlib reorder flipped the
-        // aggregator's hash).
+        // where input section order is ELF-stable.
         contributor_segs.sort_by_key(|(seg, h, tu)| (*h, *tu, seg.object, seg.section));
 
         let agg_nid = nodes.len() as NodeId;
@@ -450,8 +446,7 @@ pub fn build(
     // .llvm-stripped target name): two same-bytes definers with
     // different relocs are NOT interchangeable, and a bytes-only
     // tiebreak would call them "identical content" and silently keep
-    // whichever scanned first (review find: divergence detection and
-    // tiebreaks must see one-hop wiring, not just bytes).
+    // whichever scanned first.
     let bytes_hash_of: Vec<[u8; 16]> = nodes
         .iter()
         .map(|nm| {
@@ -494,9 +489,9 @@ pub fn build(
     // Precedence: STRONG over weak first — ld binds every reference
     // to the strong def when both exist (the weak-default-handler /
     // strong-override shape), and tracking the weak definer here made
-    // an edit to the STRONG body invisible to its callers' hashes
-    // (review find, task #44: scan must mirror ld's binds, not just
-    // its inclusion). Within one strength, tiebreak by lowest
+    // an edit to the STRONG body invisible to its callers' hashes —
+    // scan must mirror ld's binds, not just its inclusion. Within one
+    // strength, tiebreak by lowest
     // bytes_hash: identical content → identical bytes_hash → both
     // scans pick the same canonical. (Two strong defs of one name are
     // an ld error; equal-strength different-content only arises for
@@ -515,7 +510,7 @@ pub fn build(
     // same-named cross-TU statics for `locals_any_tu`). Such names are
     // REMOVED from the maps below: External is deterministic and
     // routes through the verified/bailing base_symtab channel instead
-    // of silently picking a copy (review finds).
+    // of silently picking a copy.
     let mut locals_diverged: FxHashSet<(String, [u8; 8])> = FxHashSet::default();
     let mut any_tu_diverged: FxHashSet<String> = FxHashSet::default();
     for (nid, nm) in nodes.iter().enumerate() {
@@ -664,7 +659,7 @@ pub fn build(
                         // silently dropped the edge to an external
                         // sentinel — the referrer lost its string
                         // dependency and the closure walk never saw
-                        // it (task #43). Keep a dependency on the
+                        // it. Keep a dependency on the
                         // pool (first entry) whenever the precise
                         // entry can't be identified.
                         let precise = if r.addend >= 0 {

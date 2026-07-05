@@ -115,8 +115,8 @@ impl Census {
 }
 
 /// A maximal run of catch-all edges on a dirty min-cost path: the bytes
-/// the transform alphabet can't explain. This localization is the
-/// mining tool that found every missing rule (docs/16 §5).
+/// the transform alphabet can't explain, localized for diagnosis
+/// (docs/16 §5).
 #[derive(Debug, Clone)]
 pub struct DirtyRun {
     pub in_off: usize,

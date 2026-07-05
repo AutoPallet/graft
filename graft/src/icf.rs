@@ -649,7 +649,7 @@ pub fn run(scan: &ScanResult, output: &Path) -> Result<Option<IcfOutcome>> {
     }
 
     // ---- rewrite objects -------------------------------------------------
-    // One representative input per (path, member): find its bytes.
+    // One representative input per (path, member).
     let mut input_bytes: HashMap<(PathBuf, Option<String>), &[u8]> = HashMap::new();
     for inp in &scan.inputs {
         let key = (

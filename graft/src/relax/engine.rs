@@ -55,7 +55,7 @@ const COST_DIAG_NOP: u32 = 6;
 const COST_REPLACE: u32 = 12;
 const COST_SKIP: u32 = 16;
 /// Backstop against pathological state growth; never fired on the
-/// deploy corpus once the rules were complete.
+/// deploy corpus.
 const STATE_CAP: usize = 8_000_000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

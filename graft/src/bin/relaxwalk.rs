@@ -17,7 +17,7 @@
 //! against. Examples:
 //!
 //!   relaxwalk --map corpus.map --elf <linked-elf> \
-//!             --path-map /workspaces/roborack=/home/eric/roborack2
+//!             --path-map /workspaces/roborack=/path/to/roborack2
 //!   relaxwalk --arch x86 --map base.graft-map --elf <base-elf>
 
 use graft::relax::engine;
@@ -240,7 +240,6 @@ fn main() {
     let mut query_cache: HashMap<(String, usize), HashMap<object::SectionIndex, Vec<usize>>> =
         HashMap::new();
 
-    // walk every entry
     let mut attempted = 0usize;
     let mut reconciled = 0usize;
     let mut fast_verified = 0usize;

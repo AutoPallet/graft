@@ -206,7 +206,7 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
         base_abi: compute_base_abi(&elf_bytes),
         entry_symbol: entry_for_scan.clone().unwrap_or_else(|| "main".into()),
         toolchain_stamp: toolchain_stamp(),
-        overlay_region: (0, 0), // M0.5 doesn't reserve one; overlay picks a disjoint addr
+        overlay_region: (0, 0), // no region reserved; overlay picks a disjoint addr
     };
 
     let manifest_bytes = encode_manifest(&manifest)?;
@@ -696,7 +696,7 @@ fn compute_base_abi(elf_bytes: &[u8]) -> [u8; 20] {
     // Prefer NT_GNU_BUILD_ID if present; otherwise fall back to
     // blake3(output ELF bytes) truncated to 20 bytes. Either is
     // sufficient for the "your overlay was built against a different
-    // base" check M0.5 needs.
+    // base" check.
     if let Some(bid) = read_build_id(elf_bytes) {
         let mut out = [0u8; 20];
         let n = bid.len().min(20);

@@ -69,13 +69,12 @@ pub fn dump_graph(path: &Path, scan: &ScanResult) -> std::io::Result<()> {
 
     // Canonicalize reloc targets through the *exact* code path
     // `hash::compute` uses, so the dump faithfully reproduces the real
-    // trans_hash inputs (a hand-rolled copy previously drifted — it
-    // keyed on whole-section bytes and ignored string-pool sub-ranges,
-    // reporting fingerprints `compute` never produced).
+    // trans_hash inputs. A hand-rolled copy drifts — it keys on
+    // whole-section bytes and ignores string-pool sub-ranges, producing
+    // fingerprints `compute` never emits.
     let bytes_hashes = crate::hash::node_identity_hashes(g, &scan.objects);
     let resolver = crate::hash::ContentResolver::build(&scan.objects, g, &bytes_hashes);
-    // Real per-node SCC hashes — this column used to just repeat
-    // trans_hash, which misled the #42 dissection.
+    // Real per-node SCC hashes (distinct from the node trans_hash).
     let (_, scch_of_node) = crate::hash::compute_detailed(&scan.objects, g, &scc);
 
     // Per-node logical key (used for cross-scan join AND for emitting

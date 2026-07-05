@@ -52,7 +52,6 @@ fn prune_keep_all_preserves_shape() {
 
     let result = prune::prune_object(&bytes, &keep, &dummy_dispose)
         .unwrap_or_else(|e| panic!("prune {}: {e:#}", path.display()));
-    // Re-parse.
     let _ = object::File::parse(&*result.bytes)
         .unwrap_or_else(|e| panic!("re-parse pruned {}: {e}", path.display()));
     assert!(result.kept_sections > 0);

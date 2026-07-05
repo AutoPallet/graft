@@ -304,7 +304,7 @@ impl<'a> Resolver<'a> {
             // prune ever disposes, so a refusal here is a walk/dispose
             // disagreement — refuse loudly, never guess an offset.
             Err(why) => bail!(
-                "reloc in {from_section}: {} resolves into base's relaxed copy but the                  walk refused to translate offset {q:#x}: {why} (pre-pass gap)",
+                "reloc in {from_section}: {} resolves into base's relaxed copy but the walk refused to translate offset {q:#x}: {why} (pre-pass gap)",
                 name.unwrap_or("<section ref>"),
             ),
         }

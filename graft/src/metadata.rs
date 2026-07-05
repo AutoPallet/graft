@@ -31,13 +31,12 @@ pub const GRAFT_MAGIC: [u8; 4] = *b"GRFT";
 // v9: the trans_hash ALGORITHM was overhauled (per-SCC color
 // refinement replacing member-hash mixing; st_value folded into
 // canonical addends; pool-fallback / bind-precedence / aggregator-key
-// / entry-cut / salt-tu_id / segment-framing fixes from the 2026-07
-// review cycle) — empirically a total re-key of the hash domain. The
-// manifest also gains `hash_algo_version` so future algorithm-only
-// changes are self-documenting; the review found the refinement
-// initially shipped WITHOUT a bump, leaving the stale-base guard
-// blind (every by_section lookup missed, the closure silently became
-// whole-program, and only data-dependent slack overflow rescued it).
+// / entry-cut / salt-tu_id / segment-framing fixes) — empirically a
+// total re-key of the hash domain. The manifest also gains
+// `hash_algo_version` so future algorithm-only changes are
+// self-documenting. A hash-value change without a version bump leaves
+// the stale-base guard blind (every by_section lookup misses and the
+// closure silently becomes whole-program), so never skip the bump.
 pub const SCHEMA_VERSION: u16 = 9;
 
 /// Version of the trans_hash algorithm itself, independent of table

@@ -142,8 +142,6 @@ pub fn combine(base_path: &Path, overlay_path: &Path, output_path: &Path) -> Res
     // into base's reserved slack regions, so combine byte-splices them
     // in place (RAM-resident segments that legitimately fall past base,
     // e.g. xtensa `.rwtext`, are appended by `combine_splice`'s pass 2).
-    // The old "append everything at a fresh PT_LOAD" path — with its
-    // overlap-trim, AT_PHDR stretching, and PHT rewrite — is gone.
     combine_splice(
         base_path,
         &base_bytes,
@@ -352,8 +350,8 @@ fn combine_splice(
         append_loads.push(trimmed);
     }
 
-    // Trampoline on entry symbol — same as the append path, just on
-    // the splice-modified buffer.
+    // Trampoline on the entry symbol, applied to the splice-modified
+    // buffer.
     let manifest_bytes = elf_attach::read_section(base_bytes, metadata::SECTION_MANIFEST)?
         .ok_or_else(|| anyhow!("{}: no {}", base_path.display(), metadata::SECTION_MANIFEST))?;
     let manifest = metadata::decode_manifest(manifest_bytes)?;
