@@ -474,12 +474,21 @@ pub struct ContentResolver {
     /// string get a stable encoding regardless of which CGU's
     /// `.rodata.str1.1` happens to host the string in this build.
     string_pool: HashMap<(u32, u32), Vec<(u32, u32, [u8; 8])>>,
-    /// Global symbol name → defining-node content fingerprint.
-    global: HashMap<String, [u8; 8]>,
-    /// (local symbol name, defining tu_id) → defining-node content
-    /// fingerprint. Locals can repeat by name across TUs; the tu_id
-    /// disambiguates.
-    local: HashMap<(String, [u8; 8]), [u8; 8]>,
+    /// Global symbol name → (defining-node content fingerprint, the
+    /// symbol's section-relative st_value). The st_value is folded
+    /// into the canonical addend so the encoding names the *byte the
+    /// reloc resolves to*, not just the section: two byte-identical
+    /// referrers to different symbols at different offsets of one
+    /// multi-symbol section (the gcc/esp-idf several-functions-per-
+    /// .text shape) are NOT interchangeable and must not hash equal.
+    /// It also makes the symbol-reloc and section-reloc forms of the
+    /// same reference canonicalize identically for st_value ≠ 0,
+    /// which the section↔symbol invariance goal always required.
+    global: HashMap<String, ([u8; 8], u64)>,
+    /// (local symbol name, defining tu_id) → (defining-node content
+    /// fingerprint, st_value). Locals can repeat by name across TUs;
+    /// the tu_id disambiguates.
+    local: HashMap<(String, [u8; 8]), ([u8; 8], u64)>,
 }
 
 impl ContentResolver {
@@ -513,11 +522,11 @@ impl ContentResolver {
             for sym in &nm.defined_symbols {
                 match sym.bind {
                     SymbolBind::Global | SymbolBind::Weak => {
-                        global.insert(sym.name.clone(), h);
+                        global.insert(sym.name.clone(), (h, sym.value));
                     }
                     SymbolBind::Local => {
                         let tu_id = sym.tu_id.expect("local symbol must carry tu_id");
-                        local.insert((sym.name.clone(), tu_id), h);
+                        local.insert((sym.name.clone(), tu_id), (h, sym.value));
                     }
                 }
             }
@@ -566,11 +575,14 @@ impl ContentResolver {
                 return (format!("@{}", hex8(h)), r.addend);
             }
         }
-        if let Some(h) = self.global.get(&r.target) {
-            return (format!("@{}", hex8(h)), r.addend);
+        // Symbol targets: canonical addend = st_value + A — the byte
+        // the reference actually resolves to, section-relative. Same
+        // encoding a section-target form of this reference produces.
+        if let Some(&(h, value)) = self.global.get(&r.target) {
+            return (format!("@{}", hex8(&h)), value as i64 + r.addend);
         }
-        if let Some(h) = self.local.get(&(r.target.clone(), tu_id)) {
-            return (format!("@{}", hex8(h)), r.addend);
+        if let Some(&(h, value)) = self.local.get(&(r.target.clone(), tu_id)) {
+            return (format!("@{}", hex8(&h)), value as i64 + r.addend);
         }
         // Out-of-scope target: keep the original name. The SCC
         // walker counts these as externals (sentinel hash), so the
