@@ -606,6 +606,82 @@ fn swapped_wiring_to_byte_identical_targets_does_not_collide() {
     assert_ne!(th(&scan, "wx"), th(&scan, "wy"));
 }
 
+/// The ICF byte-level post-check must reject a pair whose transitive
+/// content differs even when the pair is byte-identical at the top —
+/// and accept a genuinely interchangeable pair. This is the
+/// last-line-of-defense guard for the #42 class: if trans_hash ever
+/// lies again, the fold refuses instead of shipping.
+#[test]
+fn icf_verifier_rejects_transitively_different_pairs() {
+    let mut obj = WObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+
+    for (i, name) in ["leaf_1", "leaf_2"].iter().enumerate() {
+        let sec = obj.add_section(
+            Vec::new(),
+            format!(".text.{name}").into_bytes(),
+            SectionKind::Text,
+        );
+        obj.section_mut(sec).set_data(vec![0xb8, i as u8 + 1, 0, 0, 0, 0xc3], 16);
+        global_text_symbol(&mut obj, name, sec, 0);
+    }
+    // Byte-identical wrappers: wx, wz → leaf_1; wy → leaf_2.
+    for (name, leaf) in [("wx", "leaf_1"), ("wz", "leaf_1"), ("wy", "leaf_2")] {
+        let sec = obj.add_section(
+            Vec::new(),
+            format!(".text.{name}").into_bytes(),
+            SectionKind::Text,
+        );
+        obj.section_mut(sec).set_data(call_ret(), 16);
+        global_text_symbol(&mut obj, name, sec, 0);
+        let target = obj.symbol_id(leaf.as_bytes()).unwrap();
+        obj.add_relocation(
+            sec,
+            WRelocation {
+                offset: 1,
+                symbol: target,
+                addend: -4,
+                flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PLT32 },
+            },
+        )
+        .unwrap();
+    }
+    let msec = obj.add_section(Vec::new(), b".text.main".to_vec(), SectionKind::Text);
+    let mut code = Vec::new();
+    for _ in 0..3 {
+        code.extend_from_slice(&[0xe8, 0, 0, 0, 0]);
+    }
+    code.push(0xc3);
+    obj.section_mut(msec).set_data(code, 16);
+    global_text_symbol(&mut obj, "main", msec, 0);
+    for (off, name) in [(1u64, "wx"), (6, "wz"), (11, "wy")] {
+        let sym = obj.symbol_id(name.as_bytes()).unwrap();
+        obj.add_relocation(
+            msec,
+            WRelocation {
+                offset: off,
+                symbol: sym,
+                addend: -4,
+                flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PLT32 },
+            },
+        )
+        .unwrap();
+    }
+
+    let scan = scan_one(obj, "main");
+    let nid = |name: &str| scan.graph.symbols.resolve_global(name).unwrap().0;
+
+    // Interchangeable pair passes.
+    graft::icf::verify_interchangeable(&scan, &[(nid("wx"), nid("wz"))])
+        .expect("byte-identical wrappers of the same leaf must verify");
+    // Transitively different pair is rejected.
+    let err = graft::icf::verify_interchangeable(&scan, &[(nid("wx"), nid("wy"))])
+        .expect_err("wrappers of different leaves must fail the byte-level check");
+    assert!(
+        format!("{err:#}").contains("raw bytes differ"),
+        "unexpected verifier error: {err:#}"
+    );
+}
+
 /// Mid-pool symbol attack (task #46 dissection, the roborack
 /// "Down\0time\0" shape): LLVM places two string constants in one pool
 /// section and a named symbol points at the SECOND entry (st_value ≠ 0).

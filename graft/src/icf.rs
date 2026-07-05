@@ -1,5 +1,5 @@
-//! Identical-code folding for the base link (default ON; `GRAFT_ICF=0`
-//! opts out, links without `--gc-sections` skip it with a warning).
+//! Identical-code folding for the base link (`GRAFT_ICF=1`, default
+//! off in graft; validated projects enable it in their build config).
 //!
 //! GNU ld has no ICF, and on xtensa-espidf rustc emits cross-crate
 //! monomorphization copies as internalized LOCAL symbols with no COMDAT
@@ -105,37 +105,19 @@ use crate::scan::ScanResult;
 
 pub const ENV: &str = "GRAFT_ICF";
 
-/// How the fold pass was requested.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Setting {
-    /// `GRAFT_ICF` unset/empty — on by default (since the 2026-07 #46
-    /// dissection: every roborack fold group verified transitively
-    /// byte-identical, full abuse matrix 7/7 on a folded base, and the
-    /// hash_identity pins guard the identity contract). Preconditions
-    /// that fail (no `--gc-sections`) degrade to a warning + no fold.
-    DefaultOn,
-    /// `GRAFT_ICF=1|on|rust` — failed preconditions are hard errors.
-    ExplicitOn,
-    /// `GRAFT_ICF=0|off`.
-    Off,
-}
-
-impl Setting {
-    pub fn is_on(self) -> bool {
-        self != Setting::Off
-    }
-}
-
-/// Parse `GRAFT_ICF`. Unrecognized values are a hard error — never a
-/// silent fallthrough (same policy as the `GRAFT` mode variable).
-pub fn setting() -> Result<Setting> {
+/// Parse `GRAFT_ICF`. Unset/empty → off (graft itself stays
+/// conservative; projects that have validated folding on their target
+/// opt in via config — roborack sets `GRAFT_ICF=1` in `.cargo/config`).
+/// `1`/`on`/`rust` → on, `0`/`off` → off. Anything else is a hard
+/// error — never a silent fallthrough (same policy as the `GRAFT`
+/// mode variable).
+pub fn enabled() -> Result<bool> {
     match std::env::var(ENV) {
-        Err(std::env::VarError::NotPresent) => Ok(Setting::DefaultOn),
+        Err(std::env::VarError::NotPresent) => Ok(false),
         Err(e) => Err(anyhow!("{ENV}: {e}")),
         Ok(v) => match v.as_str() {
-            "" => Ok(Setting::DefaultOn),
-            "1" | "on" | "rust" => Ok(Setting::ExplicitOn),
-            "0" | "off" => Ok(Setting::Off),
+            "" | "0" | "off" => Ok(false),
+            "1" | "on" | "rust" => Ok(true),
             other => bail!(
                 "{ENV}={other:?} is not a recognized mode (expected `1`, `on`, \
                  `rust`, `0`, or `off`). Refusing to guess."
@@ -174,6 +156,227 @@ pub struct IcfStats {
 /// waste (group-size distribution is heavily skewed toward small
 /// groups).
 pub const MAX_PARTICIPANTS: usize = 16;
+
+/// Parse `GRAFT_ICF_VERIFY` (default ON): the independent byte-level
+/// post-check on every fold pair. `0`/`off` disables. Unrecognized
+/// values are a hard error.
+fn verify_enabled() -> Result<bool> {
+    match std::env::var("GRAFT_ICF_VERIFY") {
+        Err(std::env::VarError::NotPresent) => Ok(true),
+        Err(e) => Err(anyhow!("GRAFT_ICF_VERIFY: {e}")),
+        Ok(v) => match v.as_str() {
+            "" | "1" | "on" => Ok(true),
+            "0" | "off" => Ok(false),
+            other => bail!("GRAFT_ICF_VERIFY={other:?} (expected `1`, `on`, `0`, or `off`)"),
+        },
+    }
+}
+
+/// Independent post-check on the fold plan: walk both members of every
+/// fold pair in dependency lockstep and require RAW-BYTE equality at
+/// every reached node, structurally equivalent relocs, and identical
+/// referenced positions. Equal `trans_hash` is the *claim* that two
+/// sections are interchangeable; this re-derives the claim from bytes
+/// and the recorded resolutions without trusting the hash aggregation,
+/// so a missing information channel (the #42 class: data that never
+/// made it into the hash) fails the base link instead of shipping a
+/// wrong-function fold.
+///
+/// What it trusts: `reloc_targets` (which node a reloc resolves to)
+/// and the pool entry split. What it does NOT trust: canonicalized
+/// names, fingerprints, member hashes, slot streams, or trans_hash
+/// itself — every content comparison is on raw section/entry bytes.
+pub fn verify_interchangeable(
+    scan: &ScanResult,
+    pairs: &[(crate::graph::NodeId, crate::graph::NodeId)],
+) -> Result<()> {
+    use crate::graph::{NodeId, ResolvedTarget};
+
+    let g = &scan.graph;
+
+    // Per-string entry lookup: (object, section) → sorted (start, len,
+    // nid). Section-form pool refs resolve to the FIRST entry node with
+    // the in-section offset in the addend; the referenced entry must be
+    // recovered by offset.
+    let mut pool_entries: HashMap<(u32, u32), Vec<(u32, u32, NodeId)>> = HashMap::new();
+    for (nid, nm) in g.nodes.iter().enumerate() {
+        if let [seg] = nm.segments.as_slice()
+            && let Some((off, len)) = seg.range
+        {
+            pool_entries
+                .entry((seg.object, seg.section))
+                .or_default()
+                .push((off, len, nid as NodeId));
+        }
+    }
+    for v in pool_entries.values_mut() {
+        v.sort_unstable();
+    }
+
+    // One reloc's target, reduced to a comparable form.
+    #[derive(PartialEq)]
+    enum Ref {
+        /// Unresolved (or entry-cut) target — compared by exact name:
+        /// ld binds these by name at final link.
+        Ext(String),
+        /// In-graph target node + referenced position relative to the
+        /// node's own start.
+        Node(NodeId, i64),
+        /// Pool ref whose offset lands in no entry (the PC-rel-bias
+        /// miss shape): sound only if the WHOLE pools are identical
+        /// and the offsets agree — mirrors the whole-pool-fingerprint
+        /// fallback, on raw bytes.
+        PoolMiss(u32, u32, i64),
+    }
+
+    let classify = |r: &crate::elf::CanonicalReloc, seg: &crate::graph::SegmentRef| -> Ref {
+        let recorded = g
+            .reloc_targets
+            .get(&(seg.object, seg.section))
+            .and_then(|m| m.get(&(r.offset, r.r_type)));
+        let (nid, value) = match recorded {
+            None | Some(ResolvedTarget::External) => return Ref::Ext(r.target.clone()),
+            Some(&ResolvedTarget::Symbol { nid, value }) => (nid, value as i64),
+            Some(&ResolvedTarget::Section { nid }) => (nid, 0),
+        };
+        // Mirror the trampoline cut: entry-targeted relocs are
+        // address-only dependencies (base callers are reused verbatim).
+        if g.entry_node == Some(nid) {
+            return Ref::Ext(r.target.clone());
+        }
+        let nm = &g.nodes[nid as usize];
+        let [tseg] = nm.segments.as_slice() else {
+            return Ref::Node(nid, value + r.addend);
+        };
+        let key = (tseg.object, tseg.section);
+        match pool_entries.get(&key) {
+            None => Ref::Node(nid, value + r.addend),
+            Some(entries) => {
+                // Split pool: recover the referenced entry by naive
+                // S + A offset (BFD's _bfd_merged_section_offset does
+                // the same arithmetic).
+                let off = value + r.addend;
+                match entries
+                    .iter()
+                    .find(|&&(s, l, _)| (s as i64) <= off && off < (s as i64) + (l as i64))
+                {
+                    Some(&(s, _, entry_nid)) => Ref::Node(entry_nid, off - s as i64),
+                    None => Ref::PoolMiss(key.0, key.1, off),
+                }
+            }
+        }
+    };
+
+    let label = |nid: NodeId| -> String {
+        let seg = &g.nodes[nid as usize].segments[0];
+        format!(
+            "{}::{}",
+            scan.inputs[seg.object as usize].label(),
+            scan.objects[seg.object as usize].sections[seg.section as usize].name
+        )
+    };
+
+    let mut ok: HashSet<(NodeId, NodeId)> = HashSet::new();
+    let mut stack: Vec<(NodeId, NodeId)> = Vec::new();
+    for &(a0, b0) in pairs {
+        stack.push((a0, b0));
+        while let Some((a, b)) = stack.pop() {
+            let key = if a <= b { (a, b) } else { (b, a) };
+            if a == b || !ok.insert(key) {
+                continue;
+            }
+            let fail = |what: String| -> anyhow::Error {
+                anyhow!(
+                    "fold pair {} <-> {} (reached from {} <-> {}): {what}",
+                    label(a),
+                    label(b),
+                    label(a0),
+                    label(b0),
+                )
+            };
+            let (na, nb) = (&g.nodes[a as usize], &g.nodes[b as usize]);
+            if na.segments.len() != nb.segments.len() {
+                return Err(fail(format!(
+                    "segment count {} != {}",
+                    na.segments.len(),
+                    nb.segments.len()
+                )));
+            }
+            for (sa, sb) in na.segments.iter().zip(&nb.segments) {
+                let oa = &scan.objects[sa.object as usize];
+                let ob = &scan.objects[sb.object as usize];
+                if sa.bytes_in(&oa.sections) != sb.bytes_in(&ob.sections) {
+                    return Err(fail("raw bytes differ".into()));
+                }
+                // Per-string segments own no relocs; a whole-section
+                // partner may pair with one only if it has none either.
+                if sa.range.is_some() || sb.range.is_some() {
+                    let stray = (sa.range.is_none()
+                        && !oa.sections[sa.section as usize].relocs.is_empty())
+                        || (sb.range.is_none()
+                            && !ob.sections[sb.section as usize].relocs.is_empty());
+                    if stray {
+                        return Err(fail("pool entry paired with reloc-bearing section".into()));
+                    }
+                    continue;
+                }
+                let ra = &oa.sections[sa.section as usize].relocs;
+                let rb = &ob.sections[sb.section as usize].relocs;
+                if ra.len() != rb.len() {
+                    return Err(fail(format!("reloc count {} != {}", ra.len(), rb.len())));
+                }
+                for (x, y) in ra.iter().zip(rb) {
+                    if x.offset != y.offset || x.r_type != y.r_type {
+                        return Err(fail(format!(
+                            "reloc shape (offset {:#x} type {}) != (offset {:#x} type {})",
+                            x.offset, x.r_type, y.offset, y.r_type
+                        )));
+                    }
+                    match (classify(x, sa), classify(y, sb)) {
+                        (Ref::Ext(nx), Ref::Ext(ny)) => {
+                            if nx != ny {
+                                return Err(fail(format!(
+                                    "external targets differ at +{:#x}: {nx} vs {ny}",
+                                    x.offset
+                                )));
+                            }
+                        }
+                        (Ref::Node(tx, px), Ref::Node(ty, py)) => {
+                            if px != py {
+                                return Err(fail(format!(
+                                    "referenced positions differ at +{:#x}: {px} vs {py} \
+                                     (into {} / {})",
+                                    x.offset,
+                                    label(tx),
+                                    label(ty)
+                                )));
+                            }
+                            stack.push((tx, ty));
+                        }
+                        (Ref::PoolMiss(o1, s1, p1), Ref::PoolMiss(o2, s2, p2)) => {
+                            if p1 != p2
+                                || scan.objects[o1 as usize].sections[s1 as usize].bytes
+                                    != scan.objects[o2 as usize].sections[s2 as usize].bytes
+                            {
+                                return Err(fail(format!(
+                                    "out-of-entry pool refs differ at +{:#x}",
+                                    x.offset
+                                )));
+                            }
+                        }
+                        _ => {
+                            return Err(fail(format!(
+                                "target classes differ at +{:#x}",
+                                x.offset
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 pub struct IcfOutcome {
     pub stats: IcfStats,
@@ -215,6 +418,7 @@ pub fn run(scan: &ScanResult, output: &Path) -> Result<Option<IcfOutcome>> {
     // archive appearing twice in argv.
     let mut groups: HashMap<[u8; 16], Vec<(usize, u32)>> = HashMap::new();
     let mut seen_identity: HashSet<(PathBuf, Option<String>, u32)> = HashSet::new();
+    let mut nid_of: HashMap<(usize, u32), crate::graph::NodeId> = HashMap::new();
     for (nid, nm) in scan.graph.nodes.iter().enumerate() {
         if nm.is_aggregator() {
             continue;
@@ -263,12 +467,15 @@ pub fn run(scan: &ScanResult, output: &Path) -> Result<Option<IcfOutcome>> {
             .entry(scan.trans_hash[nid])
             .or_default()
             .push((seg.object as usize, seg.section));
+        nid_of.insert((seg.object as usize, seg.section), nid as crate::graph::NodeId);
     }
 
     // ---- eligibility filters + plan construction ------------------------
     // Keyed by (canonical source path, member name) — the on-disk unit
     // we rewrite.
     let mut plans: HashMap<(PathBuf, Option<String>), ObjectPlan> = HashMap::new();
+    // (survivor, dropped) node pairs for the byte-level post-check.
+    let mut verify_pairs: Vec<(crate::graph::NodeId, crate::graph::NodeId)> = Vec::new();
     let mut group_list: Vec<([u8; 16], Vec<(usize, u32)>)> = groups
         .into_iter()
         .filter(|(_, v)| v.len() >= 2)
@@ -364,6 +571,9 @@ pub fn run(scan: &ScanResult, output: &Path) -> Result<Option<IcfOutcome>> {
             if chunk.len() < 2 {
                 continue;
             }
+            for &copy in &chunk[1..] {
+                verify_pairs.push((nid_of[&chunk[0]], nid_of[&copy]));
+            }
             let icf_name = if chunk_idx == 0 {
                 format!("__graft_icf_{hex}")
             } else {
@@ -418,6 +628,24 @@ pub fn run(scan: &ScanResult, output: &Path) -> Result<Option<IcfOutcome>> {
 
     if plans.is_empty() {
         return Ok(None);
+    }
+
+    // Independent byte-level post-check on everything we're about to
+    // fold, BEFORE touching any input. A violation means trans_hash
+    // equality is lying about interchangeability — refuse the fold
+    // rather than ship a wrong-function bind.
+    if verify_enabled()? {
+        let t = std::time::Instant::now();
+        verify_interchangeable(scan, &verify_pairs).context(
+            "GRAFT_ICF verify: a fold pair failed independent byte-level \
+             verification — refusing to fold (GRAFT_ICF_VERIFY=0 bypasses, \
+             at the cost of shipping the unverified fold)",
+        )?;
+        eprintln!(
+            "graft icf: verified {} fold pairs byte-interchangeable in {:.1?}",
+            verify_pairs.len(),
+            t.elapsed()
+        );
     }
 
     // ---- rewrite objects -------------------------------------------------
