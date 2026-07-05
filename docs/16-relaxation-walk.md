@@ -2,8 +2,9 @@
 
 Status: knowledge dump from the `relaxwalk` prototype
 (`graft/src/bin/relaxwalk.rs`, commit `37c6916`), written to enable a
-clean-sheet reimplementation. The prototype hit **100.0% (9,204/9,204)**
-on the roborack deploy corpus using only transforms transcribed from
+clean-sheet reimplementation. The prototype hit **100.0% (10,000/10,000)**
+(early drafts said 9,204; that was a v1 map-parser bug — see below) on
+the roborack deploy corpus using only transforms transcribed from
 binutils source. It is also ~1,400 lines of very ISA-specific code; the
 goal of the rewrite is the same result with a small generic engine and
 the xtensa knowledge reduced to data tables.
@@ -366,7 +367,7 @@ Corpus (12,123 relaxed-section map annotations; 9,206 exec/literal):
 - run from
   `~/roborack2/target/xtensa-esp32s3-espidf/vehicle/build/esp-idf-sys-b8b4dafca91fe4cc/out/build`
   (map archive paths are relative to it) with
-  `--path-map /workspaces/roborack=/home/eric/roborack2`.
+  `--path-map /workspaces/roborack=/path/to/roborack2`.
 
 A reimplementation is accepted when, on this exact corpus:
 

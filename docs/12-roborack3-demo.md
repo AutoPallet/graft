@@ -1,5 +1,8 @@
 # 12 — Roborack3 demo: hot overlay flash on real hardware
 
+Status: historical demo recipe. Point-in-time; commands and container
+names may have drifted. Kept for rationale.
+
 A self-contained recipe for showing graft producing an overlay
 binary that delivers a source change to a real ESP32-S3 (roborack3
 fallback build). Hardware-validated end-to-end through wifi connect,

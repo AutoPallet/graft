@@ -1,5 +1,8 @@
 # 04 — Wire protocol (CLI ↔ running app)
 
+Status: reference research on Dioxus's Subsecond. graft does not use this
+wire protocol (it flashes an ordinary ELF); kept for context.
+
 The CLI needs to send the finished `JumpTable` and a reference to the patch
 file to every running client. Dioxus uses a dedicated websocket endpoint via
 the `devtools` / `devtools-types` crates.

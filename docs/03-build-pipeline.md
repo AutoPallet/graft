@@ -1,5 +1,8 @@
 # 03 — The build pipeline (CLI side)
 
+Status: reference research on Dioxus's Subsecond. graft reuses only the
+linker-shim and ELF-parse ideas; kept for context.
+
 Where patches actually come from. All references into
 `packages/cli/src/`.
 

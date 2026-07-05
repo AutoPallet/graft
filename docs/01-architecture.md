@@ -1,5 +1,9 @@
 # 01 — End-to-end architecture
 
+Status: reference research on Dioxus's Subsecond hot-patching system.
+graft resolves at link time and shares none of this runtime; kept for
+context.
+
 A single mental model for how Subsecond turns a Rust code edit into a running
 patch in under a second.
 

@@ -1,5 +1,8 @@
 # 02 — Runtime patching (the `subsecond` crate)
 
+Status: reference research on Dioxus's Subsecond. graft does not use any
+of this runtime mechanism; kept for context.
+
 Everything in `packages/subsecond/`. This crate is what gets linked *into
 your application*. It contains no code generation — all code gen happens on
 the host `dx` side. The runtime's job is just:

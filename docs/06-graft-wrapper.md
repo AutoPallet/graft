@@ -72,8 +72,8 @@ fn main() -> ExitCode {
 ```
 
 Finding the real linker: `GRAFT_REAL_LD` env var in `.cargo/config.toml`
-(defaults to `xtensa-esp-elf-ld`, or `ld` on x86). No magic — one
-`exec`.
+(defaults to `cc`; bare-metal targets set it explicitly, e.g.
+`xtensa-esp32s3-elf-gcc`). No magic — one `exec`.
 
 ## Inputs
 

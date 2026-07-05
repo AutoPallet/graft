@@ -1,5 +1,8 @@
 # 09 — Working with roborack3
 
+Status: historical bring-up notes. Point-in-time operational record for
+running graft on a large real ESP32-S3 firmware; kept for rationale.
+
 Bringing graft up against the user's real project at `~/roborack3` — a
 much larger ESP32-S3 firmware than the `esp32s3-hello` fixture used
 through M1.a–M1.o. This doc captures the dev-loop pieces that differ

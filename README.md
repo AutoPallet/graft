@@ -8,10 +8,15 @@ ordinary ELF that boots the normal way.
 A full build links a **base** image once, recording where every input
 section landed. After an edit, graft links only the transitive closure of
 sections whose content changed — everything else resolves positionally
-against the base — and byte-splices the result into reserved slack in the
-base image. A sector-diff flasher (`docker/flash-diff.py`) then writes
+against the base — and writes the result into slack — empty space the
+base link reserves up front — so the base image's layout never shifts. A
+sector-diff flasher (`docker/flash-diff.py`) then writes
 only the changed 4KB sectors, identified through per-sector hash
 manifests keyed by the image's appended SHA-256.
+
+**Status:** research prototype. Validated on ESP32-S3 hardware (xtensa,
+bare metal and esp-idf/std) and on x86_64-musl (rust-analyzer). Not
+published as a crate; no stability guarantees.
 
 ## Measured results
 
@@ -32,28 +37,110 @@ cache is the next lever.
 Native x86-64 (rust-analyzer, ~470k input sections): overlay relink
 4.5s vs 138.5s full link, patched binary verified by execution.
 
-Correctness is validated on-device by an abuse matrix over the edit
-classes that historically produce *silent* incremental-link bugs —
-changed static initializers with unchanged users, single-user edits
-against base-resident statics, zero-init `.bss` twins (aliasing
-canaries), string/rodata edits, function bodies reached only through
-static function pointers, cross-crate edits — each checked against
-computed expected values at boot.
+Correctness is validated on-device by an abuse matrix over edit classes
+that historically produce *silent* incremental-link bugs:
+
+- changed static initializers with unchanged users,
+- single-user edits against base-resident statics,
+- zero-init `.bss` twins (aliasing canaries),
+- string/rodata edits,
+- function bodies reached only through static function pointers,
+- cross-crate edits,
+
+each checked against computed expected values at boot.
+
+## Using it
+
+graft is a linker shim: rustc invokes it in the linker seat, and it
+either does the graft work or forwards argv to the real linker
+(`$GRAFT_REAL_LD`, default `cc`). Wire it in `.cargo/config.toml`:
+
+```toml
+[target.xtensa-esp32s3-none-elf]
+linker = "/path/to/graft"
+
+[env]
+GRAFT = "auto"                            # engage graft (see modes below)
+GRAFT_REAL_LD = "xtensa-esp32s3-elf-gcc"  # real linker graft forwards to
+```
+
+Bare-metal xtensa also needs `GRAFT_TLS_SLACK_LEN = "0"` (no TLS runtime;
+see env table) — full working config in
+`esp32s3-hello/.cargo/config.toml`.
+
+The target's linker script must "scoop" graft's slack input sections
+(`*.graft_slack`) into base's normal output sections via wildcard rules
+(`*(.text.*)`, `*(.rodata.*)`, etc.). Without a matching rule ld
+orphan-places the slack — it lands wherever ld guesses and can silently
+change segment layout. graft's base link self-checks this and fails
+loudly (`check_slack_scooped`) on any orphaned `*.graft_slack` output
+section, so the failure is at link time, not on-device.
+
+The `GRAFT` variable picks the mode:
+
+- **unset** — passthrough; graft forwards to the real linker unchanged.
+  This is the path IDEs, `cargo check`, and `build.rs` probes take.
+- `auto` — self-managing. First link for a given output is a full base
+  link (a snapshot is kept next to the output); later links overlay
+  against it. Any overlay failure falls back to a full base relink, so
+  the build always succeeds — just slower on the fallback. `cargo build`
+  "just works" incrementally.
+- `base` / `overlay` — the two phases run explicitly (overlay needs
+  `GRAFT_BASE_ELF`). Used by the test harnesses.
+- `passthrough` — explicit opt-out, same as unset.
+
+A set-but-unrecognized `GRAFT` value is a hard error, never a silent
+passthrough (a typo would otherwise ship an un-instrumented "base").
+
+Subcommands: `graft combine` (splice a base + overlay pair),
+`graft scan-dump` / `graft dup-stats` (inspect the section/hash table),
+`graft cache-info`.
+
+## Environment variables
+
+| Variable | Effect |
+|---|---|
+| `GRAFT` | Mode: unset/`passthrough`, `auto`, `base`, `overlay`. Unrecognized value is a hard error. |
+| `GRAFT_OVERLAY_MODE` | Overlay layout strategy: only `splice` (or unset) is accepted; any other value is a hard error. |
+| `GRAFT_REAL_LD` | Real linker graft execs (default `cc`; bare-metal sets e.g. `xtensa-esp32s3-elf-gcc`). |
+| `GRAFT_BASE_ELF` | `overlay` mode: base ELF to prune against. `auto` uses its own snapshot instead. |
+| `GRAFT_REBASE` | `auto` mode: `1` forces a fresh base link, discarding the snapshot. |
+| `GRAFT_ENTRY_SYMBOL` | Move the single overlay trampoline off `main` (debugging; default `main`). |
+| `GRAFT_TEXT_SLACK_LEN` | Bytes of `.text` slack the base link reserves for future overlays. |
+| `GRAFT_RODATA_SLACK_LEN` | Bytes of `.rodata` slack reserved at base link. |
+| `GRAFT_DATA_SLACK_LEN` | Bytes of `.data` slack reserved at base link. |
+| `GRAFT_TLS_SLACK_LEN` | Bytes of TLS slack reserved; `0` opts out (bare-metal xtensa has no TLS runtime). |
+| `GRAFT_ICF` | `1` to enable identical-code folding (ICF): fold identical Rust code sections at base link (default off). |
+| `GRAFT_ICF_VERIFY` | Byte-level fold verifier (default on); `0` disables. |
+| `GRAFT_ICF_LIMIT` | Fold only the first N sorted groups (bisect knob). |
+| `GRAFT_LOG` | Path for the per-link decision/telemetry log. |
+| `GRAFT_DEBUG` | Comma-separated debug flags (`preserve-icf-inputs`). Unknown flag is a hard error. |
+| `GRAFT_DEBUG_DUMP_GRAPH` | Path to dump the closure graph. |
+| `GRAFT_DEBUG_MISMATCH` | Path to log nodes that missed a base-section match. |
+| `GRAFT_SCAN_TIMINGS` | Path for per-phase scan timing breakdown. |
+| `GRAFT_GREP` | Debug/inspection: `dup-stats` prints only section-table entries whose `trans_hash` hex contains this substring. |
+| `GRAFT_ADDR` | Debug/inspection: `dup-stats` prints only section-table entries at this address (hex, `0x`-optional). |
+
+Slack is reserved once at base-link time and can never grow at combine
+time; the overlay link asserts its payload fits and bails (to a full
+relink under `auto`) if not.
 
 ## Why xtensa is hard
 
-GNU ld *relaxes* xtensa code at link time (deletes longcall sequences,
-narrows/widens instructions, drops literal-pool words), so "where did
-this input byte land in the base" is not an offset calculation. graft
-reconciles every relaxed section byte-for-byte against a finite transform
-alphabet transcribed from binutils (`docs/16-relaxation-walk.md`),
-refusing anything it cannot explain — 10,000/10,000 sections reconcile on
-the reference corpus, and unexplained bytes force a re-emit rather than a
-guess.
+GNU ld rewrites xtensa code as it links (deleting, narrowing, and
+widening instructions), so an input byte's address in the base image
+can't be computed by offset. graft replays ld's exact set of edits —
+transcribed from binutils source — to locate each byte, and forces a
+re-link of any section it can't fully account for
+(`docs/16-relaxation-walk.md`). It accounts for all 10,000 relaxed
+sections in the reference corpus, and the same engine verifies
+470,558/470,558 sections on x86-64 (where no relaxation occurs) as a
+self-check.
 
 ## Layout
 
-- `graft/` — the linker wrapper (scan, closure, prune, relax walk, splice)
-- `esp32s3-hello/` — bare-metal fixture + `docker/hw-test.sh` hardware loop
-- `docker/flash-diff.py` — manifest-based sector-diff flasher
+- `graft/` — the linker shim (scan, closure, prune, relax walk, splice)
+- `esp32s3-hello/` — bare-metal fixture
+- `docker/` (repo root) — `hw-test.sh` hardware loop, `flash-diff.py`
+  manifest-based sector-diff flasher
 - `docs/` — design notes and post-mortems (start at `docs/README.md`)

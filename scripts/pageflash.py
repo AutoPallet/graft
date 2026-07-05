@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Superseded by docker/flash-diff.py (manifest-based sector diff).
+# Kept for the M1-era measurement scripts that reference it.
 """
 Diff two ESP32-S3 .img files at 4 KB SPI-flash sector granularity, then
 range-write only the runs of changed sectors via `espflash write-bin`.

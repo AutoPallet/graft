@@ -1,5 +1,9 @@
 # 10 — Mutation experiments on roborack3
 
+Status: historical measurement (M1.r era). Closure-cost numbers below
+predate later resolver/ICF changes; kept for the qualitative finding
+(closure cost is site-determined, log-machinery edits cascade).
+
 A 4×2 matrix of overlay rebuilds against the user's real ESP32-S3
 firmware (`~/roborack3`, fallback-only build), measuring how the
 graft closure cost (and the wall-clock breakdown) responds to

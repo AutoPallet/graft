@@ -1,7 +1,51 @@
 # 08 — Implementation status & decision log
 
-Where the work actually stands relative to the design in 05 / 06, and
-what got changed along the way. As of M1.k.
+> **Status: historical milestone log, frozen at M1.k / M1.l.** The
+> body below is the M1-era built-vs-plan record, kept for rationale.
+> It does not describe the current implementation. For "how it works
+> today," read the root `README.md` and docs 14, 15, 16. The
+> "Current state" section immediately below summarizes what shipped
+> since M1.l.
+
+## Current state (2026-07)
+
+Everything through M1.l held; the substantial changes since:
+
+- **Identity model rewritten** to a single per-section address table
+  with *positional* resolution (schema v9, `hash_algo_version` field).
+  Per-node `trans_hash` = `blake3(scc_hash ‖ member_input_hash)`;
+  mutable (writable/bss) sections get a nominal salt so distinct
+  variables never content-fold. Resolution lives in one place
+  (`resolve.rs`); prune is a dumb rewriter. See docs/14.
+- **Section anchors via a base-map object** (docs/15): overlay emits
+  `__graft_assumed_<vaddr>` UND refs, one synthetic object defines them
+  as section symbols in NOBITS/TLS map sections at base's layout.
+  PIE-compatible; ld owns all TLS/tpoff arithmetic. PIE/dynamic and the
+  rust-analyzer bench are otherwise suspended.
+- **One overlay layout mode: splice** into reserved `GRAFT_*_SLACK`.
+  The "append a fresh PT_LOAD" mode is retired. `check_slack_scooped`
+  fails the base link if the target's linker script orphan-places a
+  slack section.
+- **xtensa relaxation reconciliation walk** (docs/16, `graft/src/relax`):
+  every relaxed base section is reconciled byte-for-byte against a
+  binutils-derived transform alphabet; unexplained bytes force a
+  re-emit. 10,000/10,000 xtensa sections and 470,558/470,558 x86
+  sections reconcile on the reference corpora.
+- **`GRAFT=auto`**: self-managing base snapshot with bail-to-full-relink
+  on any overlay failure (`graft/src/auto.rs`).
+- **Base-link ICF** (`GRAFT_ICF`, default off; `GRAFT_ICF_VERIFY`
+  byte-level fold verifier default on): symmetric-weak fold of
+  `trans_hash`-identical Rust exec sections. On the reference firmware,
+  −1.22MB image (−19.2%), base ld 224s→76s.
+- **OTA sector-diff flasher** (`docker/flash-diff.py`): per-sector hash
+  manifests keyed by the image's appended id; writes only changed 4KB
+  sectors, aborts to a full write on mismatch.
+- **Hardware-validated**: abuse matrix over the silent-bug edit classes
+  is byte-exact on device; the reference firmware boots with boot parity
+  against a full link; x86 rust-analyzer overlay verified by execution.
+
+The regression noted below (M1.h rotext_dummy padding) was resolved by
+the M1.i–M1.l slack-splice layout; ignore it as a current concern.
 
 ## Status snapshot
 
