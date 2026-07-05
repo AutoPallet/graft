@@ -1,4 +1,5 @@
-//! Identical-code folding for the base link (`GRAFT_ICF=1`, default off).
+//! Identical-code folding for the base link (default ON; `GRAFT_ICF=0`
+//! opts out, links without `--gc-sections` skip it with a warning).
 //!
 //! GNU ld has no ICF, and on xtensa-espidf rustc emits cross-crate
 //! monomorphization copies as internalized LOCAL symbols with no COMDAT
@@ -104,19 +105,40 @@ use crate::scan::ScanResult;
 
 pub const ENV: &str = "GRAFT_ICF";
 
-/// Parse `GRAFT_ICF`. Unset/empty → off. `1`/`on`/`rust` → on. Anything
-/// else is a hard error — never a silent fallthrough (same policy as
-/// the `GRAFT` mode variable).
-pub fn enabled() -> Result<bool> {
+/// How the fold pass was requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Setting {
+    /// `GRAFT_ICF` unset/empty — on by default (since the 2026-07 #46
+    /// dissection: every roborack fold group verified transitively
+    /// byte-identical, full abuse matrix 7/7 on a folded base, and the
+    /// hash_identity pins guard the identity contract). Preconditions
+    /// that fail (no `--gc-sections`) degrade to a warning + no fold.
+    DefaultOn,
+    /// `GRAFT_ICF=1|on|rust` — failed preconditions are hard errors.
+    ExplicitOn,
+    /// `GRAFT_ICF=0|off`.
+    Off,
+}
+
+impl Setting {
+    pub fn is_on(self) -> bool {
+        self != Setting::Off
+    }
+}
+
+/// Parse `GRAFT_ICF`. Unrecognized values are a hard error — never a
+/// silent fallthrough (same policy as the `GRAFT` mode variable).
+pub fn setting() -> Result<Setting> {
     match std::env::var(ENV) {
-        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotPresent) => Ok(Setting::DefaultOn),
         Err(e) => Err(anyhow!("{ENV}: {e}")),
         Ok(v) => match v.as_str() {
-            "" => Ok(false),
-            "1" | "on" | "rust" => Ok(true),
+            "" => Ok(Setting::DefaultOn),
+            "1" | "on" | "rust" => Ok(Setting::ExplicitOn),
+            "0" | "off" => Ok(Setting::Off),
             other => bail!(
-                "{ENV}={other:?} is not a recognized mode (expected `1`, `on`, or \
-                 `rust`). Refusing to guess."
+                "{ENV}={other:?} is not a recognized mode (expected `1`, `on`, \
+                 `rust`, `0`, or `off`). Refusing to guess."
             ),
         },
     }

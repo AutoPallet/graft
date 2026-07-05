@@ -91,17 +91,32 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
     let map_path = output.with_extension("graft-map");
     argv.push(format!("-Wl,-Map={}", map_path.display()));
 
-    // GRAFT_ICF (default off): fold trans_hash-identical Rust sections
+    // GRAFT_ICF (default ON): fold trans_hash-identical Rust sections
     // before the real link. Needs the scan's hashes, so the parallel
     // scan-under-the-linker overlap is traded for a serial
     // scan → rewrite → ld pipeline on this path. See `icf.rs`.
-    let (ld_status, t_link, scan_result, t_scan) = if crate::icf::enabled()? {
-        if !argv.iter().any(|a| a.contains("--gc-sections")) {
-            bail!(
-                "GRAFT_ICF requires --gc-sections in the link argv — folding \
-                 works by orphaning duplicate copies for ld's gc to collect"
-            );
+    let icf_setting = crate::icf::setting()?;
+    let icf_active = match icf_setting {
+        crate::icf::Setting::Off => false,
+        on => {
+            let has_gc = argv.iter().any(|a| a.contains("--gc-sections"));
+            if !has_gc && on == crate::icf::Setting::ExplicitOn {
+                bail!(
+                    "GRAFT_ICF requires --gc-sections in the link argv — folding \
+                     works by orphaning duplicate copies for ld's gc to collect"
+                );
+            }
+            if !has_gc {
+                eprintln!(
+                    "graft base: ICF skipped — no --gc-sections in the link argv \
+                     (folding needs ld's gc to collect orphaned copies; set \
+                     GRAFT_ICF=0 to silence)"
+                );
+            }
+            has_gc
         }
+    };
+    let (ld_status, t_link, scan_result, t_scan) = if icf_active {
         let (scan_result, t_scan) = scan_handle
             .join()
             .map_err(|_| anyhow!("pre-scan thread panicked"))?;
