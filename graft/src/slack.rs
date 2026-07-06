@@ -41,8 +41,24 @@ const DEFAULT_DATA_LEN: u32 = 4 * 1024;
 // In-template TLS slack for thread-locals an overlay defines or
 // re-emits (changed initializer). Deliberately tiny: every thread
 // copies the template's filesz bytes at spawn, so this is a per-thread
-// RAM cost. Bumpable via GRAFT_SLACK_LEN (`tls=`).
+// RAM cost. Bumpable via GRAFT_SLACK_LEN (`tls=`). Not used on
+// xtensa — see `default_tls_len`.
 const DEFAULT_TLS_LEN: u32 = 64;
+
+/// xtensa defaults to NO TLS slack: both supported xtensa flavors'
+/// linker scripts (esp-hal's linkall.x, esp-idf's) have no `*(.tdata*)`
+/// scoop rule, so a TLS balloon gets orphan-placed — it once joined the
+/// IROM LOAD, flipped it writable, and crash-looped the ESP ROM
+/// bootloader with no link-time symptom. `check_slack_scooped` now
+/// fails loud on that, but a mandatory `tls=0` knob on every xtensa
+/// setup was pure friction. An explicit `GRAFT_SLACK_LEN=tls=N` still
+/// re-enables the balloon for a script that does scoop `.tdata`.
+fn default_tls_len(architecture: Architecture) -> u32 {
+    match architecture {
+        Architecture::Xtensa => 0,
+        _ => DEFAULT_TLS_LEN,
+    }
+}
 // TLS slack alignment — also a floor for the section's contribution
 // to PT_TLS p_align. New thread-locals needing more than this trip
 // the overlay's PT_TLS geometry check (loudly) rather than silently
@@ -78,27 +94,28 @@ pub struct SlackParams {
 
 impl SlackParams {
     /// Per-region defaults, before any `GRAFT_SLACK_LEN` override.
-    fn defaults() -> Self {
+    /// Arch-dependent only in the TLS region (`default_tls_len`).
+    fn defaults(architecture: Architecture) -> Self {
         Self {
             text_len: DEFAULT_TEXT_LEN,
             rodata_len: DEFAULT_RODATA_LEN,
             data_len: DEFAULT_DATA_LEN,
-            tls_len: DEFAULT_TLS_LEN,
+            tls_len: default_tls_len(architecture),
         }
     }
 
-    pub fn from_env() -> Result<Self> {
-        let Some(raw) = std::env::var_os(ENV) else { return Ok(Self::defaults()) };
+    pub fn from_env(architecture: Architecture) -> Result<Self> {
+        let Some(raw) = std::env::var_os(ENV) else { return Ok(Self::defaults(architecture)) };
         let s = raw
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("{ENV}: value is not valid UTF-8"))?;
-        Self::parse(s)
+        Self::parse(s, architecture)
     }
 
     /// Parse a `GRAFT_SLACK_LEN` value into params, applying each
     /// `region=len` pair on top of the per-region defaults. See [`ENV`].
-    fn parse(raw: &str) -> Result<Self> {
-        let mut params = Self::defaults();
+    fn parse(raw: &str, architecture: Architecture) -> Result<Self> {
+        let mut params = Self::defaults(architecture);
         let mut seen: Vec<&str> = Vec::new();
         for tok in raw.split(',').map(str::trim).filter(|t| !t.is_empty()) {
             let Some((region, value)) = tok.split_once('=') else {
@@ -303,7 +320,18 @@ mod tests {
     use super::*;
 
     fn parse(raw: &str) -> Result<SlackParams> {
-        SlackParams::parse(raw)
+        SlackParams::parse(raw, Architecture::X86_64)
+    }
+
+    #[test]
+    fn xtensa_defaults_tls_to_zero() {
+        let p = SlackParams::parse("", Architecture::Xtensa).unwrap();
+        assert_eq!(p.tls_len, 0);
+        // The other regions keep the shared defaults.
+        assert_eq!(p.text_len, DEFAULT_TEXT_LEN);
+        // And an explicit override still wins over the arch default.
+        let p = SlackParams::parse("tls=64", Architecture::Xtensa).unwrap();
+        assert_eq!(p.tls_len, 64);
     }
 
     #[test]

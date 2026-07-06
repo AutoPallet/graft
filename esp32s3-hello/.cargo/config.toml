@@ -14,13 +14,9 @@ build-std = ["alloc", "core"]
 
 [env]
 ESP_LOG = "INFO"
-# No TLS runtime on bare-metal xtensa, and esp-hal's linkall.x has no
-# *(.tdata*) rule — ld orphan-places graft's TLS slack into the IROM
-# LOAD, flipping it writable, and the ROM bootloader rejects the image
-# (boot crash-loop, found on hardware). Opt out of TLS slack entirely
-# via the `tls=0` region of the unified GRAFT_SLACK_LEN knob; graft's
-# base mode fails loud if any slack section gets orphaned.
-GRAFT_SLACK_LEN = "tls=0"
+# TLS slack defaults to 0 on xtensa (esp-hal's linkall.x has no
+# *(.tdata*) rule to scoop it; see graft/src/slack.rs default_tls_len),
+# so no GRAFT_SLACK_LEN setting is needed here.
 # graft's passthrough mode forwards all argv to the real linker. For
 # xtensa builds the gcc driver (not bare ld) is what rustc expects to
 # invoke — it knows how to add the right libgcc / startfiles / linker
