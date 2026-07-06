@@ -13,9 +13,11 @@
 //!
 //!   1. Entry symbol. `manifest.entry_symbol` names it (M0.5: always
 //!      `main`). On a hosted link the *real* ld entry is `_start` (in
-//!      crt1.o, outside our scan), but `_start` immediately calls
-//!      `main` — treating main as the root covers the same reach-cone
-//!      from our graph's perspective.
+//!      crt1.o — a scan input on self-contained musl), but `_start`
+//!      immediately calls `main`, so rooting main covers the same
+//!      reach-cone for closure purposes; drift in the `_start` cone
+//!      itself is pinned separately by the boot fingerprint
+//!      (overlay.rs boot guard).
 //!
 //!   2. `-u SYM` / `--undefined SYM` on argv. Force-undefined symbols.
 //!

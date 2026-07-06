@@ -138,7 +138,7 @@ real link, and graft rides alongside to record where everything landed.
    for `.symtab` addresses, joins them with the pre-scan's hashes, and
    attaches two non-alloc (`SHF_ALLOC=0`) sections to the ELF:
    `.graft.manifest` (root record — schema version, hash-algo version,
-   entry symbol, toolchain stamp, build-id, pre-main aggregator hashes)
+   entry symbol, toolchain stamp, build-id, boot fingerprint)
    and `.graft.sections` (the
    content-keyed table: `trans_hash → placed address + size`). These are
    postcard-encoded and schema-versioned; a stale base fails loud rather
@@ -356,13 +356,16 @@ relink, so the build never breaks. The main refusal classes:
   definitions and no strong override; ld's bind is link-order-dependent
   and graft can't track it soundly. Base warns (plain ld semantics),
   overlay refuses.
-- **Pre-main constructor drift** — the `.init_array` aggregator's hash
-  differs from base's (a constructor added, removed, reordered, or
-  anything one transitively calls edited). The runtime walks *base's*
-  constructor table — the bracket symbols resolve to base and only the
-  entry symbol is trampolined — so the change could never take effect
-  through an overlay; refuse instead of leaving base's stale
-  constructor running.
+- **Boot-cone drift** — the trans_hash of the ELF-entry symbol's node
+  (the manifest's *boot fingerprint*) differs from base's. With edges
+  into the trampoline symbol cut, that one hash covers everything
+  reachable from boot *except* the redirectable subtree: crt, the
+  pre-main constructor walk and its `.init_array` aggregates, fini. A
+  constructor added, removed, reordered, or edited (or anything one
+  transitively calls) lands here — the runtime walks base's
+  constructor table and only the entry symbol is trampolined, so the
+  change could never take effect through an overlay; refuse instead of
+  leaving base's stale constructor running.
 - **Walk refusal on mutable content** — a relaxed-base positional anchor
   the walk can't translate, where re-emitting would fork a variable.
 - **Anchor byte-mismatch** — a channel-2 positional anchor whose base.elf

@@ -155,26 +155,26 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
     let closure = compute_closure_fixpoint(&scan, &base, &roots, walker.as_ref())?;
     let t_closure = t_closure_start.elapsed();
 
-    // Pre-main aggregates (.init_array & co.) are consumed by base's
-    // startup walk, not through the trampoline: the bracket symbols
-    // resolve to base, so a changed aggregate can never take effect —
-    // even when the closure re-emits it, the fresh merged array in
-    // slack is walked by nobody (and closure membership is guaranteed
-    // whenever a contributor is #[used]/RETAIN'd, since that roots the
-    // aggregator). Refuse; auto converts this into a full relink.
-    // Aggregator hashes live in the manifest because synthetic nodes
-    // have no entry in base's section table.
-    for (nid, nm) in scan.graph.nodes.iter().enumerate() {
-        let Some(id) = nm.aggregator_id else { continue };
-        let base_th = base.manifest.aggregator_hashes.iter()
-            .find(|a| a.id == id)
-            .map(|a| a.trans_hash);
-        if base_th != Some(scan.trans_hash[nid]) {
+    // Boot guard. The manifest's boot fingerprint is the trans_hash of
+    // the node defining the ELF-entry symbol; with edges into the
+    // trampoline symbol cut, it covers everything reachable from boot
+    // EXCEPT the redirectable subtree — crt, the pre-main constructor
+    // walk and its .init_array aggregates, fini. None of that can take
+    // effect through an overlay (only the entry symbol is trampolined),
+    // so drift there refuses; auto converts it into a full relink.
+    if let Some(boot) = &base.manifest.boot {
+        let cur = scan
+            .graph
+            .symbols
+            .resolve_global(&boot.symbol)
+            .map(|(nid, _)| scan.trans_hash[nid as usize]);
+        if cur != Some(boot.trans_hash) {
             bail!(
-                "overlay refused: pre-main constructors changed ({id}) — base's \
-                 startup walks its own constructor table, which the overlay \
-                 cannot redirect, so the change would never take effect. A full \
-                 relink is required; GRAFT=auto does this automatically."
+                "overlay refused: content reachable from boot ({}) changed \
+                 outside the entry symbol's subtree — pre-main/crt code cannot \
+                 be redirected, so the change would never take effect. A full \
+                 relink is required; GRAFT=auto does this automatically.",
+                boot.symbol
             );
         }
     }

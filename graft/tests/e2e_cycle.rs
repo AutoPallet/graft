@@ -511,14 +511,14 @@ fn entry_cut_keeps_caller_in_base() {
     assert!(out.contains("sum = 105"), "rest of base unchanged: {out}");
 }
 
-/// Pre-main constructor guard (schema v10): the runtime walks BASE's
+/// Boot guard (schema v10): the runtime walks BASE's
 /// `[__init_array_start, __init_array_end)` — the closure can re-emit a
 /// changed ctor, but the re-emitted copy is unreachable (the pre-main
-/// path is rooted at `_start`, outside the scan, and only `main` is
-/// trampolined). So an overlay whose `.init_array` aggregator hash
-/// differs from base's must REFUSE, not silently leave base's stale
-/// ctor running. Positive control first: overlays still work with a
-/// ctor merely present.
+/// path is rooted at the ELF entry `_start`, and only `main` is
+/// trampolined). A ctor edit cascades into `_start`'s trans_hash (the
+/// manifest's boot fingerprint), and the overlay must REFUSE, not
+/// silently leave base's stale ctor running. Positive control first:
+/// overlays still work with a ctor merely present.
 #[test]
 #[ignore]
 fn ctor_edit_refuses_overlay() {
@@ -581,8 +581,8 @@ fn ctor_edit_refuses_overlay() {
     fx.edit("base/src/lib.rs", "CTOR_SEEN.store(7,", "CTOR_SEEN.store(9,");
     let stderr = fx.cargo_build_expect_fail(&overlay_env);
     assert!(
-        stderr.contains("pre-main constructor"),
-        "refusal must name the ctor guard:\n{stderr}"
+        stderr.contains("reachable from boot"),
+        "refusal must name the boot guard:\n{stderr}"
     );
 }
 

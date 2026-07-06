@@ -74,8 +74,9 @@ fn run_cache_info(path: &Path, grep: Option<&str>, addr: Option<&str>) -> anyhow
     println!("  entry_symbol     {}", m.entry_symbol);
     println!("  toolchain_stamp  {}", m.toolchain_stamp);
     println!("  overlay_region   {:#x}..{:#x}", m.overlay_region.0, m.overlay_region.1);
-    for a in &m.aggregator_hashes {
-        println!("  aggregator       {} {}", a.id, hex(&a.trans_hash));
+    match &m.boot {
+        Some(b) => println!("  boot             {} {}", b.symbol, hex(&b.trans_hash)),
+        None => println!("  boot             (unattributed — pre-main drift guard inactive)"),
     }
     println!();
     println!(

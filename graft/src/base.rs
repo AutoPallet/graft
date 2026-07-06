@@ -209,8 +209,14 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
         entry_symbol: entry_for_scan.clone().unwrap_or_else(|| "main".into()),
         toolchain_stamp: toolchain_stamp(),
         overlay_region: (0, 0), // no region reserved; overlay picks a disjoint addr
-        aggregator_hashes: scan_result.aggregator_hashes(),
+        boot: boot_fingerprint(&elf_bytes, &scan_result),
     };
+    if manifest.boot.is_none() {
+        eprintln!(
+            "graft base: could not attribute e_entry to a scanned symbol — \
+             pre-main drift guard inactive for this base"
+        );
+    }
 
     let manifest_bytes = encode_manifest(&manifest)?;
     let sections_bytes = encode_sections(&table)?;
@@ -239,6 +245,38 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
         t_total,
     );
     Ok(())
+}
+
+/// Attribute the linked output's `e_entry` to a scanned defined symbol
+/// and record that node's trans_hash — the boot fingerprint
+/// (metadata.rs, v10 note). With edges into the trampoline symbol cut,
+/// this one hash covers everything reachable from boot except the
+/// redirectable subtree. `None` when no named scanned symbol sits at
+/// the entry address (the caller warns; the guard is then inactive).
+fn boot_fingerprint(
+    elf_bytes: &[u8],
+    scan: &crate::scan::ScanResult,
+) -> Option<crate::metadata::BootFingerprint> {
+    use object::{Object, ObjectSymbol};
+    let file = object::File::parse(elf_bytes).ok()?;
+    let entry = file.entry();
+    let name = file.symbols().find_map(|s| {
+        if s.address() != entry || s.is_undefined() {
+            return None;
+        }
+        if matches!(s.kind(), object::SymbolKind::Section | object::SymbolKind::File) {
+            return None;
+        }
+        match s.name() {
+            Ok(n) if !n.is_empty() => Some(n.to_string()),
+            _ => None,
+        }
+    })?;
+    let (nid, _) = scan.graph.symbols.resolve_global(&name)?;
+    Some(crate::metadata::BootFingerprint {
+        symbol: name,
+        trans_hash: scan.trans_hash[nid as usize],
+    })
 }
 
 /// One-line dedup-miss summary, printed on every base link. The full
