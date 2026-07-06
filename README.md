@@ -54,6 +54,8 @@ This process considers changes to functions, read-only data like strings, mutabl
 
 In cases where the linker modifies the instructions in the linked code (*cough cough looking at you xtensa*) graft has an algorithm to reverse-engineer and resolve relocation targets correctly.
 
+Slack is reserved once at base-link time and can never grow at combine time. The overlay link asserts its payload fits and bails (to a full relink under `auto`) if not.
+
 ## Usage
 
 **For xtensa/esp32**
@@ -91,19 +93,15 @@ Other things are currently unsupported entirely
 
 | Variable | Effect |
 |---|---|
-| `GRAFT` | Mode: unset/`passthrough`, `auto`, `base`, `overlay`. Unrecognized value is a hard error. |
+| `GRAFT` | Mode: unset/`passthrough`, `auto`, `base`, `overlay`. |
 | `GRAFT_REAL_LD` | Real linker graft execs (default `cc`; bare-metal sets e.g. `xtensa-esp32s3-elf-gcc`). |
-| `GRAFT_BASE_ELF` | `overlay` mode: base ELF to prune against. `auto` uses its own snapshot instead. |
+| `GRAFT_BASE_ELF` | `overlay` mode: base ELF to prune against. |
 | `GRAFT_REBASE` | `auto` mode: `1` forces a fresh base link, discarding the snapshot. |
-| `GRAFT_ENTRY_SYMBOL` | Move the single overlay trampoline off `main` (debugging; default `main`). |
+| `GRAFT_ENTRY_SYMBOL` | Which function to replace with a jump to the overlay code (default `main`). |
 | `GRAFT_SLACK_LEN` | Slack bytes the base link reserves for future overlays, as a comma-separated list of `region=len` pairs over regions `text`, `rodata`, `data`, `tls` (e.g. `"text=2M,tls=0"`). Lengths accept decimal, `0x` hex, and case-insensitive `K`/`M` suffixes. |
-| `GRAFT_ICF` | `1` to enable identical-code folding (ICF): fold identical Rust code sections at base link (default off). |
+| `GRAFT_ICF` | `1` to enable identical-code folding (ICF): fold identical Rust code sections before the base link (default off). |
 | `GRAFT_ICF_VERIFY` | Byte-level fold verifier (default on); `0` disables. |
-| `GRAFT_ANCHOR_VERIFY` | Overlay-side byte-check of channel-2 positional anchors against base.elf (default on); `0` disables (ships an unverified bind). |
+| `GRAFT_ANCHOR_VERIFY` | Overlay-side byte-check of positional anchors against base.elf (default on); `0` disables. |
 | `GRAFT_LOG` | Path for the per-link decision/telemetry log. |
 | `GRAFT_DEBUG` | Comma-separated debug flags; unknown flag is a hard error. Flags: `preserve-icf-inputs`, `dump-graph=<path>` (dump the closure graph), `scan-timings` (per-phase scan timings to stderr), `icf-limit=<N>` (fold only the first N sorted ICF groups - for bisecting), `mismatch=<path>` (log nodes that missed a base-section match). |
-
-Slack is reserved once at base-link time and can never grow at combine
-time; the overlay link asserts its payload fits and bails (to a full
-relink under `auto`) if not.
 
