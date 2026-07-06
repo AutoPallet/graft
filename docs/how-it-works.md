@@ -10,6 +10,43 @@ The output of every mode is an ordinary ET_EXEC ELF that boots the normal
 way. There is no runtime, no hot-patch loader, no jump table baked into
 the program. All the cleverness is at link time.
 
+The shape of it:
+
+```
+BASE IMAGE (linked once; slack balloons reserved up front)
+
+  +----------+----------------+------------+-------------+-----------+------------+
+  |  .text   | GRAFT_TEXT     |  .rodata   | GRAFT_RO... |  .data    | GRAFT_DATA |
+  |  code    |  _SLACK        |  consts    |  _SLACK     |  statics  |  _SLACK    |
+  |          | (0xFF balloon) |            | (balloon)   |           | (balloon)  |
+  +----------+----------------+------------+-------------+-----------+------------+
+
+  edit foo() -> the overlay link re-emits only the changed closure (foo'
+  and its transitive referrers, up to main') and splices it into the
+  balloons:
+
+  +----------+----------------+------------+-------------+-----------+------------+
+  |  .text   | main'..foo'    |  .rodata   | (unchanged) |  .data    | (spliced)  |
+  |  code    | (spliced into  |  consts    |             |  statics  |            |
+  |    |     |  slack)        |            |             |           |            |
+  +----|-----+----------------+------------+-------------+-----------+------------+
+       |            ^                                ^
+       +------------+ one trampoline: base's main    | references to unchanged
+         (long jump)  jumps to main'                 | code/data resolve to
+                                                     | base's addresses (anchors),
+   old main/foo bodies stay in place, unreachable    | so nothing else moves
+```
+
+Unchanged references never move: an anchor pins them to base's address as
+a constant. Only the entry symbol is trampolined; the rest of base is
+byte-for-byte untouched, which is what makes a sector-diff flash cheap.
+
+Mode selection is the `GRAFT` env var. Unset (or `passthrough`, or empty)
+forwards untouched — the path IDEs, `cargo check`, and `build.rs` probes
+take. A set-but-unrecognized value is a hard error, never a silent
+passthrough: a typo'd mode would otherwise ship an ordinary,
+un-instrumented binary that looks fine but can never be patched.
+
 This doc is the maintained account of what each mode does and why it is
 sound. For the identity model it rests on, read
 [`14-identity-granularity.md`](./14-identity-granularity.md); for the
@@ -76,9 +113,10 @@ real link, and graft rides alongside to record where everything landed.
    build loudly on any orphaned `*.graft_slack` output section. Sizes are
    env-driven via `GRAFT_SLACK_LEN` (a comma-separated list of
    `region=len` pairs over `text`/`rodata`/`data`/`tls`); slack is
-   reserved once here and can never grow at combine time. Bare-metal
-   targets with no TLS runtime set `GRAFT_SLACK_LEN=tls=0` to opt the
-   TLS balloon out.
+   reserved once here and can never grow at combine time. On xtensa the
+   TLS balloon defaults to 0 — no supported xtensa linker script scoops
+   `.tdata`, and an orphan-placed TLS balloon once crash-looped the ESP
+   ROM bootloader; an explicit `tls=N` re-enables it.
 
 3. **Address oracle.** graft always adds `-Wl,-Map=<output>.graft-map`.
    The linker map is the authoritative source of each input section's
@@ -100,7 +138,8 @@ real link, and graft rides alongside to record where everything landed.
    for `.symtab` addresses, joins them with the pre-scan's hashes, and
    attaches two non-alloc (`SHF_ALLOC=0`) sections to the ELF:
    `.graft.manifest` (root record — schema version, hash-algo version,
-   entry symbol, toolchain stamp, build-id) and `.graft.sections` (the
+   entry symbol, toolchain stamp, build-id, pre-main aggregator hashes)
+   and `.graft.sections` (the
    content-keyed table: `trans_hash → placed address + size`). These are
    postcard-encoded and schema-versioned; a stale base fails loud rather
    than mis-resolving (`metadata.rs`, `SCHEMA_VERSION`).
@@ -283,6 +322,20 @@ succeeds, just slower" — always correct, sometimes slower.
 
 ---
 
+## Subcommands
+
+Outside the linker seat the same binary exposes:
+
+- `graft combine <base.elf> <overlay.elf> -o <out.elf>` — the splice
+  step, standalone.
+- `graft scan-dump` / `graft dup-stats` — inspect the scan's
+  section/hash view of a link line.
+- `graft cache-info <base.elf>` — dump the attached manifest + section
+  table; `--grep <substr>` filters entries by `trans_hash` hex
+  substring, `--addr <addr>` by placed address.
+
+---
+
 ## Failure philosophy
 
 Every ambiguity is a loud refusal at link time, never a runtime guess. A
@@ -303,6 +356,13 @@ relink, so the build never breaks. The main refusal classes:
   definitions and no strong override; ld's bind is link-order-dependent
   and graft can't track it soundly. Base warns (plain ld semantics),
   overlay refuses.
+- **Pre-main constructor drift** — the `.init_array` aggregator's hash
+  differs from base's (a constructor added, removed, reordered, or
+  anything one transitively calls edited). The runtime walks *base's*
+  constructor table — the bracket symbols resolve to base and only the
+  entry symbol is trampolined — so the change could never take effect
+  through an overlay; refuse instead of leaving base's stale
+  constructor running.
 - **Walk refusal on mutable content** — a relaxed-base positional anchor
   the walk can't translate, where re-emitting would fork a variable.
 - **Anchor byte-mismatch** — a channel-2 positional anchor whose base.elf
@@ -315,5 +375,27 @@ relink, so the build never breaks. The main refusal classes:
 - **Slack overflow** — the overlay payload doesn't fit the reserved
   balloon (slack can't grow at combine time).
 - **Stale / incompatible snapshot** — manifest schema or hash-algo
-  version mismatch, or an argv reshape; the base is not a valid oracle
-  for this overlay.
+  version mismatch; the base is not a valid oracle for this overlay.
+  (Changes to the link argv itself are *not* currently detected — see
+  the README's Limitations.)
+
+---
+
+## Validation
+
+Unit and e2e pins cover each resolution channel (including both bail
+paths), the nominal-identity predicate, adversarial hash-identity
+attacks, and fails-before tests for both byte verifiers (ICF folds,
+channel-2 anchors). On top of that, correctness is validated on-device
+by an abuse matrix over edit classes that historically produce *silent*
+incremental-link bugs:
+
+- changed static initializers with unchanged users,
+- single-user edits against base-resident statics,
+- zero-init `.bss` twins (aliasing canaries),
+- string/rodata edits,
+- function bodies reached only through static function pointers,
+- cross-crate edits,
+
+each checked against computed expected values at boot on ESP32-S3
+hardware, and byte-compared against a full relink of the same tree.

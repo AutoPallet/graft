@@ -11,6 +11,14 @@ and post-mortems kept for rationale. They are not maintained and may
 describe superseded specifics; read them for the *why*, not the current
 contract.
 
+## Repo layout
+
+- `graft/` — the linker shim (scan, closure, prune, relax walk, splice)
+- `esp32s3-hello/` — bare-metal ESP32-S3 fixture
+- `docker/` (repo root) — `hw-test.sh` hardware loop, `flash-diff.py`
+  manifest-based sector-diff flasher
+- `docs/` — this directory
+
 ## Design
 
 - [`how-it-works.md`](./how-it-works.md) — what actually happens in the
