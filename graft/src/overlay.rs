@@ -102,6 +102,19 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
         );
     }
 
+    // Pre-main constructor guard. The runtime walks BASE's
+    // [__init_array_start, __init_array_end): the bracket symbols
+    // resolve through base's symtab and combine never touches the
+    // merged array, so a changed contributor — a ctor added, removed,
+    // reordered, its body edited, or anything a ctor transitively
+    // calls edited — can never take effect through an overlay. It
+    // would be re-emitted into slack where the walk never looks and
+    // base's stale constructor would keep running, silently. The
+    // aggregator node's trans_hash cascades on every such change, so
+    // hash inequality is exactly "pre-main behavior changed": refuse
+    // (auto converts this into a full relink).
+    check_aggregator_hashes(&base.manifest.aggregator_hashes, &scan.aggregator_hashes())?;
+
     // esp-idf's linker scripts mark `.flash.rodata` with SHF_TLS (a
     // workaround for ld's IROM/DROM vaddr-overlap error), leaving a
     // fake megabyte-scale PT_TLS covering all of DROM. Real ELF TLS
@@ -1356,6 +1369,43 @@ pub(crate) struct Closure {
 /// mutable sections at distinct addresses are distinct variables, and
 /// aliasing them is exactly the silent-stale-bind failure mode this
 /// design exists to prevent.
+/// The pre-main constructor guard's comparison: base's recorded
+/// aggregator hashes (manifest, sorted by id) vs the overlay scan's.
+/// Any difference — an aggregator appearing, disappearing, or hashing
+/// differently — refuses the overlay, naming the ids.
+fn check_aggregator_hashes(
+    base: &[crate::metadata::AggregatorHash],
+    overlay: &[crate::metadata::AggregatorHash],
+) -> Result<()> {
+    if base == overlay {
+        return Ok(());
+    }
+    let base_by_id: HashMap<&str, [u8; 16]> =
+        base.iter().map(|a| (a.id.as_str(), a.trans_hash)).collect();
+    let overlay_by_id: HashMap<&str, [u8; 16]> =
+        overlay.iter().map(|a| (a.id.as_str(), a.trans_hash)).collect();
+    let mut ids: Vec<&str> = base_by_id.keys().chain(overlay_by_id.keys()).copied().collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut diffs = Vec::new();
+    for id in ids {
+        match (base_by_id.get(id), overlay_by_id.get(id)) {
+            (Some(b), Some(o)) if b != o => diffs.push(format!("{id} (content changed)")),
+            (Some(_), None) => diffs.push(format!("{id} (present in base only)")),
+            (None, Some(_)) => diffs.push(format!("{id} (new in overlay)")),
+            _ => {}
+        }
+    }
+    bail!(
+        "overlay refused: pre-main constructor content changed: {} — \
+         the runtime walks base's constructor table, which an overlay \
+         cannot redirect, so the change could never take effect (base's \
+         stale constructor would keep running silently). A full relink \
+         is required; GRAFT=auto does this automatically.",
+        diffs.join(", ")
+    );
+}
+
 fn mutable_trans_hashes(scan: &ScanResult) -> HashSet<TransHash> {
     let mut out = HashSet::new();
     for (nid, nm) in scan.graph.nodes.iter().enumerate() {
@@ -2225,6 +2275,35 @@ fn render_blockers_ld_esp_idf(ram: &RamUsage) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn agg(id: &str, h: u8) -> crate::metadata::AggregatorHash {
+        crate::metadata::AggregatorHash { id: id.into(), trans_hash: [h; 16] }
+    }
+
+    #[test]
+    fn aggregator_guard_accepts_equal_sets() {
+        let v = vec![agg(".fini_array", 2), agg(".init_array", 1)];
+        assert!(check_aggregator_hashes(&v, &v.clone()).is_ok());
+        assert!(check_aggregator_hashes(&[], &[]).is_ok());
+    }
+
+    #[test]
+    fn aggregator_guard_refuses_changed_hash() {
+        let base = vec![agg(".init_array", 1)];
+        let overlay = vec![agg(".init_array", 9)];
+        let err = check_aggregator_hashes(&base, &overlay).unwrap_err().to_string();
+        assert!(err.contains(".init_array (content changed)"), "{err}");
+        assert!(err.contains("pre-main constructor"), "{err}");
+    }
+
+    #[test]
+    fn aggregator_guard_refuses_added_and_removed() {
+        let base = vec![agg(".fini_array", 2)];
+        let overlay = vec![agg(".init_array", 1)];
+        let err = check_aggregator_hashes(&base, &overlay).unwrap_err().to_string();
+        assert!(err.contains(".fini_array (present in base only)"), "{err}");
+        assert!(err.contains(".init_array (new in overlay)"), "{err}");
+    }
 
     #[test]
     fn mutate_memory_x_replaces_three_lines() {

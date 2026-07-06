@@ -37,7 +37,14 @@ pub const GRAFT_MAGIC: [u8; 4] = *b"GRFT";
 // self-documenting. A hash-value change without a version bump leaves
 // the stale-base guard blind (every by_section lookup misses and the
 // closure silently becomes whole-program), so never skip the bump.
-pub const SCHEMA_VERSION: u16 = 9;
+// v10: manifest gains `aggregator_hashes` — per-aggregator trans_hash
+// of the synthetic `.init_array`/`.fini_array`/`.preinit_array` nodes
+// at base scan. Overlay refuses when its own scan's aggregator hashes
+// differ: the runtime walks BASE's constructor table (bracket symbols
+// resolve to base's symtab), so a changed contributor can never take
+// effect through an overlay — without the guard, base's stale ctor
+// keeps running silently.
+pub const SCHEMA_VERSION: u16 = 10;
 
 /// Version of the trans_hash algorithm itself, independent of table
 /// layout. Bump whenever hash VALUES change for unchanged inputs;
@@ -61,6 +68,21 @@ pub struct GraftManifest {
     /// Link-time [start, end) address range reserved for overlays.
     /// Informational — the overlay link script is authoritative.
     pub overlay_region: (u64, u64),
+    /// trans_hash of each synthetic linker-aggregate node
+    /// (`.init_array` & co.) at base scan, sorted by id. The overlay
+    /// guard compares these against its own scan's values (see
+    /// `overlay::check_aggregator_hashes`).
+    pub aggregator_hashes: Vec<AggregatorHash>,
+}
+
+/// One aggregator's identity fingerprint: the synthetic node's id
+/// (`.init_array`, ...) and its trans_hash, which cascades on any
+/// contributor change — an entry added/removed/reordered, a ctor body
+/// edited, or anything a ctor transitively references edited.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AggregatorHash {
+    pub id: String,
+    pub trans_hash: [u8; 16],
 }
 
 /// "Where did base place the section with this content?" record. Stored
@@ -145,6 +167,10 @@ mod tests {
             entry_symbol: "main".into(),
             toolchain_stamp: "rustc-1.94.1".into(),
             overlay_region: (0x5_0000_0000, 0x5_0100_0000),
+            aggregator_hashes: vec![AggregatorHash {
+                id: ".init_array".into(),
+                trans_hash: [0x22; 16],
+            }],
         };
         let bytes = encode_manifest(&m).unwrap();
         let decoded = decode_manifest(&bytes).unwrap();

@@ -209,6 +209,7 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
         entry_symbol: entry_for_scan.clone().unwrap_or_else(|| "main".into()),
         toolchain_stamp: toolchain_stamp(),
         overlay_region: (0, 0), // no region reserved; overlay picks a disjoint addr
+        aggregator_hashes: scan_result.aggregator_hashes(),
     };
 
     let manifest_bytes = encode_manifest(&manifest)?;
@@ -344,7 +345,7 @@ fn inject_slack(
     arch: object::Architecture,
     output: &std::path::Path,
 ) -> Result<Vec<String>> {
-    let params = crate::slack::SlackParams::from_env()?;
+    let params = crate::slack::SlackParams::from_env(arch)?;
     let bytes = crate::slack::synthesize(arch, &params)?;
     let slack_path = output.with_extension("graft-slack.o");
     atomic_write(&slack_path, &bytes)?;

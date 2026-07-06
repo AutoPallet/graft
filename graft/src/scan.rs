@@ -34,6 +34,29 @@ pub struct ScanResult {
     pub walked_archives: HashSet<PathBuf>,
 }
 
+impl ScanResult {
+    /// trans_hash of each synthetic aggregator node (`.init_array` &
+    /// co.), sorted by id. Base stores this in the manifest; overlay
+    /// compares against its own scan's values to catch pre-main
+    /// constructor drift (`overlay::check_aggregator_hashes`).
+    pub fn aggregator_hashes(&self) -> Vec<crate::metadata::AggregatorHash> {
+        let mut v: Vec<crate::metadata::AggregatorHash> = self
+            .graph
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(nid, nm)| {
+                nm.aggregator_id.map(|id| crate::metadata::AggregatorHash {
+                    id: id.to_string(),
+                    trans_hash: self.trans_hash[nid],
+                })
+            })
+            .collect();
+        v.sort_by(|a, b| a.id.cmp(&b.id));
+        v
+    }
+}
+
 /// Run the scan against eager paths (`.o`, `.rlib`) and deferred
 /// archive paths (`.a`). `extra_roots` is a set of symbol names the
 /// link argv asked for via `-u <sym>` / `--undefined=<sym>` — those

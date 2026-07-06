@@ -66,7 +66,32 @@ impl Fixture {
         std::fs::write(&path, s.replace(from, to)).unwrap();
     }
 
+    /// Like `cargo_build`, but the build is EXPECTED to fail (an
+    /// overlay refusal is a hard link error in explicit overlay mode).
+    /// Returns cargo's stderr, which carries the linker's message —
+    /// rustc surfaces linker stderr on failure.
+    fn cargo_build_expect_fail(&self, env: &[(&str, &str)]) -> String {
+        let out = self.cargo_build_raw(env);
+        assert!(
+            !out.status.success(),
+            "cargo build unexpectedly succeeded ({env:?}) — the overlay \
+             refusal under test did not fire"
+        );
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
     fn cargo_build(&self, env: &[(&str, &str)]) {
+        let out = self.cargo_build_raw(env);
+        if !out.status.success() {
+            panic!(
+                "cargo build failed ({:?})\nstderr:\n{}",
+                env,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    fn cargo_build_raw(&self, env: &[(&str, &str)]) -> std::process::Output {
         // Cargo doesn't track env vars like `GRAFT`, so switching between
         // base and overlay mode with unchanged sources wouldn't trigger
         // a relink. Clean `app` specifically (leaving `base`'s rlib
@@ -88,14 +113,7 @@ impl Fixture {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let out = cmd.output().expect("spawn cargo");
-        if !out.status.success() {
-            panic!(
-                "cargo build failed ({:?})\nstderr:\n{}",
-                env,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
+        cmd.output().expect("spawn cargo")
     }
 
     fn combine_stats(&self) -> Stats {
@@ -491,6 +509,81 @@ fn entry_cut_keeps_caller_in_base() {
     let out = run_combined(&fx.app_bin());
     assert!(out.contains("cshim = 151"), "edited inner, via base's outer + trampoline: {out}");
     assert!(out.contains("sum = 105"), "rest of base unchanged: {out}");
+}
+
+/// Pre-main constructor guard (schema v10): the runtime walks BASE's
+/// `[__init_array_start, __init_array_end)` — the closure can re-emit a
+/// changed ctor, but the re-emitted copy is unreachable (the pre-main
+/// path is rooted at `_start`, outside the scan, and only `main` is
+/// trampolined). So an overlay whose `.init_array` aggregator hash
+/// differs from base's must REFUSE, not silently leave base's stale
+/// ctor running. Positive control first: overlays still work with a
+/// ctor merely present.
+#[test]
+#[ignore]
+fn ctor_edit_refuses_overlay() {
+    let fx = Fixture::new();
+
+    // Install a pre-main constructor before the base build. Restored
+    // by Fixture::drop.
+    fx.edit(
+        "base/src/lib.rs",
+        "    (a, z)\n}",
+        concat!(
+            "    (a, z)\n}\n\n",
+            "// Pre-main constructor (ctor-guard e2e): runs off base's\n",
+            "// .init_array walk; main-side code reads the value back.\n",
+            "static CTOR_SEEN: AtomicU32 = AtomicU32::new(0);\n\n",
+            "extern \"C\" fn graft_e2e_ctor() {\n",
+            "    CTOR_SEEN.store(7, Ordering::Relaxed);\n",
+            "}\n\n",
+            "#[used]\n",
+            "#[unsafe(link_section = \".init_array\")]\n",
+            "static GRAFT_E2E_CTOR: extern \"C\" fn() = graft_e2e_ctor;\n\n",
+            "pub fn ctor_seen() -> u32 {\n",
+            "    CTOR_SEEN.load(Ordering::Relaxed)\n",
+            "}\n",
+        ),
+    );
+    fx.edit(
+        "app/src/main.rs",
+        "println!(\"tls = {a1},{z1},{a2},{z2},{ta},{tz}\");",
+        "println!(\"tls = {a1},{z1},{a2},{z2},{ta},{tz}\");\n    \
+         println!(\"ctor = {}\", base::ctor_seen());",
+    );
+
+    fx.cargo_build(&[("GRAFT", "base"), ("GRAFT_MAP_ORACLE", "1")]);
+    let base_elf = std::env::temp_dir().join("graft-e2e-ctor-base.elf");
+    std::fs::copy(fx.app_bin(), &base_elf).unwrap();
+    make_executable(&base_elf);
+    let base_out = run_combined(&base_elf);
+    assert!(base_out.contains("ctor = 7"), "ctor must run pre-main: {base_out}");
+
+    let base_env = base_elf.to_string_lossy().into_owned();
+    let log_env = fx.graft_log_path().to_string_lossy().into_owned();
+    let overlay_env = [
+        ("GRAFT", "overlay"),
+        ("GRAFT_BASE_ELF", base_env.as_str()),
+        ("GRAFT_LOG", log_env.as_str()),
+    ];
+
+    // Positive control: an unrelated edit with the ctor present must
+    // still overlay (equal aggregator hashes pass the guard).
+    fx.edit("base/src/lib.rs", "wrapping_mul(7)", "wrapping_mul(13)");
+    fx.cargo_build(&overlay_env);
+    let out = run_combined(&fx.app_bin());
+    assert!(out.contains("sum = 195"), "control edit visible: {out}");
+    assert!(out.contains("ctor = 7"), "control keeps ctor: {out}");
+    fx.edit("base/src/lib.rs", "wrapping_mul(13)", "wrapping_mul(7)");
+
+    // The pin: a ctor-body edit must refuse the overlay. (Pre-guard,
+    // this build SUCCEEDED and printed the stale `ctor = 7`.)
+    fx.edit("base/src/lib.rs", "CTOR_SEEN.store(7,", "CTOR_SEEN.store(9,");
+    let stderr = fx.cargo_build_expect_fail(&overlay_env);
+    assert!(
+        stderr.contains("pre-main constructor"),
+        "refusal must name the ctor guard:\n{stderr}"
+    );
 }
 
 /// For small, focused source mutations, graft's *overlay payload*
