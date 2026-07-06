@@ -248,13 +248,25 @@ pub fn verify_interchangeable(
         let [tseg] = nm.segments.as_slice() else {
             return Ref::Node(nid, value + r.addend);
         };
+        // Pool-entry target: the graph already resolved this reloc to
+        // the precise entry node (symbol-form by st_value, section-form
+        // by addend — hash.rs's conventions). Position is made
+        // ENTRY-relative, so a PC bias riding in the addend compares
+        // equal across pools of different shapes. Naive S+A re-derivation
+        // here smeared that bias across entry boundaries whenever two
+        // pools packed different entry counts — refusing a sound fold
+        // (the Splice::drop pair: same zero constant, 3-entry vs
+        // 1-entry .rodata.cst16).
+        if let Some((s, _)) = tseg.range {
+            return Ref::Node(nid, value + r.addend - s as i64);
+        }
         let key = (tseg.object, tseg.section);
         match pool_entries.get(&key) {
             None => Ref::Node(nid, value + r.addend),
             Some(entries) => {
-                // Split pool: recover the referenced entry by naive
-                // S + A offset (BFD's _bfd_merged_section_offset does
-                // the same arithmetic).
+                // Whole-section target inside a split pool (the graph
+                // couldn't attribute an entry): recover by naive S + A
+                // (BFD's _bfd_merged_section_offset arithmetic).
                 let off = value + r.addend;
                 match entries
                     .iter()

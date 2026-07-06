@@ -179,6 +179,169 @@ fn build_main_many(callers: &[String]) -> Vec<u8> {
     obj.write().unwrap()
 }
 
+/// Patch an emitted ELF64 object so `section_name` becomes a
+/// fixed-entsize merge pool (SHF_MERGE, sh_entsize = entsize) — the
+/// `object` write API has no entsize knob, so set it in the header.
+fn set_merge_pool(bytes: &mut [u8], section_name: &str, entsize: u64) {
+    const SHF_MERGE: u64 = 0x10;
+    let shoff = u64::from_le_bytes(bytes[0x28..0x30].try_into().unwrap()) as usize;
+    let shentsize = u16::from_le_bytes(bytes[0x3a..0x3c].try_into().unwrap()) as usize;
+    let shnum = u16::from_le_bytes(bytes[0x3c..0x3e].try_into().unwrap()) as usize;
+    let shstrndx = u16::from_le_bytes(bytes[0x3e..0x40].try_into().unwrap()) as usize;
+    let str_hdr = shoff + shstrndx * shentsize;
+    let str_off = u64::from_le_bytes(bytes[str_hdr + 0x18..str_hdr + 0x20].try_into().unwrap()) as usize;
+    for i in 0..shnum {
+        let h = shoff + i * shentsize;
+        let name_off = u32::from_le_bytes(bytes[h..h + 4].try_into().unwrap()) as usize;
+        let name_end = str_off + name_off
+            + bytes[str_off + name_off..].iter().position(|&b| b == 0).unwrap();
+        if &bytes[str_off + name_off..name_end] != section_name.as_bytes() {
+            continue;
+        }
+        let flags = u64::from_le_bytes(bytes[h + 0x08..h + 0x10].try_into().unwrap());
+        bytes[h + 0x08..h + 0x10].copy_from_slice(&(flags | SHF_MERGE).to_le_bytes());
+        bytes[h + 0x38..h + 0x40].copy_from_slice(&entsize.to_le_bytes());
+        return;
+    }
+    panic!("section {section_name} not found to patch");
+}
+
+/// lea 0x0(%rip),%rax ; ret — reloc at +3.
+const POOLFN: &[u8] = &[0x48, 0x8d, 0x05, 0x00, 0x00, 0x00, 0x00, 0xc3];
+
+/// An rcgu with a LOCAL `.text.poolfn` that PC32-references a LOCAL
+/// OBJECT symbol at `sym_off` inside its own `.rodata.cst16` pool
+/// (`pool` bytes, split into 16-byte entries by the scan), plus a
+/// GLOBAL caller so demand-load pulls the member.
+fn build_pool_rcgu(caller_name: &str, pool: &[u8], sym_off: u64) -> Vec<u8> {
+    let mut obj = WObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+
+    let pool_sec = obj.add_section(Vec::new(), b".rodata.cst16".to_vec(), SectionKind::ReadOnlyData);
+    obj.section_mut(pool_sec).set_data(pool.to_vec(), 16);
+    let anon = obj.add_symbol(WSymbol {
+        name: format!("anon.{caller_name}").into_bytes(),
+        value: sym_off,
+        size: 16,
+        kind: SymbolKind::Data,
+        scope: object::write::SymbolScope::Compilation, // LOCAL
+        weak: false,
+        section: SymbolSection::Section(pool_sec),
+        flags: object::write::SymbolFlags::None,
+    });
+
+    let fn_sec = obj.add_section(Vec::new(), b".text.poolfn".to_vec(), SectionKind::Text);
+    obj.section_mut(fn_sec).set_data(POOLFN.to_vec(), 16);
+    let fn_sym = obj.add_symbol(WSymbol {
+        name: b"poolfn".to_vec(),
+        value: 0,
+        size: POOLFN.len() as u64,
+        kind: SymbolKind::Text,
+        scope: object::write::SymbolScope::Compilation, // LOCAL
+        weak: false,
+        section: SymbolSection::Section(fn_sec),
+        flags: object::write::SymbolFlags::None,
+    });
+    obj.add_relocation(
+        fn_sec,
+        WRelocation {
+            offset: 3,
+            symbol: anon,
+            addend: -4,
+            flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PC32 },
+        },
+    )
+    .unwrap();
+
+    let caller_sec = obj.add_section(
+        Vec::new(),
+        format!(".text.{caller_name}").into_bytes(),
+        SectionKind::Text,
+    );
+    obj.section_mut(caller_sec).set_data(CALLER.to_vec(), 16);
+    obj.add_symbol(WSymbol {
+        name: caller_name.as_bytes().to_vec(),
+        value: 0,
+        size: CALLER.len() as u64,
+        kind: SymbolKind::Text,
+        scope: object::write::SymbolScope::Linkage,
+        weak: false,
+        section: SymbolSection::Section(caller_sec),
+        flags: object::write::SymbolFlags::None,
+    });
+    obj.add_relocation(
+        caller_sec,
+        WRelocation {
+            offset: 1,
+            symbol: fn_sym,
+            addend: -4,
+            flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PLT32 },
+        },
+    )
+    .unwrap();
+
+    let mut bytes = obj.write().unwrap();
+    set_merge_pool(&mut bytes, ".rodata.cst16", 16);
+    bytes
+}
+
+/// Pool-shape false-refusal pin (the Splice::drop dissection): two
+/// byte-identical functions each PC32-reference their own 16-byte
+/// all-zero `.rodata.cst16` entry, but member A's pool packs THREE
+/// entries (zero at +0x10) while member B's packs ONE (zero at +0x0).
+/// trans_hash correctly equates the pair (entry content identity);
+/// the verifier's classify must too — naive S+A entry recovery smears
+/// the PC32 -4 bias across entry boundaries and refused this sound
+/// fold ("target classes differ").
+#[test]
+fn pool_shape_does_not_refuse_sound_fold() {
+    if !have("ar") {
+        eprintln!("skipping: ar not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+
+    let mut pool_a = Vec::new();
+    pool_a.extend_from_slice(&[0x11u8; 16]);
+    pool_a.extend_from_slice(&[0x00u8; 16]); // the referenced entry
+    pool_a.extend_from_slice(&[0x22u8; 16]);
+    let pool_b = vec![0x00u8; 16]; // same entry, different pool shape
+
+    let a_name = "pool_alpha-0123456789abcdef.rcgu.o";
+    let b_name = "pool_beta-fedcba9876543210.rcgu.o";
+    std::fs::write(d.join(a_name), build_pool_rcgu("use_pa", &pool_a, 0x10)).unwrap();
+    std::fs::write(d.join(b_name), build_pool_rcgu("use_pb", &pool_b, 0x0)).unwrap();
+    std::fs::write(
+        d.join("main.o"),
+        build_main_many(&["use_pa".to_string(), "use_pb".to_string()]),
+    )
+    .unwrap();
+
+    let rlib = d.join("libpool.rlib");
+    let st = Command::new("ar")
+        .current_dir(d)
+        .args(["crs", "libpool.rlib", a_name, b_name])
+        .status()
+        .unwrap();
+    assert!(st.success(), "ar failed");
+
+    let scan = graft::scan::run(
+        &[d.join("main.o"), rlib.clone()],
+        &[] as &[PathBuf],
+        &[],
+        &[],
+        Some("main"),
+    )
+    .unwrap();
+    let outcome = graft::icf::run(&scan, &d.join("out.elf"))
+        .expect("verify must not refuse the sound pool-shape fold")
+        .expect("fold should find the poolfn twins");
+    // Both the poolfn twins and the byte-identical callers fold —
+    // which also pins the hash side: if trans_hash failed to equate
+    // the pair, no group would form and this would fail above.
+    assert_eq!(outcome.stats.groups_folded, 2, "poolfn + caller groups");
+}
+
 fn have(cmd: &str) -> bool {
     Command::new(cmd)
         .arg("--version")
