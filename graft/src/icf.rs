@@ -234,10 +234,10 @@ pub fn verify_interchangeable(
             .reloc_targets
             .get(&(seg.object, seg.section))
             .and_then(|m| m.get(&(r.offset, r.r_type)));
-        let (nid, value) = match recorded {
+        let (nid, value, symbol_form) = match recorded {
             None | Some(ResolvedTarget::External) => return Ref::Ext(r.target.clone()),
-            Some(&ResolvedTarget::Symbol { nid, value }) => (nid, value as i64),
-            Some(&ResolvedTarget::Section { nid }) => (nid, 0),
+            Some(&ResolvedTarget::Symbol { nid, value }) => (nid, value as i64, true),
+            Some(&ResolvedTarget::Section { nid }) => (nid, 0, false),
         };
         // Mirror the trampoline cut: entry-targeted relocs are
         // address-only dependencies (base callers are reused verbatim).
@@ -248,25 +248,30 @@ pub fn verify_interchangeable(
         let [tseg] = nm.segments.as_slice() else {
             return Ref::Node(nid, value + r.addend);
         };
-        // Pool-entry target: the graph already resolved this reloc to
-        // the precise entry node (symbol-form by st_value, section-form
-        // by addend — hash.rs's conventions). Position is made
-        // ENTRY-relative, so a PC bias riding in the addend compares
-        // equal across pools of different shapes. Naive S+A re-derivation
-        // here smeared that bias across entry boundaries whenever two
-        // pools packed different entry counts — refusing a sound fold
-        // (the Splice::drop pair: same zero constant, 3-entry vs
-        // 1-entry .rodata.cst16).
-        if let Some((s, _)) = tseg.range {
-            return Ref::Node(nid, value + r.addend - s as i64);
+        // Symbol-form target whose st_value sits inside the recorded
+        // pool-entry node: the symbol NAMES the entry (#46's st_value
+        // convention), and the addend is a displacement that may carry
+        // a PC bias. Compare positions ENTRY-relative — naive S+A
+        // smears that bias across entry boundaries whenever two pools
+        // pack different entry counts, refusing a sound fold (the
+        // Splice::drop pair: same zero constant, 3-entry vs 1-entry
+        // .rodata.cst16). Everything else — notably SECTION-form refs,
+        // where the graph records the pool's first-entry node and the
+        // ADDEND is the entry selector — keeps the S+A recovery below.
+        if symbol_form
+            && let Some((s, l)) = tseg.range
+            && (s as i64) <= value
+            && value < (s + l) as i64
+        {
+            return Ref::Node(nid, value - s as i64 + r.addend);
         }
         let key = (tseg.object, tseg.section);
         match pool_entries.get(&key) {
             None => Ref::Node(nid, value + r.addend),
             Some(entries) => {
-                // Whole-section target inside a split pool (the graph
-                // couldn't attribute an entry): recover by naive S + A
-                // (BFD's _bfd_merged_section_offset arithmetic).
+                // Split pool: recover the referenced entry by naive
+                // S + A offset (BFD's _bfd_merged_section_offset does
+                // the same arithmetic).
                 let off = value + r.addend;
                 match entries
                     .iter()
