@@ -527,12 +527,16 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
         overlay_elf.display(),
     );
     eprint!("{summary}");
+    // Append (main resets GRAFT_LOG once at linker-seat entry) so this
+    // summary doesn't clobber notes appended earlier in the same run.
     if let Ok(p) = std::env::var("GRAFT_LOG") {
-        let _ = std::fs::write(&p, {
-            let mut body = summary.into_bytes();
-            body.extend_from_slice(&format_closure_dump(&scan, &closure));
-            body
-        });
+        if let Ok(mut f) =
+            std::fs::OpenOptions::new().create(true).append(true).open(&p)
+        {
+            use std::io::Write;
+            let _ = f.write_all(summary.as_bytes());
+            let _ = f.write_all(&format_closure_dump(&scan, &closure));
+        }
     }
 
     Ok(())

@@ -19,6 +19,15 @@ fn main() -> ExitCode {
         }
     }
 
+    // GRAFT_LOG names a per-run sidecar: reset it at linker-seat entry
+    // so tests and tooling read exactly one run's lines, and every
+    // writer below (telemetry, notes, the overlay summary) appends.
+    // The default `<output>.graft.log` path is never reset — it is the
+    // accumulated history channel.
+    if let Ok(p) = env::var("GRAFT_LOG") {
+        let _ = std::fs::write(&p, "");
+    }
+
     // Mode selection. A *set-but-unrecognized* GRAFT value is a hard
     // error, never a silent passthrough: a typo like `GRAFT=bse` would
     // otherwise link a normal, un-instrumented binary that looks fine
