@@ -206,10 +206,19 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
     // Count how many anchors the walk actually re-homed — the reference-corpus
     // failure mode was exactly these, so surface them in the summary.
     let walk_translated = std::cell::Cell::new(0usize);
+    // Every node that reaches channel-2 positional resolution (the
+    // unverified anchor path) is recorded here — `positional_anchor`
+    // routes ALL such anchors, on every target, through `translate`, so
+    // wrapping it captures the exact set to byte-check post-prune (see
+    // anchor_verify.rs). The name-pin (2a) and external (4) channels
+    // return an Anchor directly and never call translate.
+    let anchored_nodes = std::cell::RefCell::new(HashSet::<NodeId>::new());
     let translate: Box<crate::resolve::TranslateFn<'_>> = match &walker {
         Some(w) => {
             let counter = &walk_translated;
+            let anchored = &anchored_nodes;
             Box::new(move |nid, q| {
+                anchored.borrow_mut().insert(nid);
                 let r = w.query(nid, q);
                 if matches!(r, Ok(crate::resolve::Translation::Mapped(_))) {
                     counter.set(counter.get() + 1);
@@ -217,7 +226,13 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
                 r
             })
         }
-        None => Box::new(crate::resolve::identity_translate),
+        None => {
+            let anchored = &anchored_nodes;
+            Box::new(move |nid, q| {
+                anchored.borrow_mut().insert(nid);
+                crate::resolve::identity_translate(nid, q)
+            })
+        }
     };
     let resolver = crate::resolve::Resolver {
         trans_hash: &scan.trans_hash,
@@ -284,6 +299,31 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
     let base_bytes_for_layout =
         std::fs::read(&base_path).with_context(|| format!("read {}", base_path.display()))?;
     let e_machine = base_e_machine(&base_bytes_for_layout)?;
+
+    // Anchor byte-check (twin of GRAFT_ICF_VERIFY, default on): every
+    // channel-2 positional anchor bound overlay to base by trans_hash
+    // alone. Re-derive that claim from raw bytes before the real link —
+    // a corrupt/stale base.elf or a lying hash refuses here instead of
+    // shipping a wrong-address bind. On xtensa the relax walker already
+    // reconciled these nodes; on x86 this is a masked byte compare.
+    let anchor_arch = match e_machine {
+        object::elf::EM_X86_64 => object::Architecture::X86_64,
+        object::elf::EM_XTENSA => object::Architecture::Xtensa,
+        m => bail!("anchor-verify: unsupported e_machine {m:#x}"),
+    };
+    {
+        let anchored = anchored_nodes.borrow();
+        crate::anchor_verify::run(
+            crate::anchor_verify::enabled()?,
+            &scan,
+            &base.by_section,
+            &base_bytes_for_layout,
+            anchor_arch,
+            &anchored,
+            walker.as_ref(),
+            &output,
+        )?;
+    }
 
     let xtensa_layout = if e_machine == object::elf::EM_XTENSA {
         Some(setup_xtensa_layout(&work_dir, &base_bytes_for_layout, &argv)?)

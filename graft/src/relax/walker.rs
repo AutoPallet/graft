@@ -107,6 +107,19 @@ impl<'a> Walker<'a> {
         }
     }
 
+    /// Anchor byte-check (overlay-side `GRAFT_ANCHOR_VERIFY`): did node
+    /// `nid`'s content reconcile with base's placed bytes? `Ok` when the
+    /// walk verified it (Identity, or a source-grounded fate vector);
+    /// `Err(why)` on refusal. Reuses the cached per-node verdict the
+    /// channel-2 translation already computed, so it costs nothing beyond
+    /// the first `query`.
+    pub fn byte_check(&self, nid: NodeId) -> Result<(), String> {
+        match &*self.entry(nid) {
+            WalkEntry::Identity | WalkEntry::Fates { .. } => Ok(()),
+            WalkEntry::Refused(why) => Err(why.clone()),
+        }
+    }
+
     fn entry(&self, nid: NodeId) -> Rc<WalkEntry> {
         if let Some(e) = self.cache.borrow().get(&nid) {
             return Rc::clone(e);

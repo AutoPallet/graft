@@ -139,6 +139,7 @@ Subcommands: `graft combine` (splice a base + overlay pair),
 | `GRAFT_SLACK_LEN` | Slack bytes the base link reserves for future overlays, as a comma-separated list of `region=len` pairs over regions `text`, `rodata`, `data`, `tls` (e.g. `"text=2M,tls=0"`). Lengths accept decimal, `0x` hex, and case-insensitive `K`/`M` suffixes. Unset/empty keeps all defaults; an unlisted region keeps its default (`text`/`rodata` 64K, `data` 4K, `tls` 64B). `tls=0` opts out of TLS slack (bare-metal xtensa has no TLS runtime). Unknown region, malformed pair, or bare number is a hard error. |
 | `GRAFT_ICF` | `1` to enable identical-code folding (ICF): fold identical Rust code sections at base link (default off). |
 | `GRAFT_ICF_VERIFY` | Byte-level fold verifier (default on); `0` disables. |
+| `GRAFT_ANCHOR_VERIFY` | Overlay-side byte-check of channel-2 positional anchors against base.elf (default on); `0` disables (ships an unverified bind). |
 | `GRAFT_LOG` | Path for the per-link decision/telemetry log. |
 | `GRAFT_DEBUG` | Comma-separated debug flags; unknown flag is a hard error. Flags: `preserve-icf-inputs`, `dump-graph=<path>` (dump the closure graph), `scan-timings` (per-phase scan timings to stderr), `icf-limit=<N>` (fold only the first N sorted ICF groups — bisect knob), `mismatch=<path>` (log nodes that missed a base-section match). |
 

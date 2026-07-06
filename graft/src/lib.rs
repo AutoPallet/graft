@@ -3,6 +3,7 @@
 //! This library surface mirrors the binary's entry points so integration
 //! tests can drive work in-process. See `docs/worklogs/06-graft-wrapper.md`.
 
+pub mod anchor_verify;
 pub mod arch;
 pub mod archive;
 pub mod argv;

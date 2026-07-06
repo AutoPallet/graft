@@ -142,7 +142,13 @@ soundness argument lives.
       ld binds the reference to overlay's fresh copy. (STT_TLS when the
       target is SHF_TLS — ld rejects TLS-def-vs-non-TLS-ref binds.)
    2. **Target's `trans_hash` is in base's table → anchor** at
-      `by_section[hash] + offset` (positional, content-keyed, no verify).
+      `by_section[hash] + offset` (positional, content-keyed). The bind
+      rests on "equal `trans_hash` ⇒ base's placed bytes are identical",
+      so before the real link `GRAFT_ANCHOR_VERIFY` (default on, the twin
+      of `GRAFT_ICF_VERIFY`) re-derives that claim from raw bytes: every
+      distinct anchored node's overlay input is masked-compared against
+      base.elf's placed bytes (on xtensa the relaxation walk already did
+      this). A corrupt/stale base.elf or a lying hash refuses the link.
       If the hash is ambiguous (base placed identical content at several
       addresses): a name unique in base's symtab pins that copy and
       verifies; no pin and the content is **mutable → bail** (would alias
@@ -299,6 +305,11 @@ relink, so the build never breaks. The main refusal classes:
   overlay refuses.
 - **Walk refusal on mutable content** — a relaxed-base positional anchor
   the walk can't translate, where re-emitting would fork a variable.
+- **Anchor byte-mismatch** — a channel-2 positional anchor whose base.elf
+  bytes don't match the overlay input (`GRAFT_ANCHOR_VERIFY`): a corrupt
+  or stale base, a table/image disagreement, or a `trans_hash` collision.
+  The last unguarded resolution surface; refuses rather than bind to
+  unverified bytes.
 - **TLS geometry drift** — overlay's PT_TLS memsz/align doesn't match
   base's; every TP offset would shift.
 - **Slack overflow** — the overlay payload doesn't fit the reserved
