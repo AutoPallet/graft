@@ -586,6 +586,58 @@ fn ctor_edit_refuses_overlay() {
     );
 }
 
+/// Argv guard (schema v11): a linker-flag change between base and
+/// overlay must refuse — the recorded base layout was produced under
+/// the old flags, and graft can't prove flag-equivalence. Flags are
+/// injected via RUSTFLAGS, which *supersedes* the fixture config's
+/// `rustflags`, so both runs repeat the config's flags verbatim; the
+/// control run (identical flag surface, despite the RUSTFLAGS-forced
+/// recompile) must still overlay, isolating the digest as the only
+/// difference in the refusing run.
+#[test]
+#[ignore]
+fn flag_change_refuses_overlay() {
+    const CONFIG_FLAGS: &str = "-C target-feature=+crt-static -C relocation-model=static";
+
+    let fx = Fixture::new();
+    fx.cargo_build(&[("GRAFT", "base"), ("GRAFT_MAP_ORACLE", "1")]);
+    let base_elf = std::env::temp_dir().join("graft-e2e-argv-base.elf");
+    std::fs::copy(fx.app_bin(), &base_elf).unwrap();
+    make_executable(&base_elf);
+
+    let base_env = base_elf.to_string_lossy().into_owned();
+    let log_env = fx.graft_log_path().to_string_lossy().into_owned();
+
+    // Positive control: same flag surface → overlay proceeds.
+    fx.edit("base/src/lib.rs", "wrapping_mul(7)", "wrapping_mul(13)");
+    fx.cargo_build(&[
+        ("GRAFT", "overlay"),
+        ("GRAFT_BASE_ELF", base_env.as_str()),
+        ("GRAFT_LOG", log_env.as_str()),
+        ("RUSTFLAGS", CONFIG_FLAGS),
+    ]);
+    let out = run_combined(&fx.app_bin());
+    assert!(out.contains("sum = 195"), "control edit visible: {out}");
+
+    // The pin: one extra (semantically inert) linker flag must refuse.
+    // Pre-guard, this build SUCCEEDED against the old-flag base layout.
+    let changed = format!("{CONFIG_FLAGS} -C link-arg=-Wl,--no-demangle");
+    let stderr = fx.cargo_build_expect_fail(&[
+        ("GRAFT", "overlay"),
+        ("GRAFT_BASE_ELF", base_env.as_str()),
+        ("GRAFT_LOG", log_env.as_str()),
+        ("RUSTFLAGS", changed.as_str()),
+    ]);
+    assert!(
+        stderr.contains("linker flags changed"),
+        "refusal must name the argv guard:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("added: -Wl,--no-demangle"),
+        "refusal must name the exact flag that changed:\n{stderr}"
+    );
+}
+
 /// For small, focused source mutations, graft's *overlay payload*
 /// (the bytes that get spliced/appended into the combined ELF and
 /// flashed) should be proportional to the source change — a few

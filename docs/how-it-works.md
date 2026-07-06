@@ -377,10 +377,17 @@ relink, so the build never breaks. The main refusal classes:
   base's; every TP offset would shift.
 - **Slack overflow** — the overlay payload doesn't fit the reserved
   balloon (slack can't grow at combine time).
+- **Linker-flag drift** — the argv's *flag surface* differs from the
+  one base recorded in its manifest. The surface is every link arg
+  except the classes the scan already captures by content: object-ish
+  inputs, `-o`, `-L` search paths, and `-l` names (a resolved archive
+  enters the scan like any other input, so adding or removing one is
+  an ordinary input change, not a flag change). Anything else —
+  `-Wl,*`, a `-T` script swap, `--wrap`, `-static`, … — can alter
+  link semantics invisibly to the content hashes, so a mismatch
+  refuses, naming the exact flags added/removed.
 - **Stale / incompatible snapshot** — manifest schema or hash-algo
   version mismatch; the base is not a valid oracle for this overlay.
-  (Changes to the link argv itself are *not* currently detected — see
-  the README's Limitations.)
 
 ---
 

@@ -78,6 +78,7 @@ fn run_cache_info(path: &Path, grep: Option<&str>, addr: Option<&str>) -> anyhow
         Some(b) => println!("  boot             {} {}", b.symbol, hex(&b.trans_hash)),
         None => println!("  boot             (unattributed — pre-main drift guard inactive)"),
     }
+    println!("  argv_flags       {}", m.argv_flags.join(" "));
     println!();
     println!(
         "sections: {} entries, {} ambiguous ({} bytes on disk)",

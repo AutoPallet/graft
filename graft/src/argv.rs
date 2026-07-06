@@ -108,6 +108,93 @@ pub fn parse(argv: &[String]) -> LinkArgs {
     out
 }
 
+/// The link argv's *flag surface*: every arg except the
+/// classes whose effect the scan already captures by content —
+///
+///   - object-ish inputs (`is_input`): scanned and content-hashed;
+///     their paths churn per build (rustc temp dirs, rlib metadata
+///     hashes) while their content identity is what actually matters.
+///   - `-o <path>`: graft owns and rewrites the output path.
+///   - `-L <path>`: search paths only steer resolution; what the scan
+///     hashes is the *resolved* archive's content.
+///   - `-l<name>`: resolved archives enter the scan as deferred
+///     inputs, so adding/removing one is an input change the closure
+///     handles like any new rlib. (A `-l` resolving to a linker-script
+///     stub is forwarded unscanned — but its *content* drift is
+///     invisible to graft either way; the digest is a flag guard,
+///     not a script-content guard.)
+///
+/// Everything else (`-Wl,*`, `-T`, `-u`, `--wrap`, `-static`,
+/// `-nodefaultlibs`, `--ldproxy-*`, …) is retained IN ORDER: those are
+/// link semantics graft cannot prove equivalent across a change. Base
+/// records the list verbatim in the manifest (it's ~20 short strings);
+/// overlay refuses on mismatch, naming the exact flags that changed
+/// (auto converts the refusal into a full relink).
+pub fn semantic_flags(argv: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = if argv.is_empty() { 0 } else { 1 };
+    while i < argv.len() {
+        let a = &argv[i];
+        if is_input(a) {
+            i += 1;
+            continue;
+        }
+        // Two-token forms: skip flag + value. (Mirrors `parse`.)
+        if a == "-o" || a == "-L" || a == "-l" {
+            i += 2;
+            continue;
+        }
+        // Attached forms.
+        if a.len() > 2 && (a.starts_with("-o") || a.starts_with("-L")) {
+            i += 1;
+            continue;
+        }
+        if let Some(v) = a.strip_prefix("-l")
+            && !v.is_empty()
+            && !v.starts_with('-')
+        {
+            i += 1;
+            continue;
+        }
+        out.push(a.clone());
+        i += 1;
+    }
+    out
+}
+
+/// Human-readable difference between two flag surfaces, for the
+/// overlay refusal message: flags added/removed (as multisets), or
+/// "flag order changed" when the sets match and only order differs.
+pub fn flag_surface_diff(base: &[String], cur: &[String]) -> String {
+    let mut counts: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+    for f in cur {
+        *counts.entry(f.as_str()).or_default() += 1;
+    }
+    for f in base {
+        *counts.entry(f.as_str()).or_default() -= 1;
+    }
+    let mut added: Vec<&str> = Vec::new();
+    let mut removed: Vec<&str> = Vec::new();
+    for (f, n) in &counts {
+        for _ in 0..(*n).max(0) {
+            added.push(f);
+        }
+        for _ in 0..(-*n).max(0) {
+            removed.push(f);
+        }
+    }
+    added.sort_unstable();
+    removed.sort_unstable();
+    let mut parts = Vec::new();
+    if !added.is_empty() {
+        parts.push(format!("added: {}", added.join(" ")));
+    }
+    if !removed.is_empty() {
+        parts.push(format!("removed: {}", removed.join(" ")));
+    }
+    if parts.is_empty() { "flag order changed".into() } else { parts.join("; ") }
+}
+
 /// Resolve a `-l<name>` flag to the archive path the linker would
 /// pick. Walks `library_paths` in order, returning the first
 /// `lib<name>.a` that exists. Falls back to the C compiler driver's
@@ -337,6 +424,42 @@ mod tests {
         let parsed = parse(&argv);
         assert_eq!(parsed.output.as_deref(), Some(Path::new("/tmp/out")));
         assert_eq!(parsed.inputs.len(), 1);
+    }
+
+    /// Content-covered argv classes (inputs, -o, -L, -l) must not
+    /// perturb the flag surface: rustc churns those paths every build
+    /// (temp dirs, rlib metadata hashes) — a surface that moved with
+    /// them would rebase every incremental build.
+    #[test]
+    fn flag_surface_ignores_content_covered_classes() {
+        let a = s(&[
+            "cc", "-m64", "/tmp/rustcAAA/symbols.o", "/tmp/foo.rcgu.o",
+            "-Wl,--as-needed", "/tmp/libbase-abc.rlib",
+            "-L", "/tmp/native/aaa", "-L/tmp/native/bbb",
+            "-lgcc_s", "-l", "util",
+            "-o", "/tmp/out/app", "-nodefaultlibs",
+        ]);
+        let b = s(&[
+            "cc", "-m64", "/tmp/rustcZZZ/symbols.o", "/tmp/foo2.rcgu.o",
+            "-Wl,--as-needed", "/tmp/libbase-def.rlib", "/tmp/extra.rlib",
+            "-L", "/tmp/native/ccc",
+            "-lm", "-lgcc_s",
+            "-o", "/tmp/elsewhere/app2", "-nodefaultlibs",
+        ]);
+        assert_eq!(semantic_flags(&a), semantic_flags(&b));
+        assert_eq!(semantic_flags(&a), s(&["-m64", "-Wl,--as-needed", "-nodefaultlibs"]));
+    }
+
+    #[test]
+    fn flag_surface_moves_on_flag_change_and_order() {
+        let base = s(&["cc", "-m64", "-Wl,--as-needed", "-o", "/tmp/app", "/tmp/a.o"]);
+        let added = s(&["cc", "-m64", "-Wl,--as-needed", "-Wl,--defsym=x=1", "-o", "/tmp/app", "/tmp/a.o"]);
+        let removed = s(&["cc", "-m64", "-o", "/tmp/app", "/tmp/a.o"]);
+        let reordered = s(&["cc", "-Wl,--as-needed", "-m64", "-o", "/tmp/app", "/tmp/a.o"]);
+        let d = semantic_flags(&base);
+        assert_ne!(d, semantic_flags(&added));
+        assert_ne!(d, semantic_flags(&removed));
+        assert_ne!(d, semantic_flags(&reordered));
     }
 
     #[test]

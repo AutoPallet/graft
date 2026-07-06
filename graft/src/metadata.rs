@@ -46,7 +46,17 @@ pub const GRAFT_MAGIC: [u8; 4] = *b"GRFT";
 // effect through an overlay (only the entry symbol is trampolined),
 // so the overlay refuses when this hash moves — without it, an edited
 // constructor silently keeps running base's stale copy.
-pub const SCHEMA_VERSION: u16 = 10;
+// v11: manifest gains `argv_flags` — the base link argv's flag
+// surface, verbatim (argv::semantic_flags; inputs / -o / -L / -l are
+// excluded because the scan captures their effect by content, and
+// their paths churn per build). A flag change (-Wl,--defsym, a -T
+// script swap, a --wrap addition, …) alters link semantics in ways
+// the content hashes can't see; before this, such a change silently
+// produced an overlay against a base linked under different flags.
+// Overlay refuses on mismatch, naming the flags that changed. Stored
+// as the list, not a digest, precisely so the refusal can say WHICH
+// flag — it's ~20 short strings in a non-ALLOC section.
+pub const SCHEMA_VERSION: u16 = 11;
 
 /// Version of the trans_hash algorithm itself, independent of table
 /// layout. Bump whenever hash VALUES change for unchanged inputs;
@@ -75,6 +85,11 @@ pub struct GraftManifest {
     /// attribute `e_entry` to a scanned symbol — the guard is then
     /// inactive (base warns loudly).
     pub boot: Option<BootFingerprint>,
+    /// The base link argv's flag surface, verbatim and in order
+    /// (`argv::semantic_flags` — see the v11 note above). Overlay
+    /// recomputes it over its own argv and refuses on mismatch,
+    /// naming the flags that differ.
+    pub argv_flags: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -167,6 +182,7 @@ mod tests {
             toolchain_stamp: "rustc-1.94.1".into(),
             overlay_region: (0x5_0000_0000, 0x5_0100_0000),
             boot: Some(BootFingerprint { symbol: "_start".into(), trans_hash: [0x22; 16] }),
+            argv_flags: vec!["-m64".into(), "-Wl,--as-needed".into()],
         };
         let bytes = encode_manifest(&m).unwrap();
         let decoded = decode_manifest(&bytes).unwrap();

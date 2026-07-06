@@ -71,6 +71,23 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
 
     let mut base = load_base_metadata(&base_path)?;
 
+    // Argv guard: base recorded its link argv's flag surface
+    // (argv::semantic_flags — inputs / -o / -L / -l excluded; the scan
+    // captures those by content). Any other flag change (-Wl,--defsym,
+    // a -T script swap, a --wrap addition, …) alters link semantics
+    // invisibly to the content hashes, so a mismatch refuses before
+    // the scan; auto converts that into a full relink.
+    let cur_flags = crate::argv::semantic_flags(&argv);
+    if cur_flags != base.manifest.argv_flags {
+        bail!(
+            "overlay refused: linker flags changed since the base link \
+             ({}) — graft cannot prove flag-equivalence, so the recorded \
+             base layout may not match what these flags would produce. A \
+             full relink is required; GRAFT=auto does this automatically.",
+            crate::argv::flag_surface_diff(&base.manifest.argv_flags, &cur_flags),
+        );
+    }
+
     let driver = crate::argv::driver_path(&argv);
     let (eager_inputs, deferred_inputs) = resolve_scan_inputs(&link_args, &driver);
     let t_scan_start = std::time::Instant::now();

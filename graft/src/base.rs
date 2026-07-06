@@ -46,6 +46,12 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
     let link_args = argv::parse(&argv);
     let output = link_args.output.clone().ok_or_else(|| anyhow!("no -o <path> in argv"))?;
 
+    // Record the flag surface AS RECEIVED, before graft's own additions
+    // below (slack object, --undefined= GC roots, -Map). Overlay
+    // computes its surface over the raw rustc argv too — recording the
+    // augmented argv here would make every overlay refuse.
+    let argv_flags = argv::semantic_flags(&argv);
+
     let t_start = std::time::Instant::now();
 
     // Spawn pre-scan concurrently with the real linker. Both touch the
@@ -210,6 +216,7 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
         toolchain_stamp: toolchain_stamp(),
         overlay_region: (0, 0), // no region reserved; overlay picks a disjoint addr
         boot: boot_fingerprint(&elf_bytes, &scan_result),
+        argv_flags,
     };
     if manifest.boot.is_none() {
         eprintln!(
