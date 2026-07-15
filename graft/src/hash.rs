@@ -60,8 +60,10 @@
 //! variables onto one base address. The salt is the section's sorted
 //! (symbol name, st_value) pairs — names with the `.llvm.<id>`
 //! internal-linkage suffix stripped, so CGU repartitioning doesn't
-//! churn the identity of an otherwise-unchanged static (which would
-//! silently *duplicate* its state into the overlay).
+//! churn the identity of an otherwise-unchanged static (churn isn't
+//! unsound — the changed hash cascades and every reachable referrer
+//! re-emits against the fresh copy, or the boot fingerprint refuses —
+//! but it drags the static's whole referrer cone into every overlay).
 
 use std::collections::HashMap;
 

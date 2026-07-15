@@ -56,28 +56,64 @@ xtensa relaxation walk it uses to locate bytes in a relaxed base, read
 ## The identity atom: `trans_hash`
 
 Everything downstream keys on one value. graft models the link as a graph
-of **nodes** — one per input section (the linker's ship/diff atom). Each
-node gets a `trans_hash`: a transitive content fingerprint over the
-section's own bytes, its canonicalized relocations, and its entire
+of **nodes**. A node is *usually* one input section (the linker's
+ship/diff atom), with two deliberate exceptions where the section is not
+the unit that survives the link: `SHF_MERGE|SHF_STRINGS` pools split into
+one node **per string** (ld dedups and reorders individual strings, so
+identity must be per-string; referrers embed the precise string
+fingerprint rather than an edge to the pool, keeping them decoupled from
+pool reshuffles), and linker-merged outputs (`.init_array`, `.eh_frame`,
+…) fold all their contributing input sections into one **aggregator**
+node (ld concatenates them into a single output section bracketed by
+`__init_array_start`/`_end`; the contributors' priority-suffix names are
+part of the aggregator's hash, so two constructors swapping `.init_array.NN`
+priorities — an init-order change with identical bytes — still changes
+it). Each node gets a `trans_hash`: a transitive content fingerprint over
+the node's own bytes, its canonicalized relocations, and its entire
 successor subgraph. Two nodes with equal `trans_hash` are byte-identical
 *and* everything they transitively reference is byte-identical, so they
 are interchangeable at a recoverable address.
 
 The hash is computed by per-SCC color refinement (`hash.rs`): sections
 that reference each other cyclically (xtensa code and its literal pool
-always do) form a strongly-connected component; colors are refined within
-the SCC to a fixed point, `scc_hash = blake3(sorted member colors)`, and
-each node's `trans_hash = blake3(scc_hash ‖ color(node))`. The per-node
+always do) form a strongly-connected component. SCCs are processed
+leaves-first, so every edge that *leaves* the SCC already has a final
+`trans_hash`; each member's starting color seeds in its own content hash
+plus, per reloc slot in order, the trans_hashes of those out-of-SCC
+targets. Colors are then refined within the SCC to a fixed point,
+`scc_hash = blake3(sorted member colors)`, and each node's
+`trans_hash = blake3(scc_hash ‖ color(node))`. The per-node
 mix matters — SCC members must not share a hash, or `by_section[hash]`
 becomes ambiguous and resolution can land in the middle of the wrong
 section (see `14` and CLAUDE.md).
 
 Content identity is sound only for immutable content. A node is
 `content_addressable` only if it has bytes AND is read-only or
-executable. `.bss` (no bytes) and zero-init `.data` (all byte-identical
-but distinct mutable variables) get a nominal salt folded into their hash
-and are never resolved by a shared representative — binding two distinct
-variables to one address is the exact bug the salt prevents.
+executable. Mutable sections get the *opposite* identity: a **nominal
+salt** — the section's sorted (symbol name, offset) pairs, `.llvm.<id>`
+CGU suffixes stripped, plus the defining TU's id for locals — folded into
+the hash, so `.bss`/`.data` nodes hash by *which variable they are*, not
+by their bytes (frequently all-zero and identical across every static in
+the program). Both failure directions matter. Without the salt, distinct
+variables collide: every zero-init static shares one hash and positional
+resolution aliases them onto one base address. The other direction is
+stability: the salt keeps an *unchanged* variable's hash stable across
+builds so the overlay anchors to base's copy instead of re-emitting.
+Identity churn is not itself unsound — a changed hash cascades into
+every reachable referrer, so the whole cone re-emits and binds the fresh
+copy while base's goes dead, and a referrer that *can't* be re-emitted
+(boot cone) trips the boot-fingerprint refusal — but it defeats the
+point: one repartitioned CGU would drag its referrer cone into every
+overlay. Hence the stability details: `.llvm.<id>` suffixes stripped
+(repartitioning must not churn the name), per-TU id on locals
+(`static FOO` in two TUs must not share a salt). The re-emit that
+genuinely forks state is the opposite case — a mutable node whose hash
+did NOT change, re-emitted anyway, so base-resident referrers keep
+base's copy while re-emitted referrers use the fresh one. Every path
+that could do that (ambiguous mutable hash, walk refusal on mutable
+content) hard-bails instead. A rename still reads as new content —
+fresh zero-init copy, old copy dead — the only sound reading of a
+name-keyed identity.
 
 ---
 
@@ -300,6 +336,20 @@ already resolved every base reference to an absolute address.
 Because only the slack bytes and one trampoline differ from base, a
 sector-diff flasher writes only the handful of 4KB sectors that changed.
 
+Combine's own guards are structural, not semantic: base and overlay ELF
+class must match; base must carry `GRAFT_*_SLACK` symbols and a
+decodable manifest; every spliced section must land *wholly inside* a
+slack region (a section overlapping live base content refuses — this is
+where slack overflow and a mispaired base normally surface); appended
+PT_LOADs must not intersect base's; and a base with a build-id window
+requires the overlay to have one. All *semantic* pairing checks — argv
+flag surface, schema/hash-algo versions, boot fingerprint, anchor bytes,
+TLS geometry — already ran at overlay-link time against
+`GRAFT_BASE_ELF`. Under `auto` the pairing is by construction (combine
+receives the exact snapshot the overlay just linked against); a
+standalone `graft combine` handed the *wrong* base is only caught by the
+geometric checks.
+
 ---
 
 ## Auto mode (`GRAFT=auto`)
@@ -365,7 +415,19 @@ relink, so the build never breaks. The main refusal classes:
   transitively calls) lands here — the runtime walks base's
   constructor table and only the entry symbol is trampolined, so the
   change could never take effect through an overlay; refuse instead of
-  leaving base's stale constructor running.
+  leaving base's stale constructor running. So a changed node ends up
+  in one of exactly three places: reachable from the entry symbol →
+  re-emitted in the closure; reachable from the ELF entry outside the
+  cut subtree → this refusal; reachable from neither → silently absent
+  from the overlay. That last bucket is the check's blind spot, and it
+  is *reloc-shaped*: graph edges are relocations, so content that is
+  live only through a non-reloc channel — a section KEEP'd by the
+  linker script with no referring reloc, kept alive via `--undefined=`,
+  consumed by hardware or tooling convention (vector tables jumped to
+  by fixed address, partition/checksum tables), or reached by asm that
+  carries no relocation — sits in neither cone. An edit there is
+  dropped without a refusal. Dead code is the benign instance of the
+  bucket; convention-reachable content is the dangerous one.
 - **Walk refusal on mutable content** — a relaxed-base positional anchor
   the walk can't translate, where re-emitting would fork a variable.
 - **Anchor byte-mismatch** — a channel-2 positional anchor whose base.elf
@@ -388,6 +450,38 @@ relink, so the build never breaks. The main refusal classes:
   refuses, naming the exact flags added/removed.
 - **Stale / incompatible snapshot** — manifest schema or hash-algo
   version mismatch; the base is not a valid oracle for this overlay.
+
+---
+
+## Debuggability
+
+The combined image keeps base's `.symtab` and DWARF byte-for-byte, and
+base's bytes never move, so everything *unchanged* debugs exactly as
+before. The costs concentrate in what changed:
+
+- **Overlay code has symbols but no line info.** Prune keeps only
+  closure sections, so `.debug_*` never reaches the pruned objects;
+  `overlay.elf` carries a full symtab for the re-emitted code (so slack
+  addresses symbolize function-level — `add-symbol-file overlay.elf` in
+  gdb) but no DWARF. The combined image gets neither: splice copies
+  alloc bytes only.
+- **Breakpoints on edited functions never fire.** Base's symbol for an
+  edited function still names the old, now-unreachable copy; a
+  breakpoint set by name lands there and the live copy runs at a slack
+  address only `overlay.elf` knows.
+- **ICF skews attribution, not behavior.** With `GRAFT_ICF=1` the
+  collected duplicates vanish from base's symtab, so backtraces,
+  `addr2line`, and profilers credit every call to the surviving copy's
+  name — often a *different crate's* monomorphization of the same code.
+  Folds are `trans_hash`-identical and byte-verified, so execution is
+  untouched; a frame naming `Vec<A>::push` where the source says
+  `Vec<B>` is expected output, the same trade gold/lld `--icf` makes.
+  Name breakpoints on a collected copy don't resolve. The dead copies'
+  DWARF survives (non-alloc, never gc'd) with tombstoned addresses.
+
+When any of these bite mid-debug-session, the escape hatch is the usual
+one: `GRAFT=passthrough` (or `GRAFT_REBASE=1`) yields a vanilla,
+fully-symbolized image of the current tree.
 
 ---
 
