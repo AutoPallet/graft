@@ -99,7 +99,12 @@ pub struct GraftManifest {
     /// sha1, matches NT_GNU_BUILD_ID when base was linked with --build-id=sha1.
     pub base_abi: [u8; 20],
     pub entry_symbol: String,
-    /// `rustc -Vv` hash — prevents cross-toolchain overlays.
+    /// `rustc -Vv` hash. Recorded for `cache-info` diagnostics only —
+    /// NOT enforced at overlay time. In practice a rustc change re-keys
+    /// every rcgu's content (mangled names, `-C metadata`), so the
+    /// closure balloons and auto rebases anyway; the unguarded residue
+    /// is a changed `GRAFT_REAL_LD`/binutils, which only the downstream
+    /// checks (slack asserts, assumed-name verify, TLS geometry) catch.
     pub toolchain_stamp: String,
     /// Link-time [start, end) address range reserved for overlays.
     /// Informational — the overlay link script is authoritative.
