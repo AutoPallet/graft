@@ -95,6 +95,18 @@ pub fn append_sections(input: &[u8], sections: &[NewSection<'_>]) -> Result<Vec<
     if sh_table_end > input.len() {
         bail!("truncated section header table");
     }
+    // The rebuild copies input[..e_shoff] and re-emits the SHT — any
+    // file content AFTER the SHT would be silently dropped (and
+    // section sh_offsets pointing past it would dangle into the
+    // appended payloads). ld/lld always emit the SHT last, so this is
+    // a self-enforcing assumption, not a limitation in practice.
+    if sh_table_end < input.len() {
+        bail!(
+            "{} byte(s) of file content after the section-header table — \
+             attach assumes SHT-last layout and would corrupt this file",
+            input.len() - sh_table_end,
+        );
+    }
 
     // Read .shstrtab's sh_offset / sh_size from its section header.
     // Field offsets within the shdr: sh_offset starts at byte 16

@@ -320,6 +320,21 @@ fn combine_splice(
             }
         }
         if any_slack {
+            // The splice pass consumed the slack-resident sections —
+            // but only those. A LOAD that ALSO carries past-base
+            // content would silently lose it here (the append pass
+            // never sees this LOAD), so refuse the mix outright.
+            // (Slack + non-slack-in-base is already a per-section
+            // hard error in the splice pass.)
+            if any_outside_base {
+                bail!(
+                    "overlay PT_LOAD at {load_v_start:#x}+{:#x}: mixes slack-resident \
+                     and past-base sections — the splice pass consumed the slack part \
+                     and the past-base bytes have nowhere to go. Unsupported layout; \
+                     put past-base (RAM-resident) sections in their own segment.",
+                    ov.p_memsz
+                );
+            }
             continue; // splice path handled it
         }
         if any_in_base {
