@@ -357,15 +357,57 @@ fn combine_splice(
     let manifest = metadata::decode_manifest(manifest_bytes)?;
     let entry = manifest.entry_symbol.as_str();
 
-    let base_entry_addr = find_text_def(&base_obj_for_slack, entry)
+    let e_machine = u16::from_le_bytes(base_bytes[18..20].try_into().unwrap());
+    let (base_entry_addr, base_entry_size) = find_text_def(&base_obj_for_slack, entry)
         .ok_or_else(|| anyhow!("entry symbol {entry:?} not defined in base"))?;
-    let overlay_entry_addr = find_text_def(&overlay_obj, entry);
-    let trampolines: Vec<Trampoline> = match overlay_entry_addr {
-        Some(a) => vec![Trampoline {
-            name: entry.to_string(),
-            base_addr: base_entry_addr,
-            overlay_addr: a,
-        }],
+    let trampolines: Vec<Trampoline> = match find_text_def(&overlay_obj, entry) {
+        Some((overlay_addr, overlay_size)) => {
+            // The patch overwrites tramp_size bytes at base's entry;
+            // refuse rather than clobber a neighboring function. st_size
+            // 0 (hand asm without .size) is indistinguishable from
+            // "tiny" — refuse that too, loudly, instead of guessing.
+            let tramp_size = crate::arch::trampoline_size(e_machine)? as u64;
+            if base_entry_size < tramp_size {
+                bail!(
+                    "entry symbol {entry:?} is {base_entry_size} bytes in base — smaller than \
+                     the {tramp_size}-byte trampoline; patching would overwrite the next function"
+                );
+            }
+            let prologue_size = crate::arch::trampoline_prologue_size(e_machine)?;
+            if prologue_size > 0 {
+                // The l32r literal at from+8 needs a 4-byte-aligned
+                // patch site (arch.rs layout).
+                if base_entry_addr % 4 != 0 {
+                    bail!(
+                        "entry symbol {entry:?} at {base_entry_addr:#x} is not 4-byte aligned — \
+                         the xtensa trampoline's l32r literal requires it"
+                    );
+                }
+                if overlay_size != 0 && overlay_size < prologue_size as u64 {
+                    bail!(
+                        "entry symbol {entry:?} is {overlay_size} bytes in overlay — smaller \
+                         than its own {prologue_size}-byte entry instruction?"
+                    );
+                }
+            }
+            // The prologue the trampoline executes must be the OVERLAY
+            // function's own `entry` instruction: it encodes the frame
+            // size of the body we jump into at overlay+3. Base's copy
+            // allocates base's (possibly smaller) frame — running the
+            // new body on it silently corrupts the stack.
+            let prologue = if prologue_size > 0 {
+                read_bytes_at_vaddr(&overlay_obj, overlay_addr, prologue_size)
+                    .with_context(|| format!("read overlay entry prologue for {entry:?}"))?
+            } else {
+                Vec::new()
+            };
+            vec![Trampoline {
+                name: entry.to_string(),
+                base_addr: base_entry_addr,
+                overlay_addr,
+                prologue,
+            }]
+        }
         None => Vec::new(),
     };
 
@@ -381,7 +423,6 @@ fn combine_splice(
     }
 
     if !trampolines.is_empty() {
-        let e_machine = u16::from_le_bytes(base_bytes[18..20].try_into().unwrap());
         apply_trampolines(&mut out, &base_phdrs, &trampolines, e_machine)?;
     }
 
@@ -486,6 +527,11 @@ pub struct Trampoline {
     pub name: String,
     pub base_addr: u64,
     pub overlay_addr: u64,
+    /// The OVERLAY entry function's first `trampoline_prologue_size`
+    /// bytes (xtensa: its `entry` instruction, carrying the frame size
+    /// of the body the trampoline jumps into). Empty on targets with
+    /// no preserved prologue.
+    pub prologue: Vec<u8>,
 }
 
 /// Locate an image's build-id bytes: the window between
@@ -781,7 +827,8 @@ fn read_program_headers(elf: &[u8], class: ElfClass) -> Result<Vec<Phdr>> {
         .collect())
 }
 
-fn find_text_def(elf: &object::File<'_>, name: &str) -> Option<u64> {
+/// Find a defined text symbol; returns `(st_value, st_size)`.
+fn find_text_def(elf: &object::File<'_>, name: &str) -> Option<(u64, u64)> {
     elf.symbols().find_map(|s| {
         if !s.is_definition() || !matches!(s.kind(), object::SymbolKind::Text) {
             return None;
@@ -789,8 +836,26 @@ fn find_text_def(elf: &object::File<'_>, name: &str) -> Option<u64> {
         if s.name().ok()? != name {
             return None;
         }
-        Some(s.address())
+        Some((s.address(), s.size()))
     })
+}
+
+/// Read `len` bytes at virtual address `vaddr` out of an ELF's section
+/// contents (used to pull the overlay entry function's first
+/// instruction for the trampoline prologue).
+fn read_bytes_at_vaddr(elf: &object::File<'_>, vaddr: u64, len: usize) -> Result<Vec<u8>> {
+    use object::ObjectSection;
+    for sec in elf.sections() {
+        let (addr, size) = (sec.address(), sec.size());
+        if vaddr >= addr && vaddr + len as u64 <= addr + size {
+            let data = sec.data()?;
+            let off = (vaddr - addr) as usize;
+            if off + len <= data.len() {
+                return Ok(data[off..off + len].to_vec());
+            }
+        }
+    }
+    bail!("no section contents cover {vaddr:#x}..+{len}");
 }
 
 fn apply_trampolines(
@@ -813,6 +878,16 @@ fn apply_trampolines(
                     t.name
                 )
             })?;
+        // Bound by the segment's file bytes, not just EOF: a patch near
+        // segment end must not spill into the next segment's contents.
+        if t.base_addr + tramp_size as u64 > seg.p_vaddr + seg.p_filesz {
+            bail!(
+                "trampoline {} ({} bytes) at {:#x} runs past its PT_LOAD's filesz",
+                t.name,
+                tramp_size,
+                t.base_addr
+            );
+        }
         let file_off = (seg.p_offset + (t.base_addr - seg.p_vaddr)) as usize;
         if file_off + tramp_size > out.len() {
             bail!(
@@ -821,12 +896,20 @@ fn apply_trampolines(
                 tramp_size
             );
         }
-        // For arches that need to preserve a prologue (xtensa: the
-        // windowed-ABI `entry` instruction), grab those bytes BEFORE
-        // we overwrite. They live at the patch site in the (still
-        // unmodified) `out` buffer.
-        let prologue = out[file_off..file_off + prologue_size].to_vec();
-        let bytes = crate::arch::trampoline(e_machine, t.base_addr, t.overlay_addr, &prologue)
+        // Sanity-check the patch site: base's entry function must open
+        // with `entry` (opcode byte 0x36) — anything else means we're
+        // patching the wrong place. (arch.rs makes the same check on
+        // the overlay prologue we're about to install.)
+        if prologue_size > 0 && out[file_off] != 0x36 {
+            bail!(
+                "trampoline {}: base entry at {:#x} does not start with an `entry` \
+                 instruction (byte {:#04x})",
+                t.name,
+                t.base_addr,
+                out[file_off]
+            );
+        }
+        let bytes = crate::arch::trampoline(e_machine, t.base_addr, t.overlay_addr, &t.prologue)
             .with_context(|| format!("encode trampoline for {}", t.name))?;
         out[file_off..file_off + bytes.len()].copy_from_slice(&bytes);
     }
@@ -1043,4 +1126,83 @@ fn write_executable(path: &Path, bytes: &[u8]) -> Result<()> {
             .with_context(|| format!("chmod +x {}", path.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one_load(vaddr: u64, filesz: u64) -> Vec<Phdr> {
+        vec![Phdr {
+            p_type: PT_LOAD,
+            p_flags: 0,
+            p_offset: 0,
+            p_vaddr: vaddr,
+            p_paddr: vaddr,
+            p_filesz: filesz,
+            p_memsz: filesz,
+            p_align: 4,
+        }]
+    }
+
+    fn tramp(base_addr: u64, prologue: &[u8]) -> Trampoline {
+        Trampoline {
+            name: "main".into(),
+            base_addr,
+            overlay_addr: 0x2000,
+            prologue: prologue.to_vec(),
+        }
+    }
+
+    /// The installed prologue must be the OVERLAY entry instruction —
+    /// it encodes the frame size of the body the trampoline jumps
+    /// into. Installing base's copy runs the new body on the old
+    /// frame (silent stack corruption when the frame grew).
+    #[test]
+    fn xtensa_installs_overlay_entry_frame() {
+        let base_prologue = [0x36, 0x81, 0x01]; // entry a1, 192
+        let overlay_prologue = [0x36, 0xc1, 0x01]; // bigger frame
+        let mut out = vec![0u8; 64];
+        out[16..19].copy_from_slice(&base_prologue);
+        apply_trampolines(
+            &mut out,
+            &one_load(0x1000, 64),
+            &[tramp(0x1010, &overlay_prologue)],
+            object::elf::EM_XTENSA,
+        )
+        .unwrap();
+        assert_eq!(&out[16..19], &overlay_prologue);
+    }
+
+    /// A patch near segment end must refuse, not spill into the next
+    /// segment's file bytes (EOF alone is not a bound).
+    #[test]
+    fn patch_past_filesz_refuses() {
+        let mut out = vec![0u8; 4096];
+        out[0] = 0x36;
+        let err = apply_trampolines(
+            &mut out,
+            &one_load(0x1000, 16), // 16 bytes < 18-byte trampoline
+            &[tramp(0x1000, &[0x36, 0x81, 0x01])],
+            object::elf::EM_XTENSA,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("filesz"), "{err}");
+    }
+
+    /// Patch site whose first byte isn't `entry` (0x36) means we're
+    /// aimed at the wrong place — refuse.
+    #[test]
+    fn non_entry_patch_site_refuses() {
+        let mut out = vec![0u8; 64];
+        out[0] = 0x90;
+        let err = apply_trampolines(
+            &mut out,
+            &one_load(0x1000, 64),
+            &[tramp(0x1000, &[0x36, 0x81, 0x01])],
+            object::elf::EM_XTENSA,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("entry"), "{err}");
+    }
 }

@@ -10,13 +10,15 @@ use object::elf;
 /// to `to`. The first byte of the returned slice is the entry point —
 /// callers must place it at `from` exactly.
 ///
-/// `prologue` is the original bytes already at `from`. Most targets
-/// ignore it; xtensa needs the first 3 bytes (the windowed-ABI `entry`
-/// instruction) preserved so the caller's `call8 main` lands on a valid
-/// frame-allocating prologue. The trampoline then jumps past overlay's
-/// own entry (which would double-allocate the frame and rotate the
-/// window twice). Pass at least `trampoline_prologue_size(machine)`
-/// bytes; extras are ignored.
+/// `prologue` is the first bytes of the *destination* function (the
+/// overlay's copy at `to`). Most targets ignore it; xtensa installs the
+/// first 3 bytes (the windowed-ABI `entry` instruction) at `from` so
+/// the caller's `call8 main` lands on a frame-allocating prologue —
+/// and it must be the overlay's own `entry`, since that encodes the
+/// frame size of the body the trampoline jumps into. The trampoline
+/// then jumps past overlay's entry (which would double-allocate the
+/// frame and rotate the window twice). Pass at least
+/// `trampoline_prologue_size(machine)` bytes; extras are ignored.
 pub fn trampoline(machine: u16, from: u64, to: u64, prologue: &[u8]) -> Result<Vec<u8>> {
     match machine {
         elf::EM_X86_64 => x86_64_jmp_rel32(from, to),
@@ -34,9 +36,10 @@ pub fn trampoline_size(machine: u16) -> Result<usize> {
     }
 }
 
-/// How many bytes of the existing function the trampoline copies
-/// verbatim (then continues with arch-specific redirect). 0 on most
-/// targets; 3 on xtensa for the `entry` instruction.
+/// How many bytes of the destination function's prologue the
+/// trampoline installs verbatim (then continues with arch-specific
+/// redirect). 0 on most targets; 3 on xtensa for the `entry`
+/// instruction.
 pub fn trampoline_prologue_size(machine: u16) -> Result<usize> {
     match machine {
         elf::EM_X86_64 => Ok(0),
@@ -85,14 +88,13 @@ fn x86_64_jmp_rel32(from: u64, to: u64) -> Result<Vec<u8>> {
 /// and confirms the new window. Skipping or duplicating `entry` corrupts
 /// the window state — the chip silently hangs after the first call.
 ///
-/// Constraint: overlay's function must allocate the same stack frame
-/// as base's (typically true for "same Rust source, same compiler").
-/// If frame sizes diverge, the windowed-ABI assumption breaks; that's
-/// a future concern (likely needs the trampoline to allocate the larger
-/// frame, or to use a non-windowed call sequence).
+/// The installed `entry` is the OVERLAY function's (combine reads it
+/// from the overlay ELF at `to`), so the allocated frame always matches
+/// the body executing after the jump — an edit that changes the entry
+/// function's frame size is handled, not a constraint violation.
 ///
 /// Verified bytes via `xtensa-esp32s3-elf-as` for the constant-encoded
-/// portions. `entry`'s exact bytes are read from the live base ELF.
+/// portions.
 fn xtensa_skip_then_load(to: u64, prologue: &[u8]) -> Result<Vec<u8>> {
     if to > u64::from(u32::MAX) {
         bail!("xtensa trampoline target {to:#x} doesn't fit in 32 bits");
