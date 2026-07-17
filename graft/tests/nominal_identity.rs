@@ -31,6 +31,7 @@ fn bss_section(name: &str) -> SectionInfo {
         sh_flags: u64::from(SHF_ALLOC | SHF_WRITE),
         sh_entsize: 0,
         sh_size: 16,
+        sh_addralign: 4,
         bytes: Vec::new(), // NOBITS: no bytes
         relocs: Vec::new(),
     }
@@ -43,6 +44,7 @@ fn rodata_section(name: &str, bytes: &[u8]) -> SectionInfo {
         sh_flags: u64::from(SHF_ALLOC),
         sh_entsize: 0,
         sh_size: bytes.len() as u64,
+        sh_addralign: 4,
         bytes: bytes.to_vec(),
         relocs: Vec::new(),
     }
@@ -146,6 +148,7 @@ fn scc_members_get_distinct_trans_hashes() {
         sh_flags: u64::from(SHF_ALLOC | SHF_EXECINSTR),
         sh_entsize: 0,
         sh_size: bytes.len() as u64,
+        sh_addralign: 4,
         bytes: bytes.to_vec(),
         relocs: vec![CanonicalReloc {
             offset: 0,
@@ -189,6 +192,7 @@ fn ram_resident_code_stays_content_addressable() {
         sh_flags: u64::from(SHF_ALLOC | SHF_WRITE | SHF_EXECINSTR),
         sh_entsize: 0,
         sh_size: 16,
+        sh_addralign: 4,
         bytes: vec![0x90; 16],
         relocs: Vec::new(),
     };
@@ -214,6 +218,7 @@ fn merge_cst_sections_split_per_entry() {
         sh_flags: u64::from(SHF_ALLOC | SHF_MERGE),
         sh_entsize: 8,
         sh_size: 16,
+        sh_addralign: 4,
         bytes: vec![1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0],
         relocs: Vec::new(),
     };
@@ -236,10 +241,52 @@ fn merge_section_with_ragged_size_stays_whole() {
         sh_flags: u64::from(SHF_ALLOC | SHF_MERGE),
         sh_entsize: 8,
         sh_size: 12,
+        sh_addralign: 4,
         bytes: vec![0u8; 12],
         relocs: Vec::new(),
     };
     let objects = vec![obj_with_sections(vec![sec], vec![])];
     let g = graph::build(&objects, None, &Default::default());
     assert_eq!(g.nodes.len(), 1, "ragged merge section stays one node");
+}
+
+#[test]
+fn grown_bss_changes_identity() {
+    // `static X: [i32; 1]` → `[i32; 2]`: NOBITS has no bytes and the
+    // symbol layout is unchanged, so sh_size is the ONLY signal. If it
+    // isn't in the identity, the grown allocation keeps its trans_hash
+    // and channel 2 anchors writes to X[1] into base's smaller slot —
+    // corrupting whatever ld placed next.
+    let small = obj_with_sections(
+        vec![bss_section(".bss.X")], // sh_size 16
+        vec![defining_symbol("X", 0, 0)],
+    );
+    let mut grown_sec = bss_section(".bss.X");
+    grown_sec.sh_size = 32;
+    let grown = obj_with_sections(vec![grown_sec], vec![defining_symbol("X", 0, 0)]);
+    assert_ne!(
+        trans_hashes(small),
+        trans_hashes(grown),
+        "a grown NOBITS allocation must not keep its identity"
+    );
+}
+
+#[test]
+fn realigned_content_changes_identity() {
+    // Byte-identical content demanding stricter alignment must not
+    // keep its trans_hash: an anchor to base's placement satisfies the
+    // OLD alignment only (aligned SIMD loads on a repr(align) bump
+    // would fault, silently on targets that tolerate misalignment).
+    let a = obj_with_sections(
+        vec![rodata_section(".rodata.x", b"\x01\x02\x03\x04")], // align 4
+        vec![defining_symbol("X", 0, 0)],
+    );
+    let mut realigned_sec = rodata_section(".rodata.x", b"\x01\x02\x03\x04");
+    realigned_sec.sh_addralign = 64;
+    let b = obj_with_sections(vec![realigned_sec], vec![defining_symbol("X", 0, 0)]);
+    assert_ne!(
+        trans_hashes(a),
+        trans_hashes(b),
+        "an alignment change must not keep content identity"
+    );
 }

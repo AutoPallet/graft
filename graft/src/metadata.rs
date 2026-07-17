@@ -61,7 +61,15 @@ pub const SCHEMA_VERSION: u16 = 11;
 /// Version of the trans_hash algorithm itself, independent of table
 /// layout. Bump whenever hash VALUES change for unchanged inputs;
 /// `overlay::build_base_index` checks it alongside SCHEMA_VERSION.
-pub const HASH_ALGO_VERSION: u16 = 1;
+///
+/// v2: node identity folds `sh_size` + `sh_addralign` per segment.
+/// Before this, a grown NOBITS allocation (`static X: [i32;1]` →
+/// `[i32;2]`: no bytes, salt keyed only on symbol names/offsets) kept
+/// its trans_hash, and channel 2 anchored the re-emitted referrer's
+/// writes into base's smaller slot — silent corruption of whatever ld
+/// placed next. Alignment likewise: byte-identical content demanding
+/// stricter alignment must not anchor to base's placement.
+pub const HASH_ALGO_VERSION: u16 = 2;
 
 pub const SECTION_MANIFEST: &str = ".graft.manifest";
 pub const SECTION_SECTIONS: &str = ".graft.sections";

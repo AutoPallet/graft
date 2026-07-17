@@ -111,16 +111,28 @@ fn node_identity_hashes_with(
         .map(|nm| {
             let mut h = blake3::Hasher::new();
             for seg in &nm.segments {
+                let sec = &objects[seg.object as usize].sections[seg.section as usize];
                 let bytes = seg.bytes_in(&objects[seg.object as usize].sections);
                 // Per-segment length framing: without it, multi-
                 // segment (aggregator) nodes with different byte
                 // boundaries could concatenate to identical streams.
                 h.update(&(bytes.len() as u64).to_le_bytes());
                 h.update(bytes);
-                if seg.range.is_none()
-                    && let Some(salt) = salts.get(&(seg.object, seg.section))
-                {
-                    h.update(salt);
+                if seg.range.is_none() {
+                    // Placement contract the bytes can't express:
+                    // sh_size is the ONLY record of a NOBITS
+                    // allocation's extent (a grown .bss must not keep
+                    // its identity and anchor into base's smaller
+                    // slot), and sh_addralign matters even for byte-
+                    // identical content (stricter alignment must not
+                    // anchor to base's under-aligned placement).
+                    // Per-string segments (range.is_some()) stay pure
+                    // content — SHF_MERGE entries are placed by value.
+                    h.update(&sec.sh_size.to_le_bytes());
+                    h.update(&sec.sh_addralign.to_le_bytes());
+                    if let Some(salt) = salts.get(&(seg.object, seg.section)) {
+                        h.update(salt);
+                    }
                 }
             }
             h.finalize()
@@ -247,6 +259,11 @@ pub fn compute_detailed(
                 // node's input-hash is invariant to relocs that
                 // belong to other parts of the section.
                 if seg.range.is_none() {
+                    // sh_size + sh_addralign: same placement-contract
+                    // fold as node_identity_hashes — keep the two
+                    // streams in lockstep.
+                    h.update(&sec.sh_size.to_le_bytes());
+                    h.update(&sec.sh_addralign.to_le_bytes());
                     if let Some(salt) = salts.get(&(seg.object, seg.section)) {
                         h.update(salt);
                     }

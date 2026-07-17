@@ -40,8 +40,13 @@ pub struct SectionInfo {
     /// Raw ELF `sh_size`. Equals `bytes.len()` for retained PROGBITS,
     /// but is the only size record for NOBITS (.bss) and for non-alloc
     /// slots whose bytes we drop — map-record attribution disambiguates
-    /// same-named sections by it.
+    /// same-named sections by it. Folded into node identity: for NOBITS
+    /// it's the only thing distinguishing a grown allocation.
     pub sh_size: u64,
+    /// Raw ELF `sh_addralign`. Folded into node identity: byte-identical
+    /// content demanding stricter alignment must not keep its trans_hash
+    /// and anchor to base's (possibly under-aligned) placement.
+    pub sh_addralign: u64,
     /// Section contents, or empty for NOBITS sections (.bss).
     pub bytes: Vec<u8>,
     /// Forward relocations from this section, canonicalized and sorted by
@@ -202,6 +207,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedObject> {
                 sh_flags,
                 sh_entsize,
                 sh_size: sec.size(),
+                sh_addralign: sec.align(),
                 bytes: Vec::new(),
                 relocs: Vec::new(),
             });
@@ -267,6 +273,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedObject> {
             sh_flags,
             sh_entsize,
             sh_size: sec.size(),
+            sh_addralign: sec.align(),
             bytes,
             relocs,
         });
