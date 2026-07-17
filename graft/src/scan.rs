@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::archive::{self, DeferredArchive, ObjectInput};
 use crate::elf::{self, ParsedObject, SymbolBind};
@@ -85,10 +85,23 @@ pub fn run<P: AsRef<Path> + Sync>(
 
     // Open each deferred archive once. Read its symbol-index into
     // `symbol_index`: name → (archive_idx, member_offset). First
-    // archive in input order wins on duplicate names — matches ld's
-    // left-to-right archive search.
+    // archive in input order wins on duplicate names.
+    //
+    // That is NOT always ld's answer. ld satisfies an undef from the
+    // first archive at-or-after the position where the undef became
+    // *live*: with archives A B C where only a member of B introduces
+    // the undef, ld picks C's definition (even inside --start-group —
+    // the same pass reaches C before any group restart revisits A),
+    // while a global first-wins index picks A's. Hashing A's member
+    // when base.elf contains C's makes later edits to C's copy
+    // invisible — a silent stale bind. Until the scan models ld's
+    // position semantics, `dup_defs` records every cross-archive
+    // name collision, and demanding one whose candidate members'
+    // bytes differ is a hard refusal (identical bytes → either pick
+    // is interchangeable, proceed).
     let mut deferred: Vec<DeferredArchive> = Vec::with_capacity(deferred_paths.len());
     let mut symbol_index: HashMap<String, (usize, u64)> = HashMap::new();
+    let mut dup_defs: HashMap<String, Vec<(usize, u64)>> = HashMap::new();
     for p in deferred_paths {
         let p = p.as_ref();
         let Some(archive) = DeferredArchive::open(p)
@@ -103,9 +116,22 @@ pub fn run<P: AsRef<Path> + Sync>(
         walked_archives.insert(archive.canon_path.clone());
         let archive_idx = deferred.len();
         for (name, &offset) in &archive.symbol_to_offset {
-            symbol_index
-                .entry(name.clone())
-                .or_insert((archive_idx, offset));
+            match symbol_index.entry(name.clone()) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert((archive_idx, offset));
+                }
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    let first = *e.get();
+                    // Same-archive duplicates are fine: ld's archive-map
+                    // walk and ours both take the first index entry.
+                    if first.0 != archive_idx {
+                        dup_defs
+                            .entry(name.clone())
+                            .or_insert_with(|| vec![first])
+                            .push((archive_idx, offset));
+                    }
+                }
+            }
         }
         deferred.push(archive);
     }
@@ -141,12 +167,45 @@ pub fn run<P: AsRef<Path> + Sync>(
             raw.to_string()
         }
     };
+    // Refuse a demanded name that several deferred archives define with
+    // DIFFERING member bytes — graft's position-independent pick could
+    // diverge from ld's (see the dup_defs comment above). Byte-identical
+    // candidates are interchangeable; let the first-wins pick stand.
+    let check_ambiguous = |name: &str| -> Result<()> {
+        let Some(cands) = dup_defs.get(name) else {
+            return Ok(());
+        };
+        let mut first_bytes: Option<(usize, Vec<u8>)> = None;
+        for &(ai, off) in cands {
+            let inp = deferred[ai]
+                .parse_member(off)
+                .with_context(|| format!("parse member at {off:#x} in {}",
+                    deferred[ai].path.display()))?;
+            match &first_bytes {
+                None => first_bytes = Some((ai, inp.bytes)),
+                Some((_, bytes)) if *bytes == inp.bytes => {}
+                Some((first_ai, _)) => bail!(
+                    "graft scan: demanded symbol `{name}` is defined by multiple \
+                     deferred archives with differing content ({} and {}). graft's \
+                     demand-load picks the first archive in input order, but ld \
+                     satisfies an undef from the first archive at-or-after the \
+                     point it became live — the picks can diverge, and hashing a \
+                     member base.elf doesn't contain makes later edits to the real \
+                     one invisible. Refusing (scan must mirror ld).",
+                    deferred[*first_ai].path.display(),
+                    deferred[ai].path.display(),
+                ),
+            }
+        }
+        Ok(())
+    };
     for sym_name in extra_roots {
         let lookup = demand_name(sym_name);
         if defined_globals.contains(&lookup) { continue; }
         if let Some(&(ai, off)) = symbol_index.get(&lookup)
             && loaded_members.insert((ai, off))
         {
+            check_ambiguous(&lookup)?;
             pending.push((ai, off));
         }
     }
@@ -200,6 +259,7 @@ pub fn run<P: AsRef<Path> + Sync>(
                 if let Some(&(ai, off)) = symbol_index.get(&lookup)
                     && loaded_members.insert((ai, off))
                 {
+                    check_ambiguous(&lookup)?;
                     pending.push((ai, off));
                 }
             }
