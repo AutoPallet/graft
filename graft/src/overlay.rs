@@ -89,7 +89,7 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
     }
 
     let driver = crate::argv::driver_path(&argv);
-    let (eager_inputs, deferred_inputs) = resolve_scan_inputs(&link_args, &driver);
+    let (eager_inputs, deferred_inputs) = resolve_scan_inputs(&link_args, &driver)?;
     let t_scan_start = std::time::Instant::now();
     let scan = scan::run(
         &eager_inputs,
@@ -595,7 +595,15 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
 pub(crate) fn resolve_scan_inputs(
     args: &crate::argv::LinkArgs,
     driver: &Path,
-) -> (Vec<PathBuf>, Vec<PathBuf>) {
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    if args.whole_archive {
+        bail!(
+            "graft: link argv uses --whole-archive, which force-loads archive \
+             members the scan's demand-load model would never see — the graph \
+             and boot fingerprint would silently omit them. Unsupported; use \
+             GRAFT=passthrough (or unset GRAFT) for this link."
+        );
+    }
     let mut eager: Vec<PathBuf> = Vec::new();
     let mut deferred: Vec<PathBuf> = Vec::new();
     for p in &args.inputs {
@@ -612,7 +620,7 @@ pub(crate) fn resolve_scan_inputs(
             deferred.push(path);
         }
     }
-    (eager, deferred)
+    Ok((eager, deferred))
 }
 
 fn work_dir_for(output: &Path) -> PathBuf {

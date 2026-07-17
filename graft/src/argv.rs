@@ -29,6 +29,13 @@ pub struct LinkArgs {
     /// relocs as UND symbol references and let ld handle them via
     /// the forwarded `--wrap` flag.
     pub wrapped: Vec<String>,
+    /// True if the argv carries `--whole-archive` (or
+    /// `--no-whole-archive`) in any spelling. ld's whole-archive mode
+    /// force-loads every member of the bracketed archives regardless of
+    /// reference — a loading model the scan doesn't implement (members
+    /// with no inbound strong ref would be invisible to the graph and
+    /// the boot fingerprint). base/overlay refuse when this is set.
+    pub whole_archive: bool,
 }
 
 pub fn parse(argv: &[String]) -> LinkArgs {
@@ -91,6 +98,14 @@ pub fn parse(argv: &[String]) -> LinkArgs {
             && !v.is_empty()
         {
             out.library_paths.push(PathBuf::from(v));
+            i += 1;
+            continue;
+        }
+        // Any spelling of --whole-archive / --no-whole-archive (bare,
+        // -Wl,-wrapped, comma-joined). Substring match is safe: no
+        // other ld flag contains "whole-archive".
+        if a.contains("whole-archive") {
+            out.whole_archive = true;
             i += 1;
             continue;
         }
@@ -481,5 +496,23 @@ mod tests {
             parsed.undefined,
             vec!["foo1", "foo2", "foo3", "foo4", "foo5", "foo6", "foo7"],
         );
+    }
+
+    #[test]
+    fn whole_archive_any_spelling_is_flagged() {
+        for flag in [
+            "--whole-archive",
+            "--no-whole-archive",
+            "-Wl,--whole-archive",
+            "-Wl,--whole-archive,--no-whole-archive",
+        ] {
+            let argv = s(&["ld", flag, "-o", "/tmp/out", "/tmp/foo.o"]);
+            let parsed = parse(&argv);
+            assert!(parsed.whole_archive, "{flag} not detected");
+            // The flag must not eat neighbors: inputs still parsed.
+            assert_eq!(parsed.inputs.len(), 1, "{flag}");
+        }
+        let argv = s(&["ld", "-o", "/tmp/out", "/tmp/foo.o"]);
+        assert!(!parse(&argv).whole_archive);
     }
 }

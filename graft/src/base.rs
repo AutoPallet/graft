@@ -60,7 +60,7 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
     // pure linker-side machinery and shouldn't appear in the call graph.
     let driver = crate::argv::driver_path(&argv);
     let (eager_inputs, deferred_inputs) =
-        crate::overlay::resolve_scan_inputs(&link_args, &driver);
+        crate::overlay::resolve_scan_inputs(&link_args, &driver)?;
     let extra_roots = link_args.undefined.clone();
     let wrapped = link_args.wrapped.clone();
     // The trampoline target (from GRAFT_ENTRY_SYMBOL, default `main`).
@@ -329,7 +329,7 @@ pub(crate) fn dup_stats(
     }
     let link_args = argv::parse(&argv);
     let driver = crate::argv::driver_path(&argv);
-    let (eager, deferred) = crate::overlay::resolve_scan_inputs(&link_args, &driver);
+    let (eager, deferred) = crate::overlay::resolve_scan_inputs(&link_args, &driver)?;
     let entry = find_entry_symbol(&[]);
     let scan_result = scan::run(
         &eager,
