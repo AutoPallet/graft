@@ -408,11 +408,103 @@ pub fn forwarded_link_args<'a>(
     out
 }
 
+/// blake3 content hashes of every `-T` / `--script` linker script on
+/// the argv, resolved the way ld does (path as given, else searched in
+/// `-L` paths), sorted for order-independence. The v11 flag guard
+/// records the script's *name*; this closes the in-place-edit hole
+/// (editing memory.x without renaming it changes PROVIDE/KEEP/placement
+/// semantics invisibly to both the flag surface and the content
+/// hashes). A name that doesn't resolve to a readable file hashes as a
+/// marker over the name itself — ld's own script search may still find
+/// it, but a swap of which file the name resolves to is exactly a `-L`
+/// change, which the resolved-content hash captures.
+///
+/// Limitation: `INCLUDE`d sub-scripts are not chased; editing one
+/// without touching its includer stays invisible.
+pub fn script_content_hashes(argv: &[String], library_paths: &[PathBuf]) -> Vec<[u8; 32]> {
+    // Flatten -Wl, aggregates so `-Wl,-T,foo.ld` parses like `-T foo.ld`.
+    let mut toks: Vec<String> = Vec::new();
+    for a in argv.iter().skip(1) {
+        if let Some(rest) = a.strip_prefix("-Wl,") {
+            toks.extend(rest.split(',').map(str::to_string));
+        } else {
+            toks.push(a.clone());
+        }
+    }
+    let mut names: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        let t = &toks[i];
+        if t == "-T" || t == "--script" {
+            if let Some(n) = toks.get(i + 1) {
+                names.push(n.clone());
+                i += 2;
+                continue;
+            }
+        } else if let Some(n) = t.strip_prefix("--script=") {
+            names.push(n.to_string());
+        } else if let Some(n) = t.strip_prefix("-T")
+            && !n.is_empty()
+        {
+            names.push(n.to_string());
+        }
+        i += 1;
+    }
+    let mut hashes: Vec<[u8; 32]> = names
+        .iter()
+        .map(|n| {
+            let direct = Path::new(n);
+            let content = if direct.is_file() {
+                std::fs::read(direct).ok()
+            } else {
+                library_paths
+                    .iter()
+                    .map(|d| d.join(n))
+                    .find(|c| c.is_file())
+                    .and_then(|c| std::fs::read(&c).ok())
+            };
+            match content {
+                Some(bytes) => *blake3::hash(&bytes).as_bytes(),
+                None => *blake3::hash(format!("<unresolved-script:{n}>").as_bytes()).as_bytes(),
+            }
+        })
+        .collect();
+    hashes.sort_unstable();
+    hashes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn s(v: &[&str]) -> Vec<String> { v.iter().map(|x| x.to_string()).collect() }
+
+    #[test]
+    fn script_hashes_catch_in_place_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("memory.x");
+        std::fs::write(&script, "PROVIDE(x = 1);").unwrap();
+        let argv = s(&["ld", "-T", script.to_str().unwrap(), "-o", "/tmp/out"]);
+        let before = script_content_hashes(&argv, &[]);
+        assert_eq!(before.len(), 1);
+        // Same argv, edited content → different hash.
+        std::fs::write(&script, "PROVIDE(x = 2);").unwrap();
+        assert_ne!(before, script_content_hashes(&argv, &[]));
+    }
+
+    #[test]
+    fn script_hashes_resolve_via_library_paths_and_wl() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("periph.ld"), "MEMORY {}").unwrap();
+        let argv = s(&["ld", "-Wl,-T,periph.ld", "-o", "/tmp/out"]);
+        let resolved = script_content_hashes(&argv, &[dir.path().to_path_buf()]);
+        let unresolved = script_content_hashes(&argv, &[]);
+        assert_eq!(resolved.len(), 1);
+        assert_ne!(resolved, unresolved, "resolution state must be visible");
+        // -T<attached> spelling matches the two-token spelling.
+        let attached = s(&["ld", &format!("-T{}", dir.path().join("periph.ld").display())]);
+        assert_eq!(resolved, script_content_hashes(&attached, &[]));
+    }
 
     #[test]
     fn basic_split() {

@@ -49,8 +49,11 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
     // Record the flag surface AS RECEIVED, before graft's own additions
     // below (slack object, --undefined= GC roots, -Map). Overlay
     // computes its surface over the raw rustc argv too — recording the
-    // augmented argv here would make every overlay refuse.
+    // augmented argv here would make every overlay refuse. Same for the
+    // -T script content hashes (overlay adds its own layout script
+    // later, after its guard compare).
     let argv_flags = argv::semantic_flags(&argv);
+    let script_hashes = argv::script_content_hashes(&argv, &link_args.library_paths);
 
     let t_start = std::time::Instant::now();
 
@@ -226,6 +229,7 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
         overlay_region: (0, 0), // no region reserved; overlay picks a disjoint addr
         boot: boot_fingerprint(&elf_bytes, &scan_result),
         argv_flags,
+        script_hashes,
     };
     if manifest.boot.is_none() {
         eprintln!(

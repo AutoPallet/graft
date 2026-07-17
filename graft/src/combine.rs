@@ -355,6 +355,22 @@ fn combine_splice(
     let manifest_bytes = elf_attach::read_section(base_bytes, metadata::SECTION_MANIFEST)?
         .ok_or_else(|| anyhow!("{}: no {}", base_path.display(), metadata::SECTION_MANIFEST))?;
     let manifest = metadata::decode_manifest(manifest_bytes)?;
+    // Pairing check: the overlay carries the base_abi it was linked
+    // against. A different base can pass every geometric check (same
+    // slack layout family) while every anchored address is stale.
+    // Absent stamp = pre-v12 or empty-closure overlay; skip.
+    if let Some(stamp_bytes) =
+        elf_attach::read_section(overlay_bytes, metadata::SECTION_OVERLAY_STAMP)?
+        && let Ok(stamp) = metadata::decode_overlay_stamp(stamp_bytes)
+        && stamp.base_abi != manifest.base_abi
+    {
+        bail!(
+            "{} was linked against a different base (build-id mismatch with {}) — \
+             combining would bind every anchor to stale addresses",
+            overlay_path.display(),
+            base_path.display(),
+        );
+    }
     let entry = manifest.entry_symbol.as_str();
 
     let e_machine = u16::from_le_bytes(base_bytes[18..20].try_into().unwrap());

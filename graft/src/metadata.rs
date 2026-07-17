@@ -56,6 +56,13 @@ pub const GRAFT_MAGIC: [u8; 4] = *b"GRFT";
 // Overlay refuses on mismatch, naming the flags that changed. Stored
 // as the list, not a digest, precisely so the refusal can say WHICH
 // flag — it's ~20 short strings in a non-ALLOC section.
+// v12 also: the manifest gains `script_hashes` (content hashes of -T
+// scripts — the flag surface only sees their names, so an in-place
+// memory.x edit was invisible), and overlay.elf gains a
+// `.graft.overlay` stamp naming the base_abi it was linked against
+// (standalone `graft combine` refuses a mismatched base). GRAFT_ENTRY_SYMBOL
+// drift is refused at overlay entry (env vs manifest — the trampoline
+// cut is baked into the base at link time).
 // v12: `.graft.sections` gains `unplaced_mutable` — trans_hashes of
 // mutable/NOBITS nodes base PLACED (their key matched map records) but
 // couldn't attribute to an address. The closure walk previously
@@ -107,6 +114,32 @@ pub struct GraftManifest {
     /// recomputes it over its own argv and refuses on mismatch,
     /// naming the flags that differ.
     pub argv_flags: Vec<String>,
+    /// Sorted blake3 hashes of every `-T`/`--script` linker script's
+    /// CONTENT at base link (`argv::script_content_hashes`). The flag
+    /// surface records script names; this refuses the in-place edit
+    /// (memory.x PROVIDE/KEEP changes) the name can't show.
+    pub script_hashes: Vec<[u8; 32]>,
+}
+
+/// Stamp attached to overlay.elf (`.graft.overlay`): which base this
+/// overlay was linked against. `graft combine` refuses a base whose
+/// `base_abi` differs — a standalone combine against the wrong base is
+/// geometrically plausible (same slack layout family) but semantically
+/// stale everywhere.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct OverlayStamp {
+    pub magic: [u8; 4],
+    pub base_abi: [u8; 20],
+}
+
+pub const SECTION_OVERLAY_STAMP: &str = ".graft.overlay";
+
+pub fn encode_overlay_stamp(s: &OverlayStamp) -> anyhow::Result<Vec<u8>> {
+    postcard::to_allocvec(s).map_err(|e| anyhow::anyhow!("encode overlay stamp: {e}"))
+}
+
+pub fn decode_overlay_stamp(bytes: &[u8]) -> anyhow::Result<OverlayStamp> {
+    postcard::from_bytes(bytes).map_err(|e| anyhow::anyhow!("decode overlay stamp: {e}"))
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -210,6 +243,7 @@ mod tests {
             overlay_region: (0x5_0000_0000, 0x5_0100_0000),
             boot: Some(BootFingerprint { symbol: "_start".into(), trans_hash: [0x22; 16] }),
             argv_flags: vec!["-m64".into(), "-Wl,--as-needed".into()],
+            script_hashes: vec![[0x33; 32]],
         };
         let bytes = encode_manifest(&m).unwrap();
         let decoded = decode_manifest(&bytes).unwrap();

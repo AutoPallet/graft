@@ -87,6 +87,34 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
             crate::argv::flag_surface_diff(&base.manifest.argv_flags, &cur_flags),
         );
     }
+    // Script-content guard: the flag surface records -T script NAMES;
+    // an in-place edit (memory.x PROVIDE/KEEP/placement changes) needs
+    // the content hashes. Computed over the raw rustc argv, before
+    // graft's own layout-script additions — same basis as base.
+    let cur_scripts = crate::argv::script_content_hashes(&argv, &link_args.library_paths);
+    if cur_scripts != base.manifest.script_hashes {
+        bail!(
+            "overlay refused: a -T linker script's content changed since the \
+             base link (same names, different bytes) — PROVIDE/KEEP/placement \
+             semantics may differ from the recorded base layout. A full relink \
+             is required; GRAFT=auto does this automatically."
+        );
+    }
+    // Entry-symbol guard: the trampoline cut (which function the
+    // overlay redirects) is baked into base at link time. A changed
+    // GRAFT_ENTRY_SYMBOL would otherwise succeed while silently
+    // keeping the old cut.
+    if let Ok(env_entry) = std::env::var("GRAFT_ENTRY_SYMBOL")
+        && !env_entry.is_empty()
+        && env_entry != base.manifest.entry_symbol
+    {
+        bail!(
+            "overlay refused: GRAFT_ENTRY_SYMBOL={env_entry} but base was linked \
+             with entry symbol {:?} — the trampoline cut is baked into the base. \
+             A full relink is required; GRAFT=auto does this automatically.",
+            base.manifest.entry_symbol,
+        );
+    }
 
     let driver = crate::argv::driver_path(&argv);
     let (eager_inputs, deferred_inputs) = resolve_scan_inputs(&link_args, &driver)?;
@@ -509,6 +537,19 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
         if let Some(spec) = tls_spec {
             verify_tls_geometry(&overlay_bytes, &spec, base.tls.unwrap())?;
         }
+        // Stamp which base this overlay binds to, so a standalone
+        // `graft combine` against a different base (geometrically
+        // plausible, semantically stale everywhere) refuses.
+        let stamp = metadata::encode_overlay_stamp(&metadata::OverlayStamp {
+            magic: metadata::GRAFT_MAGIC,
+            base_abi: base.manifest.base_abi,
+        })?;
+        let stamped = elf_attach::append_sections(
+            &overlay_bytes,
+            &[elf_attach::NewSection { name: metadata::SECTION_OVERLAY_STAMP, data: &stamp }],
+        )?;
+        std::fs::write(&overlay_elf, &stamped)
+            .with_context(|| format!("stamp overlay {}", overlay_elf.display()))?;
     }
     let t_link = t_link_start.elapsed();
 
@@ -2384,6 +2425,7 @@ mod tests {
                 overlay_region: (0, 0),
                 boot: None,
                 argv_flags: Vec::new(),
+                script_hashes: Vec::new(),
             },
             by_section: HashMap::new(),
             ambiguous_sections: HashSet::new(),
