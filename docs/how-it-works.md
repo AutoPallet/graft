@@ -110,8 +110,11 @@ overlay. Hence the stability details: `.llvm.<id>` suffixes stripped
 genuinely forks state is the opposite case — a mutable node whose hash
 did NOT change, re-emitted anyway, so base-resident referrers keep
 base's copy while re-emitted referrers use the fresh one. Every path
-that could do that (ambiguous mutable hash, walk refusal on mutable
-content) hard-bails instead. A rename still reads as new content —
+that could do that hard-bails instead: ambiguous mutable hash, walk
+refusal on mutable content, and (schema v12) a mutable node base
+placed but couldn't attribute an address to — base records those
+hashes in `unplaced_mutable` and the closure walk refuses to re-emit
+them. A rename still reads as new content —
 fresh zero-init copy, old copy dead — the only sound reading of a
 name-keyed identity.
 
