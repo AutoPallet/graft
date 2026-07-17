@@ -56,7 +56,16 @@ pub const GRAFT_MAGIC: [u8; 4] = *b"GRFT";
 // Overlay refuses on mismatch, naming the flags that changed. Stored
 // as the list, not a digest, precisely so the refusal can say WHICH
 // flag — it's ~20 short strings in a non-ALLOC section.
-pub const SCHEMA_VERSION: u16 = 11;
+// v12: `.graft.sections` gains `unplaced_mutable` — trans_hashes of
+// mutable/NOBITS nodes base PLACED (their key matched map records) but
+// couldn't attribute to an address. The closure walk previously
+// re-emitted such nodes ("re-emitting is the safe default"), which is
+// unsound for mutable content: an attribution miss — unlike a content
+// change — perturbs no referrer's trans_hash, so unchanged referrers
+// stay Provided on base's copy while changed referrers bind the
+// re-emitted one. The walk now refuses these instead (the same fork
+// the pool/walk-refusal paths already refuse).
+pub const SCHEMA_VERSION: u16 = 12;
 
 /// Version of the trans_hash algorithm itself, independent of table
 /// layout. Bump whenever hash VALUES change for unchanged inputs;
@@ -157,6 +166,16 @@ pub struct Placed {
 pub struct SectionTable {
     pub entries: Vec<SectionEntry>,
     pub ambiguous: Vec<[u8; 16]>,
+    /// trans_hashes of NON-content-addressable (mutable/NOBITS) nodes
+    /// whose key matched linker-map records but whose placement could
+    /// not be attributed (key collision, size mismatch, byte-verify
+    /// drop). Base placed these somewhere — re-emitting one would fork
+    /// its state between base's copy (unchanged referrers) and the
+    /// overlay's (changed referrers), so the closure walk refuses
+    /// instead. Nodes with NO matching map record (gc'd / newly added)
+    /// are absent from this list: base has no live copy, re-emission
+    /// is safe. See the v12 note above.
+    pub unplaced_mutable: Vec<[u8; 16]>,
 }
 
 pub fn encode_manifest(m: &GraftManifest) -> anyhow::Result<Vec<u8>> {
@@ -205,6 +224,7 @@ mod tests {
                 SectionEntry { trans_hash: [3; 16], address: 0x401000, out_size: 0 },
             ],
             ambiguous: vec![[7; 16]],
+            unplaced_mutable: vec![[9; 16]],
         };
         let bytes = encode_sections(&table).unwrap();
         let decoded = decode_sections(&bytes).unwrap();

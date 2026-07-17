@@ -206,6 +206,15 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
         stats.skipped_ambiguous,
         stats.skipped_size_mismatch,
     );
+    if stats.unplaced_mutable > 0 {
+        // Loud at base time: each of these is a future overlay refusal
+        // if a changed referrer ever reaches it (fork guard).
+        eprintln!(
+            "graft base map-recovery: {} mutable node(s) placed but unattributable — \
+             overlays whose closure reaches one will refuse rather than fork its state",
+            stats.unplaced_mutable,
+        );
+    }
 
     let manifest = GraftManifest {
         magic: GRAFT_MAGIC,
@@ -452,8 +461,13 @@ fn exec_real_linker(argv: &[String]) -> Result<std::process::ExitStatus> {
 /// from symbols drifts the moment ld deletes bytes inside a section).
 /// Attribution is by exact key (object basename, archive member,
 /// section name) plus input size; anything ambiguous is skipped, not
-/// guessed (the node just isn't in the table, and an overlay reference
-/// to it re-emits — always safe).
+/// guessed. A skipped node isn't in the table, and an overlay
+/// reference to it re-emits — safe for content-addressable sections
+/// (interchangeable bytes), but a fork for mutable ones (the miss
+/// changes no referrer hashes, so base's referrers keep base's copy).
+/// Skipped mutable/NOBITS nodes are therefore recorded in
+/// `unplaced_mutable`, which the overlay closure walk refuses to
+/// re-emit.
 ///
 /// Every attributed claim is then **byte-verified** against the linked
 /// image before it's recorded: masked compare, with the relaxation
@@ -504,6 +518,13 @@ fn build_section_table(
     let mut stats = RecoveryStats::default();
     // Attributed placement claims: (node, object, section, record).
     let mut attributed: Vec<(u32, u32, u32, &crate::mapcheck::MapSection)> = Vec::new();
+    // Mutable/NOBITS nodes base PLACED (key matched map records) but
+    // couldn't attribute. Re-emitting one forks its state (the miss
+    // perturbs no referrer's hash, so unchanged referrers keep using
+    // base's copy) — recorded so the overlay closure walk refuses.
+    // Content-addressable misses stay re-emittable: duplicate RO/exec
+    // bytes are interchangeable.
+    let mut unplaced_mutable: std::collections::HashSet<[u8; 16]> = Default::default();
     for (nid, nm) in scan.graph.nodes.iter().enumerate() {
         if nm.is_aggregator() {
             continue; // many contributors, no single base address
@@ -537,10 +558,20 @@ fn build_section_table(
             records.iter().filter(|r| r.in_size == sec.sh_size).collect();
         match matching.len() {
             1 => attributed.push((nid as u32, seg.object, seg.section, matching[0])),
-            0 => stats.skipped_size_mismatch += 1,
+            0 => {
+                stats.skipped_size_mismatch += 1;
+                if !sec.content_addressable() {
+                    unplaced_mutable.insert(scan.trans_hash[nid]);
+                }
+            }
             // Same name AND same size twice in one object (the .rwtext
             // twins): indistinguishable — refuse rather than guess.
-            _ => stats.skipped_ambiguous += 1,
+            _ => {
+                stats.skipped_ambiguous += 1;
+                if !sec.content_addressable() {
+                    unplaced_mutable.insert(scan.trans_hash[nid]);
+                }
+            }
         }
     }
     stats.attributed = attributed.len();
@@ -637,6 +668,12 @@ fn build_section_table(
             Checked::Reconciled => stats.verified_relaxed += 1,
             Checked::Drop(why) => {
                 stats.dropped += 1;
+                let seg = &scan.graph.nodes[nid as usize].segments[0];
+                if !scan.objects[seg.object as usize].sections[seg.section as usize]
+                    .content_addressable()
+                {
+                    unplaced_mutable.insert(scan.trans_hash[nid as usize]);
+                }
                 if dropped_examples.len() < 20 {
                     dropped_examples
                         .push(format!("  {} {} @{:#x}: {why}", rec.section, rec.path, rec.address));
@@ -694,7 +731,10 @@ fn build_section_table(
     entries.sort_by(|a, b| a.trans_hash.cmp(&b.trans_hash));
     let mut ambiguous: Vec<[u8; 16]> = ambiguous.into_iter().collect();
     ambiguous.sort();
-    Ok((SectionTable { entries, ambiguous }, stats, dups))
+    stats.unplaced_mutable = unplaced_mutable.len();
+    let mut unplaced_mutable: Vec<[u8; 16]> = unplaced_mutable.into_iter().collect();
+    unplaced_mutable.sort();
+    Ok((SectionTable { entries, ambiguous, unplaced_mutable }, stats, dups))
 }
 
 /// One `trans_hash` that base placed at more than one address:
@@ -734,6 +774,9 @@ struct RecoveryStats {
     verified: usize,
     /// xtensa: explained by the relaxation walk.
     verified_relaxed: usize,
+    /// Mutable/NOBITS nodes placed by ld but unattributable — recorded
+    /// in the table's `unplaced_mutable` fork-guard list.
+    unplaced_mutable: usize,
     /// No bytes to check (.bss / zero-size) — kept on attribution alone.
     unverifiable: usize,
     /// Claims the bytes refused — NOT recorded in the table.

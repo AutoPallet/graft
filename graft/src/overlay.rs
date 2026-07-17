@@ -1258,6 +1258,12 @@ pub struct BaseMetadata {
     /// copy via `by_name` (preserving address identity), a section
     /// reference bails.
     pub ambiguous_sections: HashSet<TransHash>,
+    /// Mutable/NOBITS nodes base placed but could not attribute to an
+    /// address (`.graft.sections` `unplaced_mutable`). The closure walk
+    /// refuses to re-emit these: the miss changed no referrer's hash,
+    /// so base's unchanged referrers would keep its copy while the
+    /// overlay's changed referrers bound a fresh one — a state fork.
+    pub unplaced_mutable: HashSet<TransHash>,
     /// Snapshot of base's post-link `.symtab`: name → final address.
     /// Channel-of-last-resort for reloc resolution — used when a
     /// name isn't matched by overlay's scan or by `by_section`.
@@ -1324,6 +1330,7 @@ fn load_base_metadata(path: &std::path::Path) -> Result<BaseMetadata> {
             .or_insert(metadata::Placed { addr: e.address, out_size: e.out_size });
     }
     let ambiguous_sections: HashSet<TransHash> = table.ambiguous.iter().copied().collect();
+    let unplaced_mutable: HashSet<TransHash> = table.unplaced_mutable.iter().copied().collect();
 
     // Walk base.elf's `.symtab` for the channel-of-last-resort
     // (`name → address`) lookup. Done lazily here from the file we've
@@ -1382,6 +1389,7 @@ fn load_base_metadata(path: &std::path::Path) -> Result<BaseMetadata> {
         manifest,
         by_section,
         ambiguous_sections,
+        unplaced_mutable,
         by_name,
         by_name_ambiguous,
         tls,
@@ -1582,6 +1590,29 @@ fn compute_closure(
                     names.join(", "),
                 );
             }
+            // Fork guard: this node is mutable, base PLACED it (its key
+            // matched map records) but couldn't recover the address —
+            // and precisely because the miss changed no hashes, base's
+            // unchanged referrers still use base's copy. Re-emitting
+            // would give changed referrers a second live copy of the
+            // same variable. A genuinely new/changed mutable node is
+            // NOT in this set (its hash matches no base-scan node) and
+            // re-emits normally — the content change cascades every
+            // reachable referrer into the closure with it.
+            if base.unplaced_mutable.contains(&scan.trans_hash[nid as usize])
+                && !node_content_addressable(nid, scan)
+            {
+                let nm = &scan.graph.nodes[nid as usize];
+                let names: Vec<&str> =
+                    nm.defined_symbols.iter().map(|s| s.name.as_str()).collect();
+                bail!(
+                    "mutable node {nid} [{}] is placed in base but its address could \
+                     not be recovered (ambiguous map attribution at base link) — \
+                     re-emitting it would fork its state between base's copy and the \
+                     overlay's. Rebase, or fix the attribution collision.",
+                    names.join(", "),
+                );
+            }
             decision[nid as usize] = Decision::Included;
             closure.push(nid);
             for &succ in &scan.graph.edges[nid as usize] {
@@ -1619,8 +1650,12 @@ fn node_content_addressable(nid: NodeId, scan: &ScanResult) -> bool {
 /// in base's section table (a recovered, unambiguous address) or is a
 /// known content-identical-but-multi-address section (resolved by name at
 /// prune time). Otherwise the node must be Included — base either has no
-/// copy (content differs) or graft couldn't recover its address, and
-/// re-emitting is the safe default. See `docs/14-identity-granularity.md`.
+/// copy (content differs) or graft couldn't recover its address.
+/// Re-emitting is safe for content (interchangeable bytes) but NOT for
+/// an unattributed mutable node — `compute_closure` refuses those via
+/// `base.unplaced_mutable` (re-emission would fork the variable's state,
+/// since an attribution miss cascades no referrers the way a content
+/// change does). See `docs/14-identity-granularity.md`.
 fn classify_provided(nid: NodeId, scan: &ScanResult, base: &BaseMetadata) -> bool {
     let th = scan.trans_hash[nid as usize];
     let provided = base.by_section.contains_key(&th) || base.ambiguous_sections.contains(&th);
@@ -2274,6 +2309,135 @@ fn render_blockers_ld_esp_idf(ram: &RamUsage) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a scan over one synthesized object: changed `main`
+    /// (`.text.main`, reloc → X) plus mutable static X (`.bss.X`,
+    /// NOBITS). Returns (scan, main_nid, bss_nid).
+    fn scan_main_referencing_bss() -> (crate::scan::ScanResult, u32, u32) {
+        use object::write::{
+            Object as WObject, Relocation as WRelocation, Symbol as WSymbol, SymbolSection,
+        };
+        let mut obj = WObject::new(
+            object::BinaryFormat::Elf,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let bss = obj.add_section(Vec::new(), b".bss.X".to_vec(), object::SectionKind::UninitializedData);
+        obj.section_mut(bss).append_bss(16, 4);
+        let x = obj.add_symbol(WSymbol {
+            name: b"X".to_vec(),
+            value: 0,
+            size: 16,
+            kind: object::SymbolKind::Data,
+            scope: object::write::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(bss),
+            flags: object::write::SymbolFlags::None,
+        });
+        let text = obj.add_section(Vec::new(), b".text.main".to_vec(), object::SectionKind::Text);
+        obj.section_mut(text).set_data(vec![0x8b, 0x05, 0, 0, 0, 0, 0xc3], 16);
+        obj.add_symbol(WSymbol {
+            name: b"main".to_vec(),
+            value: 0,
+            size: 7,
+            kind: object::SymbolKind::Text,
+            scope: object::write::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(text),
+            flags: object::write::SymbolFlags::None,
+        });
+        obj.add_relocation(
+            text,
+            WRelocation {
+                offset: 2,
+                symbol: x,
+                addend: -4,
+                flags: object::RelocationFlags::Elf { r_type: object::elf::R_X86_64_PC32 },
+            },
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.o");
+        std::fs::write(&path, obj.write().unwrap()).unwrap();
+        let scan = crate::scan::run(
+            &[path],
+            &[] as &[std::path::PathBuf],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        let (main_nid, _) = scan.graph.symbols.resolve_global("main").unwrap();
+        let (bss_nid, _) = scan.graph.symbols.resolve_global("X").unwrap();
+        (scan, main_nid, bss_nid)
+    }
+
+    fn minimal_base(unplaced_mutable: HashSet<TransHash>) -> BaseMetadata {
+        BaseMetadata {
+            manifest: metadata::GraftManifest {
+                magic: metadata::GRAFT_MAGIC,
+                version: SCHEMA_VERSION,
+                hash_algo_version: metadata::HASH_ALGO_VERSION,
+                base_abi: [0; 20],
+                entry_symbol: "main".into(),
+                toolchain_stamp: String::new(),
+                overlay_region: (0, 0),
+                boot: None,
+                argv_flags: Vec::new(),
+            },
+            by_section: HashMap::new(),
+            ambiguous_sections: HashSet::new(),
+            unplaced_mutable,
+            by_name: HashMap::new(),
+            by_name_ambiguous: HashSet::new(),
+            tls: None,
+            load_spans: Vec::new(),
+            e_machine: object::elf::EM_X86_64,
+        }
+    }
+
+    /// The fork guard: a mutable node base placed but couldn't
+    /// attribute must refuse re-emission — the attribution miss
+    /// cascades no referrer hashes, so base's unchanged referrers
+    /// would keep base's copy while re-emitted referrers bound a
+    /// fresh one.
+    #[test]
+    fn walk_refuses_unplaced_mutable_node() {
+        let (scan, main_nid, bss_nid) = scan_main_referencing_bss();
+        let base = minimal_base(HashSet::from([scan.trans_hash[bss_nid as usize]]));
+        let err = match compute_closure(&scan, &base, &[main_nid], &HashSet::new()) {
+            Ok(_) => panic!("unplaced mutable node must refuse re-emission"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("fork"), "unexpected error: {err}");
+    }
+
+    /// Control: the same mutable node NOT in the unplaced set (a
+    /// genuinely new static — base has no copy) re-emits normally.
+    #[test]
+    fn walk_reemits_new_mutable_node() {
+        let (scan, main_nid, bss_nid) = scan_main_referencing_bss();
+        let base = minimal_base(HashSet::new());
+        let closure = compute_closure(&scan, &base, &[main_nid], &HashSet::new()).unwrap();
+        assert!(closure.closure.contains(&main_nid));
+        assert!(closure.closure.contains(&bss_nid), "new static must re-emit");
+    }
+
+    /// Control: an unplaced-mutable hash that the walk never reaches
+    /// (its referrer is Provided in base) must not refuse.
+    #[test]
+    fn unreached_unplaced_mutable_does_not_refuse() {
+        let (scan, main_nid, bss_nid) = scan_main_referencing_bss();
+        let mut base = minimal_base(HashSet::from([scan.trans_hash[bss_nid as usize]]));
+        // main unchanged: its hash IS in base's table → Provided; the
+        // walk stops there and never reaches X.
+        base.by_section.insert(
+            scan.trans_hash[main_nid as usize],
+            metadata::Placed { addr: 0x1000, out_size: 7 },
+        );
+        let closure = compute_closure(&scan, &base, &[main_nid], &HashSet::new()).unwrap();
+        assert!(closure.closure.is_empty(), "nothing changed → empty closure");
+    }
 
     #[test]
     fn mutate_memory_x_replaces_three_lines() {
