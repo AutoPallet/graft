@@ -113,7 +113,16 @@ pub fn run<P: AsRef<Path> + Sync>(
         // the archive was processed by graft and the corresponding
         // `-l<name>` flag should be stripped from the link argv. ld
         // would otherwise re-pull the unfiltered original.
-        walked_archives.insert(archive.canon_path.clone());
+        //
+        // A REPEATED listing (the esp-idf idiom: every component .a
+        // appears several times in argv instead of --start-group) is
+        // the same archive: index it once. ld rescans it at each
+        // position, but against a global first-wins index the rescan
+        // is a no-op — and counting one archive as several dup
+        // candidates would poison the ambiguity guard below.
+        if !walked_archives.insert(archive.canon_path.clone()) {
+            continue;
+        }
         let archive_idx = deferred.len();
         for (name, &offset) in &archive.symbol_to_offset {
             match symbol_index.entry(name.clone()) {
@@ -171,44 +180,98 @@ pub fn run<P: AsRef<Path> + Sync>(
     // DIFFERING member bytes — graft's position-independent pick could
     // diverge from ld's (see the dup_defs comment above). Byte-identical
     // candidates are interchangeable; let the first-wins pick stand.
-    let check_ambiguous = |name: &str| -> Result<()> {
+    //
+    // The refusal applies only to undefs INTRODUCED by a pulled archive
+    // member (`from_member`): those become live mid-scan, and ld
+    // satisfies them from the first archive at-or-after that position —
+    // possibly not the globally-first definer. An undef live from
+    // position zero — a `-u`/`--undefined` root, or a reference in an
+    // eager input (rustc places every object/rlib before the library
+    // archives on the link line) — is satisfied by the globally-first
+    // definer in ld too, so first-wins is provably ld's pick there.
+    // esp-idf leans on exactly this: it passes `-u __assert_func` so
+    // ITS newlib override preempts toolchain libc.a's copy, which
+    // duplicates the name with different bytes.
+    // Weak-default preemption (the esp-idf pattern: esp_system defines
+    // `esp_system_get_time_resolution` WEAK, esp_timer overrides it
+    // STRONG): once both members are in the link, ELF binding picks
+    // the strong def regardless of extraction order — not positional
+    // at all. So a differing dup with exactly ONE strong candidate
+    // proceeds, on the condition (checked after the demand fixpoint)
+    // that the strong member actually got loaded; if nothing else
+    // demands it, ld's binding can't be reproduced and we refuse.
+    // Returns the strong candidate to defer-check, if any.
+    let check_ambiguous = |name: &str, from_member: bool| -> Result<Option<(usize, u64)>> {
+        if !from_member {
+            return Ok(None);
+        }
         let Some(cands) = dup_defs.get(name) else {
-            return Ok(());
+            return Ok(None);
         };
-        let mut first_bytes: Option<(usize, Vec<u8>)> = None;
+        // (ai, bytes, bind of the def) per candidate.
+        let mut parsed: Vec<(usize, u64, Vec<u8>, Option<SymbolBind>)> = Vec::new();
         for &(ai, off) in cands {
             let inp = deferred[ai]
                 .parse_member(off)
                 .with_context(|| format!("parse member at {off:#x} in {}",
                     deferred[ai].path.display()))?;
-            match &first_bytes {
-                None => first_bytes = Some((ai, inp.bytes)),
-                Some((_, bytes)) if *bytes == inp.bytes => {}
-                Some((first_ai, _)) => bail!(
-                    "graft scan: demanded symbol `{name}` is defined by multiple \
-                     deferred archives with differing content ({} and {}). graft's \
-                     demand-load picks the first archive in input order, but ld \
-                     satisfies an undef from the first archive at-or-after the \
-                     point it became live — the picks can diverge, and hashing a \
-                     member base.elf doesn't contain makes later edits to the real \
-                     one invisible. Refusing (scan must mirror ld).",
-                    deferred[*first_ai].path.display(),
-                    deferred[ai].path.display(),
-                ),
+            let obj = elf::parse(&inp.bytes)
+                .map_err(|e| anyhow::anyhow!("{}: {e}", inp.label()))?;
+            let bind = obj
+                .symbols
+                .iter()
+                .find(|s| s.defining_section.is_some() && s.name == name)
+                .map(|s| s.bind);
+            parsed.push((ai, off, inp.bytes, bind));
+        }
+        // Byte-identical candidates are one candidate (two archives
+        // shipping the same object): keep the first of each content.
+        let mut distinct: Vec<&(usize, u64, Vec<u8>, Option<SymbolBind>)> = Vec::new();
+        for c in &parsed {
+            if !distinct.iter().any(|d| d.2 == c.2) {
+                distinct.push(c);
             }
         }
-        Ok(())
+        if let [_] = distinct.as_slice() {
+            return Ok(None); // interchangeable
+        }
+        let strongs: Vec<&&(usize, u64, Vec<u8>, Option<SymbolBind>)> = distinct
+            .iter()
+            .filter(|(_, _, _, bind)| matches!(bind, Some(SymbolBind::Global)))
+            .collect();
+        if let [one] = strongs.as_slice() {
+            return Ok(Some((one.0, one.1)));
+        }
+        bail!(
+            "graft scan: symbol `{name}`, demanded by an archive member pulled \
+             mid-scan, is defined by multiple deferred archives with differing \
+             content and no unique strong definition ({}). graft's demand-load \
+             picks the first archive in input order, but ld satisfies a \
+             member-introduced undef from the first archive at-or-after the \
+             point it became live — the picks can diverge, and hashing a member \
+             base.elf doesn't contain makes later edits to the real one \
+             invisible. Refusing (scan must mirror ld).",
+            parsed
+                .iter()
+                .map(|(ai, _, _, _)| deferred[*ai].path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
     };
+    // (name, strong candidate) pairs from `check_ambiguous`, verified
+    // loaded once the demand fixpoint completes.
+    let mut strong_required: Vec<(String, (usize, u64))> = Vec::new();
     for sym_name in extra_roots {
         let lookup = demand_name(sym_name);
         if defined_globals.contains(&lookup) { continue; }
         if let Some(&(ai, off)) = symbol_index.get(&lookup)
             && loaded_members.insert((ai, off))
         {
-            check_ambiguous(&lookup)?;
+            check_ambiguous(&lookup, false)?;
             pending.push((ai, off));
         }
     }
+    let eager_count = objects.len();
     let mut next_obj_idx: usize = 0;
     while next_obj_idx < objects.len() || !pending.is_empty() {
         while let Some((ai, off)) = pending.pop() {
@@ -259,11 +322,31 @@ pub fn run<P: AsRef<Path> + Sync>(
                 if let Some(&(ai, off)) = symbol_index.get(&lookup)
                     && loaded_members.insert((ai, off))
                 {
-                    check_ambiguous(&lookup)?;
+                    if let Some(strong) =
+                        check_ambiguous(&lookup, next_obj_idx >= eager_count)?
+                    {
+                        strong_required.push((lookup.clone(), strong));
+                    }
                     pending.push((ai, off));
                 }
             }
             next_obj_idx += 1;
+        }
+    }
+
+    // Deferred half of the weak-default dup rule: the unique strong
+    // definition must actually be in the link, or the weak copy we
+    // pulled is bound where ld would have bound the strong one.
+    for (name, strong) in &strong_required {
+        if !loaded_members.contains(strong) {
+            bail!(
+                "graft scan: symbol `{name}` has a weak default and a strong \
+                 override in different deferred archives, and the strong \
+                 member ({}) was never demand-loaded — ld's binding cannot be \
+                 reproduced from graft's member set. Refusing (scan must \
+                 mirror ld).",
+                deferred[strong.0].path.display(),
+            );
         }
     }
 

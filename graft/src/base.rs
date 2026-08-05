@@ -197,7 +197,10 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
     let map = crate::mapcheck::parse_map(&map_text);
     let (table, stats, dups) = build_section_table(&scan_result, &elf_bytes, &map, arch)?;
     print_dup_summary(&dups);
-    eprintln!(
+    // Teed to the graft log: rustc swallows linker stderr on success,
+    // and these counts are the base link's health record (a mass drop
+    // of reconciled sections would otherwise be invisible).
+    let recovery_line = format!(
         "graft base map-recovery: {} attributed ({} byte-identical · {} reconciled \
          through relaxation · {} no-bytes) · {} dropped unreconciled · \
          {} ambiguous-key skipped · {} size-mismatch skipped",
@@ -209,14 +212,18 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
         stats.skipped_ambiguous,
         stats.skipped_size_mismatch,
     );
+    eprintln!("{recovery_line}");
+    crate::telemetry::note(&output, &recovery_line);
     if stats.unplaced_mutable > 0 {
         // Loud at base time: each of these is a future overlay refusal
         // if a changed referrer ever reaches it (fork guard).
-        eprintln!(
+        let line = format!(
             "graft base map-recovery: {} mutable node(s) placed but unattributable — \
              overlays whose closure reaches one will refuse rather than fork its state",
             stats.unplaced_mutable,
         );
+        eprintln!("{line}");
+        crate::telemetry::note(&output, &line);
     }
 
     let manifest = GraftManifest {
