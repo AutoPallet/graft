@@ -11,6 +11,14 @@ fn main() -> ExitCode {
             "combine" => return graft::subcommands::combine(&args[2..]),
             "scan-dump" => return graft::subcommands::scan_dump(&args[2..]),
             "dup-stats" => return graft::subcommands::dup_stats(&args[2..]),
+            // Version probe at the linker seat. Mold-style: identify
+            // graft (schema + hash-algo are the operative identity —
+            // they say whether a snapshot will rebase), then chain the
+            // real linker's own line so configure-style probes that
+            // grep for "GNU ld" still see it. Only as the LEADING arg:
+            // `-v` and mid-argv flags belong to real links (gcc's -v
+            // means verbose-and-continue) and stay forwarded untouched.
+            "--version" | "-V" => return version(),
             "snapshot" | "clean" => {
                 eprintln!("graft: subcommand `{cmd}` not yet implemented");
                 return ExitCode::from(2);
@@ -62,6 +70,25 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn version() -> ExitCode {
+    println!(
+        "graft {} (schema v{} · hash algo v{})",
+        env!("CARGO_PKG_VERSION"),
+        graft::metadata::SCHEMA_VERSION,
+        graft::metadata::HASH_ALGO_VERSION,
+    );
+    // The seat's underlying linker, when resolvable — its absence
+    // shouldn't fail a version probe.
+    let real = env::var("GRAFT_REAL_LD").unwrap_or_else(|_| "cc".into());
+    match Command::new(&real).arg("--version").output() {
+        Ok(out) => {
+            print!("{}", String::from_utf8_lossy(&out.stdout));
+        }
+        Err(_) => println!("(real linker `{real}` not resolvable)"),
+    }
+    ExitCode::SUCCESS
 }
 
 fn passthrough(args: &[String]) -> ExitCode {
