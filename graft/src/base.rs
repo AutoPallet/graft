@@ -490,7 +490,7 @@ fn exec_real_linker(argv: &[String]) -> Result<std::process::ExitStatus> {
 /// unique. Aggregator brackets (`__init_array_start` etc.) and
 /// SHF_MERGE / string-pool per-entry nodes are intentionally NOT in
 /// this table — they resolve through other channels (symtab snapshot /
-/// re-emission). See `docs/14-identity-granularity.md`, docs/16 §8.
+/// re-emission). See `docs/worklogs/14-identity-granularity.md`, docs/16 §8.
 fn build_section_table(
     scan: &ScanResult,
     elf_bytes: &[u8],

@@ -49,7 +49,7 @@ un-instrumented binary that looks fine but can never be patched.
 
 This doc is the maintained account of what each mode does and why it is
 sound. For the identity model it rests on, read
-[`14-identity-granularity.md`](./14-identity-granularity.md); for the
+[`14-identity-granularity.md`](./worklogs/14-identity-granularity.md); for the
 xtensa relaxation walk it uses to locate bytes in a relaxed base, read
 [`16-relaxation-walk.md`](./16-relaxation-walk.md).
 

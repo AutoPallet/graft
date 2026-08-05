@@ -1696,7 +1696,7 @@ fn node_content_addressable(nid: NodeId, scan: &ScanResult) -> bool {
 /// an unattributed mutable node — `compute_closure` refuses those via
 /// `base.unplaced_mutable` (re-emission would fork the variable's state,
 /// since an attribution miss cascades no referrers the way a content
-/// change does). See `docs/14-identity-granularity.md`.
+/// change does). See `docs/worklogs/14-identity-granularity.md`.
 fn classify_provided(nid: NodeId, scan: &ScanResult, base: &BaseMetadata) -> bool {
     let th = scan.trans_hash[nid as usize];
     let provided = base.by_section.contains_key(&th) || base.ambiguous_sections.contains(&th);

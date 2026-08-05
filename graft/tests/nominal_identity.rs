@@ -9,7 +9,7 @@
 //! therefore salts such sections' leaf hashes with their sorted
 //! (symbol, offset) pairs — names are the identity exactly where
 //! content can't be, mirroring ld (which never content-folds writable
-//! sections). See `docs/14-identity-granularity.md`.
+//! sections). See `docs/worklogs/14-identity-granularity.md`.
 
 use graft::elf::{ParsedObject, SectionInfo, SectionKind, SymbolBind, SymbolInfo};
 use graft::{graph, hash};

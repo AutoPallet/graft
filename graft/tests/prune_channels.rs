@@ -1,7 +1,7 @@
 //! Channel coverage for `resolve::Resolver::dispose` — the single
 //! resolution cascade shared by the closure walk and prune — plus
 //! emission checks that `prune::prune_object` faithfully renders each
-//! `RelocDisposition`. See `docs/14-identity-granularity.md` and
+//! `RelocDisposition`. See `docs/worklogs/14-identity-granularity.md` and
 //! `resolve.rs`'s module docs for the cascade.
 //!
 //!   - channel 1 (target node in the closure) → UND

@@ -25,7 +25,7 @@
 //! one place (`resolve::Resolver`), shared with the closure walk, so
 //! inclusion and resolution cannot drift.
 //!
-//! See `docs/worklogs/11-anon-provide.md` and `docs/14-identity-granularity.md`.
+//! See `docs/worklogs/11-anon-provide.md` and `docs/worklogs/14-identity-granularity.md`.
 
 use std::collections::{HashMap, HashSet};
 

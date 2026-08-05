@@ -78,7 +78,7 @@ pub type TransHash = [u8; 16];
 // positional (section trans_hash → base address + in-section offset), and
 // the only place a name still disambiguates — content-identical sections
 // base placed at distinct addresses — is handled at prune time via the
-// base.elf symtab snapshot. See `docs/14-identity-granularity.md`.
+// base.elf symtab snapshot. See `docs/worklogs/14-identity-granularity.md`.
 
 /// Per-node blake3 over the node's *identity bytes*: each segment's
 /// content (respecting sub-ranges for per-string nodes) plus, for

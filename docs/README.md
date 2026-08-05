@@ -26,10 +26,6 @@ contract.
   pre-scan, slack, the resolution-channel cascade, the walk-refusal
   fixpoint, the base-map object, the splice, and the failure philosophy.
   Start here.
-- [`14-identity-granularity.md`](./14-identity-granularity.md) — the
-  section-identity model: per-node `trans_hash`, positional resolution,
-  why mutable content can't be content-folded. The design the resolver
-  implements.
 - [`16-relaxation-walk.md`](./16-relaxation-walk.md) — the xtensa
   relaxation reconciliation walk: the transform alphabet transcribed
   from binutils, needed to locate a relaxed input byte in the base.
@@ -46,6 +42,12 @@ Write-once records, not maintained. Kept for rationale.
   carries a reading note listing where the implementation diverged.
 - [`worklogs/08-implementation-status.md`](./worklogs/08-implementation-status.md)
   — M1-era milestone log (built-vs-plan, decisions changed, numbers).
+- [`worklogs/14-identity-granularity.md`](./worklogs/14-identity-granularity.md)
+  — the identity-granularity design note (per-section nodes, one
+  positional table, no symhash). The core shipped, but the specifics
+  predate map-authoritative recovery, TLS maps, color refinement, and
+  the nominal salt — reading note at top lists the deltas; the
+  maintained contract is `how-it-works.md`.
 - [`worklogs/11-anon-provide.md`](./worklogs/11-anon-provide.md) —
   resolving anonymous (symbol-less) sections via per-target SHN_ABS
   symbols. Implemented; absorbed into `how-it-works.md`.

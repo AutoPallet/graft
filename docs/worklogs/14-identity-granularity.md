@@ -4,6 +4,18 @@ Status: design note (2026-06-10, rev 3). Motivated by the open xtensa
 overlay bug (see `docs/worklogs/08` § "Open: classify-vs-resolve inconsistency"
 and `CLAUDE.md`).
 
+> **Reading note (2026-07).** Write-once worklog; the core ideas
+> shipped (per-section nodes, one positional table, no symhash) but the
+> specifics are several designs stale — it predates map-authoritative
+> address recovery (it describes symbol-vote recovery), TLS map
+> sections (it excludes TLS), per-SCC color refinement (it mixes member
+> hashes), the nominal salt, and schema v12 (it says v4). The
+> maintained contract is `docs/how-it-works.md` + the module docs in
+> `hash.rs` / `resolve.rs` / `basemap.rs`. Still current here: the
+> per-section-node soundness theorem, the string-pool exception, and
+> the accepted fn-pointer-identity risk under representative
+> resolution.
+
 > **Rev history.** Rev 1 proposed per-*symbol* nodes — retracted as
 > unsound (relocless intra-section jumps). Rev 2 proposed a 3-part
 > resolution-consistency fix keyed on per-symbol symhashes. Rev 3

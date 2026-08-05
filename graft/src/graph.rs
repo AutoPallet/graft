@@ -81,7 +81,7 @@ impl SymbolIndex {
 /// Where one relocation points, resolved once at scan time and reused
 /// by every downstream consumer (hash canonicalization sees the same
 /// world via `ContentResolver`; prune receives dispositions derived
-/// from these). See `docs/14-identity-granularity.md`.
+/// from these). See `docs/worklogs/14-identity-granularity.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedTarget {
     /// Symbol-targeted reloc: the defining node plus the symbol's
@@ -227,7 +227,7 @@ impl NodeMeta {
 /// that calls `main`) look "changed". A caller that *inlines* part of the
 /// entry instead has different bytes, which `bytes_hash`/`mih` already
 /// capture, so the cut hides nothing real. See
-/// `docs/14-identity-granularity.md`.
+/// `docs/worklogs/14-identity-granularity.md`.
 ///
 /// `wrapped` is the `--wrap=<sym>` set: a reloc to `<sym>` is resolved
 /// as `__wrap_<sym>` — both for edges (the semantic dependency is on

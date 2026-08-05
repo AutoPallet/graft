@@ -56,13 +56,6 @@ pub const GRAFT_MAGIC: [u8; 4] = *b"GRFT";
 // Overlay refuses on mismatch, naming the flags that changed. Stored
 // as the list, not a digest, precisely so the refusal can say WHICH
 // flag — it's ~20 short strings in a non-ALLOC section.
-// v12 also: the manifest gains `script_hashes` (content hashes of -T
-// scripts — the flag surface only sees their names, so an in-place
-// memory.x edit was invisible), and overlay.elf gains a
-// `.graft.overlay` stamp naming the base_abi it was linked against
-// (standalone `graft combine` refuses a mismatched base). GRAFT_ENTRY_SYMBOL
-// drift is refused at overlay entry (env vs manifest — the trampoline
-// cut is baked into the base at link time).
 // v12: `.graft.sections` gains `unplaced_mutable` — trans_hashes of
 // mutable/NOBITS nodes base PLACED (their key matched map records) but
 // couldn't attribute to an address. The closure walk previously
@@ -71,7 +64,14 @@ pub const GRAFT_MAGIC: [u8; 4] = *b"GRFT";
 // change — perturbs no referrer's trans_hash, so unchanged referrers
 // stay Provided on base's copy while changed referrers bind the
 // re-emitted one. The walk now refuses these instead (the same fork
-// the pool/walk-refusal paths already refuse).
+// the pool/walk-refusal paths already refuse). Also in v12: the
+// manifest gains `script_hashes` (content hashes of -T scripts — the
+// flag surface only sees their names, so an in-place memory.x edit was
+// invisible), overlay.elf gains a `.graft.overlay` stamp naming the
+// base_abi it was linked against (standalone `graft combine` refuses a
+// mismatched base), and GRAFT_ENTRY_SYMBOL drift is refused at overlay
+// entry (env vs manifest — the trampoline cut is baked into the base
+// at link time).
 pub const SCHEMA_VERSION: u16 = 12;
 
 /// Version of the trans_hash algorithm itself, independent of table
@@ -162,7 +162,7 @@ pub struct BootFingerprint {
 /// hash of the input section (its own bytes + canonicalized relocs +
 /// successors). It carries *no name* and *no symbol identity*: a node is
 /// the linker's ship/diff atom (a whole section), and its `trans_hash`
-/// fully determines its behavior (see `docs/14-identity-granularity.md`).
+/// fully determines its behavior (see `docs/worklogs/14-identity-granularity.md`).
 ///
 /// A reference resolves **positionally**: a symbol `foo` defined in a
 /// section with this `trans_hash` at in-section offset `O` lives at
