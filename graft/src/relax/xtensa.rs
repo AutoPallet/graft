@@ -72,13 +72,35 @@ pub fn insn_len(b0: u8) -> Option<usize> {
 // ---- narrow/widen pair tables ----
 // elf32-xtensa.c `narrowable[]` (~4347) / `widenable[]` (~4360).
 // Operand correspondence is semantic value equality through the
-// re-encode; `wide`/`narrow` are the pair identity (kept even in loose
-// mode), `ops` the value checks (dropped when the slot is relocated).
+// re-encode; `wide`/`narrow` are the pair identity (always enforced),
+// `ops` the per-field value checks. Each check is tagged with the
+// input-slot bytes it reads and is skipped ONLY when one of those
+// bytes is reloc-masked — a mask means the linker wrote the byte, so
+// the input value there isn't ground truth. Checks over unmasked
+// bytes always hold: a reloc on addi's imm byte must not excuse a
+// register swap in bytes 0/1 (the old slot-granular `loose` flag did
+// exactly that, accepting e.g. addi a3,a5,… → addi.n a4,a6,…).
+//
+// Byte→field map (LE): 24-bit — byte0 = op0+t, byte1 = s+r,
+// byte2 = imm8; 16-bit — byte0 = op0+t, byte1 = s+r.
+
+/// Input-byte dependency bits.
+const B0: u8 = 1 << 0;
+const B1: u8 = 1 << 1;
+const B2: u8 = 1 << 2;
+
+struct OpCheck {
+    /// Input bytes read when narrowing (input = 3-byte wide slot).
+    wide_deps: u8,
+    /// Input bytes read when widening (input = 2-byte narrow slot).
+    narrow_deps: u8,
+    pred: fn(u32, u32) -> bool,
+}
 
 struct Pair {
     wide: fn(u32) -> bool,
     narrow: fn(u32) -> bool,
-    ops: fn(u32, u32) -> bool,
+    ops: &'static [OpCheck],
     /// beqz/bnez widen but never narrow ("may require re-expand").
     widen_only: bool,
 }
@@ -88,14 +110,26 @@ const PAIRS: &[Pair] = &[
     Pair {
         wide: |w| w & 0xFF000F == 0x800000,
         narrow: |n| op0(n) == 0xA,
-        ops: |w, n| fr(w) == fr(n) && fs(w) == fs(n) && ft(w) == ft(n),
+        ops: &[
+            OpCheck { wide_deps: B1, narrow_deps: B1, pred: |w, n| fr(w) == fr(n) },
+            OpCheck { wide_deps: B1, narrow_deps: B1, pred: |w, n| fs(w) == fs(n) },
+            OpCheck { wide_deps: B0, narrow_deps: B0, pred: |w, n| ft(w) == ft(n) },
+        ],
         widen_only: false,
     },
-    // addi ↔ addi.n: wide dest is t, narrow dest is r
+    // addi ↔ addi.n: wide dest is t, narrow dest is r, narrow imm is t
     Pair {
         wide: |w| w & 0x00F00F == 0x00C002,
         narrow: |n| op0(n) == 0xB,
-        ops: |w, n| ft(w) == fr(n) && fs(w) == fs(n) && sext8(imm8(w)) == addi_n_imm(n),
+        ops: &[
+            OpCheck { wide_deps: B0, narrow_deps: B1, pred: |w, n| ft(w) == fr(n) },
+            OpCheck { wide_deps: B1, narrow_deps: B1, pred: |w, n| fs(w) == fs(n) },
+            OpCheck {
+                wide_deps: B2,
+                narrow_deps: B0,
+                pred: |w, n| sext8(imm8(w)) == addi_n_imm(n),
+            },
+        ],
         widen_only: false,
     },
     // addmi ↔ addi.n (imm × 256; in ld's table even though the value
@@ -103,79 +137,109 @@ const PAIRS: &[Pair] = &[
     Pair {
         wide: |w| w & 0x00F00F == 0x00D002,
         narrow: |n| op0(n) == 0xB,
-        ops: |w, n| ft(w) == fr(n) && fs(w) == fs(n) && sext8(imm8(w)) * 256 == addi_n_imm(n),
+        ops: &[
+            OpCheck { wide_deps: B0, narrow_deps: B1, pred: |w, n| ft(w) == fr(n) },
+            OpCheck { wide_deps: B1, narrow_deps: B1, pred: |w, n| fs(w) == fs(n) },
+            OpCheck {
+                wide_deps: B2,
+                narrow_deps: B0,
+                pred: |w, n| sext8(imm8(w)) * 256 == addi_n_imm(n),
+            },
+        ],
         widen_only: false,
     },
     // l32i ↔ l32i.n: offset imm8×4 vs r×4
     Pair {
         wide: |w| w & 0x00F00F == 0x002002,
         narrow: |n| op0(n) == 0x8,
-        ops: |w, n| ft(w) == ft(n) && fs(w) == fs(n) && imm8(w) == fr(n),
+        ops: &[
+            OpCheck { wide_deps: B0, narrow_deps: B0, pred: |w, n| ft(w) == ft(n) },
+            OpCheck { wide_deps: B1, narrow_deps: B1, pred: |w, n| fs(w) == fs(n) },
+            OpCheck { wide_deps: B2, narrow_deps: B1, pred: |w, n| imm8(w) == fr(n) },
+        ],
         widen_only: false,
     },
     // s32i ↔ s32i.n
     Pair {
         wide: |w| w & 0x00F00F == 0x006002,
         narrow: |n| op0(n) == 0x9,
-        ops: |w, n| ft(w) == ft(n) && fs(w) == fs(n) && imm8(w) == fr(n),
+        ops: &[
+            OpCheck { wide_deps: B0, narrow_deps: B0, pred: |w, n| ft(w) == ft(n) },
+            OpCheck { wide_deps: B1, narrow_deps: B1, pred: |w, n| fs(w) == fs(n) },
+            OpCheck { wide_deps: B2, narrow_deps: B1, pred: |w, n| imm8(w) == fr(n) },
+        ],
         widen_only: false,
     },
-    // movi ↔ movi.n: wide dest is t, narrow dest is s
+    // movi ↔ movi.n: wide dest is t / imm in s+imm8; narrow dest is s
+    // / imm in t+r
     Pair {
         wide: |w| w & 0x00F00F == 0x00A002,
         narrow: |n| op0(n) == 0xC && ft(n) & 0x8 == 0,
-        ops: |w, n| ft(w) == fs(n) && movi_imm(w) == movi_n_imm(n),
+        ops: &[
+            OpCheck { wide_deps: B0, narrow_deps: B1, pred: |w, n| ft(w) == fs(n) },
+            OpCheck {
+                wide_deps: B1 | B2,
+                narrow_deps: B0 | B1,
+                pred: |w, n| movi_imm(w) == movi_n_imm(n),
+            },
+        ],
         widen_only: false,
     },
     // ret ↔ ret.n / retw ↔ retw.n
-    Pair {
-        wide: |w| w == 0x000080,
-        narrow: |n| n == 0xF00D,
-        ops: |_, _| true,
-        widen_only: false,
-    },
-    Pair {
-        wide: |w| w == 0x000090,
-        narrow: |n| n == 0xF01D,
-        ops: |_, _| true,
-        widen_only: false,
-    },
+    Pair { wide: |w| w == 0x000080, narrow: |n| n == 0xF00D, ops: &[], widen_only: false },
+    Pair { wide: |w| w == 0x000090, narrow: |n| n == 0xF01D, ops: &[], widen_only: false },
     // or ↔ mov.n: identity requires equal sources on the wide side
     Pair {
         wide: |w| w & 0xFF000F == 0x200000 && fs(w) == ft(w),
         narrow: |n| op0(n) == 0xD && fr(n) == 0,
-        ops: |w, n| fr(w) == ft(n) && fs(w) == fs(n),
+        ops: &[
+            OpCheck { wide_deps: B1, narrow_deps: B0, pred: |w, n| fr(w) == ft(n) },
+            OpCheck { wide_deps: B1, narrow_deps: B1, pred: |w, n| fs(w) == fs(n) },
+        ],
         widen_only: false,
     },
     // beqz.n → beqz / bnez.n → bnez: imm is pc-relative (free), s pinned
     Pair {
         wide: |w| w & 0xFF == 0x16,
         narrow: |n| op0(n) == 0xC && ft(n) & 0xC == 0x8,
-        ops: |w, n| fs(w) == fs(n),
+        ops: &[OpCheck { wide_deps: B1, narrow_deps: B1, pred: |w, n| fs(w) == fs(n) }],
         widen_only: true,
     },
     Pair {
         wide: |w| w & 0xFF == 0x56,
         narrow: |n| op0(n) == 0xC && ft(n) & 0xC == 0xC,
-        ops: |w, n| fs(w) == fs(n),
+        ops: &[OpCheck { wide_deps: B1, narrow_deps: B1, pred: |w, n| fs(w) == fs(n) }],
         widen_only: true,
     },
 ];
 
+/// Any of `deps`' bytes reloc-masked in the input slot?
+fn deps_masked(deps: u8, in_mask: &[bool]) -> bool {
+    in_mask.iter().enumerate().any(|(k, &m)| m && deps & (1 << k) != 0)
+}
+
 /// ta_narrow_insn: may `wide` have been re-encoded as `narrow`?
-pub fn narrow_pair_ok(wide: &[u8], narrow: &[u8], loose: bool) -> bool {
+/// `in_mask` is the reloc mask of the (wide) input slot; a check is
+/// skipped only when a byte it reads is masked.
+pub fn narrow_pair_ok(wide: &[u8], narrow: &[u8], in_mask: &[bool]) -> bool {
     let (w, n) = (insn24(wide), insn16(narrow));
-    PAIRS
-        .iter()
-        .any(|p| !p.widen_only && (p.wide)(w) && (p.narrow)(n) && (loose || (p.ops)(w, n)))
+    PAIRS.iter().any(|p| {
+        !p.widen_only
+            && (p.wide)(w)
+            && (p.narrow)(n)
+            && p.ops.iter().all(|c| deps_masked(c.wide_deps, in_mask) || (c.pred)(w, n))
+    })
 }
 
 /// ta_widen_insn: may `narrow` have been re-encoded as `wide`?
-pub fn widen_pair_ok(narrow: &[u8], wide: &[u8], loose: bool) -> bool {
+/// `in_mask` is the reloc mask of the (narrow) input slot.
+pub fn widen_pair_ok(narrow: &[u8], wide: &[u8], in_mask: &[bool]) -> bool {
     let (w, n) = (insn24(wide), insn16(narrow));
-    PAIRS
-        .iter()
-        .any(|p| (p.wide)(w) && (p.narrow)(n) && (loose || (p.ops)(w, n)))
+    PAIRS.iter().any(|p| {
+        (p.wide)(w)
+            && (p.narrow)(n)
+            && p.ops.iter().all(|c| deps_masked(c.narrow_deps, in_mask) || (c.pred)(w, n))
+    })
 }
 
 // ---- longcall (R_XTENSA_ASM_SIMPLIFY sites; do_asm_simplify ~4711) ----
@@ -275,12 +339,12 @@ impl Target for Xtensa {
         free_bits(insn)
     }
 
-    fn narrow_ok(&self, wide: &[u8], narrow: &[u8], loose: bool) -> bool {
-        narrow_pair_ok(wide, narrow, loose)
+    fn narrow_ok(&self, wide: &[u8], narrow: &[u8], in_mask: &[bool]) -> bool {
+        narrow_pair_ok(wide, narrow, in_mask)
     }
 
-    fn widen_ok(&self, narrow: &[u8], wide: &[u8], loose: bool) -> bool {
-        widen_pair_ok(narrow, wide, loose)
+    fn widen_ok(&self, narrow: &[u8], wide: &[u8], in_mask: &[bool]) -> bool {
+        widen_pair_ok(narrow, wide, in_mask)
     }
 
     fn longcall(&self, input: &[u8], output: &[u8]) -> Option<(usize, usize, bool)> {
@@ -319,6 +383,7 @@ pub fn extract_input(
     let bytes = sec.data().map_err(|e| e.to_string())?.to_vec();
 
     let mut mask = vec![false; bytes.len()];
+    let mut longcall_points: HashSet<usize> = HashSet::new();
     for (off, rel) in sec.relocations() {
         let off = off as usize;
         let n = match rel.size() {
@@ -329,6 +394,17 @@ pub fn extract_input(
         };
         for m in mask.iter_mut().skip(off).take(n) {
             *m = true;
+        }
+        // gas marks an expanded longcall's l32r with ASM_EXPAND
+        // (ASM_SIMPLIFY in --emit-relocs output after ld converted
+        // it); these are the only offsets do_asm_simplify touches.
+        if let object::RelocationFlags::Elf { r_type } = rel.flags()
+            && matches!(
+                r_type,
+                object::elf::R_XTENSA_ASM_EXPAND | object::elf::R_XTENSA_ASM_SIMPLIFY
+            )
+        {
+            longcall_points.insert(off);
         }
     }
 
@@ -418,7 +494,7 @@ pub fn extract_input(
         }
     }
 
-    Ok(InputSection { bytes, mask, regions, flex_points, lit_expect })
+    Ok(InputSection { bytes, mask, regions, flex_points, lit_expect, longcall_points })
 }
 
 // Ground-truth bytes assembled with xtensa-esp32s3-elf-as
@@ -470,49 +546,64 @@ mod tests {
         // addi a3,a5,12 (synthesized: imm8=0x0c)
         let addi_12: [u8; 3] = [0x32, 0xc5, 0x0c];
         let addi_m1: [u8; 3] = [0x32, 0xc5, 0xff];
-        assert!(narrow_pair_ok(&ADD, &ADD_N, false));
-        assert!(narrow_pair_ok(&addi_12, &ADDI_N_12, false));
-        assert!(narrow_pair_ok(&addi_m1, &ADDI_N_M1, false));
-        assert!(narrow_pair_ok(&L32I, &L32I_N, false));
-        assert!(narrow_pair_ok(&MOVI_95, &MOVI_N_95, false));
-        assert!(narrow_pair_ok(&MOVI_M32, &MOVI_N_M32, false));
-        assert!(narrow_pair_ok(&RET, &RET_N, false));
-        assert!(narrow_pair_ok(&RETW, &RETW_N, false));
-        assert!(narrow_pair_ok(&S32I, &S32I_N, false));
-        assert!(narrow_pair_ok(&OR_MOV, &MOV_N, false));
+        assert!(narrow_pair_ok(&ADD, &ADD_N, &[false; 3]));
+        assert!(narrow_pair_ok(&addi_12, &ADDI_N_12, &[false; 3]));
+        assert!(narrow_pair_ok(&addi_m1, &ADDI_N_M1, &[false; 3]));
+        assert!(narrow_pair_ok(&L32I, &L32I_N, &[false; 3]));
+        assert!(narrow_pair_ok(&MOVI_95, &MOVI_N_95, &[false; 3]));
+        assert!(narrow_pair_ok(&MOVI_M32, &MOVI_N_M32, &[false; 3]));
+        assert!(narrow_pair_ok(&RET, &RET_N, &[false; 3]));
+        assert!(narrow_pair_ok(&RETW, &RETW_N, &[false; 3]));
+        assert!(narrow_pair_ok(&S32I, &S32I_N, &[false; 3]));
+        assert!(narrow_pair_ok(&OR_MOV, &MOV_N, &[false; 3]));
     }
 
     #[test]
     fn narrow_pairs_reject() {
         // operand value mismatch
-        assert!(!narrow_pair_ok(&ADDI_42, &ADDI_N_12, false));
-        assert!(!narrow_pair_ok(&ADDI_M3, &ADDI_N_M1, false));
-        assert!(!narrow_pair_ok(&ADDMI, &ADDI_N_12, false)); // 768 != 12
-        assert!(!narrow_pair_ok(&MOVI_95, &MOVI_N_M32, false));
+        assert!(!narrow_pair_ok(&ADDI_42, &ADDI_N_12, &[false; 3]));
+        assert!(!narrow_pair_ok(&ADDI_M3, &ADDI_N_M1, &[false; 3]));
+        assert!(!narrow_pair_ok(&ADDMI, &ADDI_N_12, &[false; 3])); // 768 != 12
+        assert!(!narrow_pair_ok(&MOVI_95, &MOVI_N_M32, &[false; 3]));
         // register mismatch: l32i a3,a5,28 vs s32i.n a3,a5,28
-        assert!(!narrow_pair_ok(&L32I, &S32I_N, false));
+        assert!(!narrow_pair_ok(&L32I, &S32I_N, &[false; 3]));
         // or with distinct sources is NOT mov
         let or_356: [u8; 3] = [0x60, 0x35, 0x20]; // or a3,a5,a6
-        assert!(!narrow_pair_ok(&or_356, &MOV_N, false));
+        assert!(!narrow_pair_ok(&or_356, &MOV_N, &[false; 3]));
         // branches are NOT narrowable (linker table excludes them)
-        assert!(!narrow_pair_ok(&BEQZ, &BEQZ_N, false));
-        assert!(!narrow_pair_ok(&BNEZ, &BNEZ_N, false));
+        assert!(!narrow_pair_ok(&BEQZ, &BEQZ_N, &[false; 3]));
+        assert!(!narrow_pair_ok(&BNEZ, &BNEZ_N, &[false; 3]));
         // loose mode still requires the pair identity
-        assert!(!narrow_pair_ok(&RET, &MOV_N, true));
-        assert!(narrow_pair_ok(&ADDI_42, &ADDI_N_12, true)); // imm free when masked
+        // a full-slot mask (SLOT0_OP-style) still requires the pair identity
+        assert!(!narrow_pair_ok(&RET, &MOV_N, &[true; 3]));
+        // imm-byte mask excuses the imm mismatch (42 vs 12)…
+        assert!(narrow_pair_ok(&ADDI_42, &ADDI_N_12, &[false, false, true]));
+        // …but NOT a register swap in the unmasked bytes: same imm-byte
+        // mask, narrow side re-encoded as addi.n a4,a6,12. The old
+        // slot-granular `loose` accepted this.
+        let addi_n_regswap: [u8; 2] = [0xcb, 0x46]; // addi.n a4,a6,12
+        assert!(!narrow_pair_ok(&ADDI_42, &addi_n_regswap, &[false, false, true]));
+        // dest lives in byte0 on the wide side: masking imm doesn't free it
+        let addi_n_dest4: [u8; 2] = [0xcb, 0x45]; // addi.n a4,a5,12
+        assert!(!narrow_pair_ok(&ADDI_42, &addi_n_dest4, &[false, false, true]));
+        // widen direction: narrow input with byte0 masked frees the
+        // addi.n imm (it lives in t/byte0) but pins the byte1 registers
+        assert!(widen_pair_ok(&ADDI_N_12, &ADDI_42, &[true, false])); // imm freed
+        let addi_regswap: [u8; 3] = [0x42, 0xc6, 0x0c]; // addi a4,a6,12
+        assert!(!widen_pair_ok(&ADDI_N_12, &addi_regswap, &[true, false]));
     }
 
     #[test]
     fn widen_pairs() {
-        assert!(widen_pair_ok(&ADD_N, &ADD, false));
-        assert!(widen_pair_ok(&RET_N, &RET, false));
-        assert!(widen_pair_ok(&MOV_N, &OR_MOV, false));
+        assert!(widen_pair_ok(&ADD_N, &ADD, &[false; 2]));
+        assert!(widen_pair_ok(&RET_N, &RET, &[false; 2]));
+        assert!(widen_pair_ok(&MOV_N, &OR_MOV, &[false; 2]));
         // branches widen (imm is pc-relative, register must hold)
-        assert!(widen_pair_ok(&BEQZ_N, &BEQZ, false));
-        assert!(widen_pair_ok(&BNEZ_N, &BNEZ, false));
-        assert!(!widen_pair_ok(&BEQZ_N, &BNEZ, false));
+        assert!(widen_pair_ok(&BEQZ_N, &BEQZ, &[false; 2]));
+        assert!(widen_pair_ok(&BNEZ_N, &BNEZ, &[false; 2]));
+        assert!(!widen_pair_ok(&BEQZ_N, &BNEZ, &[false; 2]));
         let beqz_a4: [u8; 3] = [0x16, 0xe4, 0x02];
-        assert!(!widen_pair_ok(&BEQZ_N, &beqz_a4, false)); // reg mismatch
+        assert!(!widen_pair_ok(&BEQZ_N, &beqz_a4, &[false; 2])); // reg mismatch
     }
 
     #[test]

@@ -17,9 +17,12 @@
 //! [`translations`] is the DP-intersection layer (docs/16 §8): it
 //! enumerates ALL minimum-cost source-grounded parses and intersects
 //! their per-byte verdicts — an input offset is translatable only if
-//! every surviving parse maps it identically. This is what makes the
-//! loose matching rules safe in production: disagreement refuses the
-//! offset, never guesses.
+//! every surviving parse maps it identically. Disagreement refuses the
+//! offset, never guesses. The matching rules themselves are also
+//! mask-granular (operand checks are skipped only for reloc-written
+//! bytes) and longcall edges exist only at ASM_EXPAND-marked sites —
+//! both shrink the space of bogus parses that could ever compete on
+//! cost with the true one.
 
 use super::{Census, DirtyRun, Fate, FateCell, InputSection, RegionKind, Verdict};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -35,12 +38,13 @@ pub trait Target {
     /// Per-byte free-bit mask for pc-relative fields the linker
     /// retargets in place (docs/16 §3); all-zero when none.
     fn free_bits(&self, insn: &[u8]) -> [u8; 3];
-    /// Exact-pair narrowing (3→2) preserving operand values; `loose`
-    /// drops the operand checks when the input slot is relocated but
-    /// keeps the pair identity.
-    fn narrow_ok(&self, wide: &[u8], narrow: &[u8], loose: bool) -> bool;
+    /// Exact-pair narrowing (3→2) preserving operand values. `in_mask`
+    /// is the input slot's per-byte reloc mask: operand checks reading
+    /// a masked byte are skipped (the linker wrote it), checks over
+    /// unmasked bytes — register fields, typically — always hold.
+    fn narrow_ok(&self, wide: &[u8], narrow: &[u8], in_mask: &[bool]) -> bool;
     /// Exact-pair widening (2→3), same contract.
-    fn widen_ok(&self, narrow: &[u8], wide: &[u8], loose: bool) -> bool;
+    fn widen_ok(&self, narrow: &[u8], wide: &[u8], in_mask: &[bool]) -> bool;
     /// Longcall site at the head of `input` matching the head of
     /// `output`: Some((input advance, output advance, converted)).
     fn longcall(&self, input: &[u8], output: &[u8]) -> Option<(usize, usize, bool)>;
@@ -253,7 +257,11 @@ fn for_each_edge<T: Target>(
             f(i + 1, o, COST_TRANSFORM, Act::EndTrim);
         }
         _ => {
-            if let Some((ia, oa, conv)) = cx.t.longcall(&inb[i..], &out[o..]) {
+            // Longcall edges only at ASM_EXPAND/ASM_SIMPLIFY-marked
+            // offsets — ld's do_asm_simplify converts nowhere else.
+            if inp.longcall_points.contains(&i)
+                && let Some((ia, oa, conv)) = cx.t.longcall(&inb[i..], &out[o..])
+            {
                 let act = if conv { Act::LongcallConvert } else { Act::Longcall };
                 if i + ia <= in_len && o + oa <= out_len {
                     f(i + ia, o + oa, COST_TRANSFORM, act);
@@ -262,7 +270,6 @@ fn for_each_edge<T: Target>(
             if let Some(len) = cx.t.insn_len(inb[i])
                 && i + len <= in_len
             {
-                let loose = inp.mask[i..i + len].iter().any(|&m| m);
                 if o + len <= out_len {
                     let fb = cx.t.free_bits(&inb[i..i + len]);
                     let mut clean = true;
@@ -285,13 +292,13 @@ fn for_each_edge<T: Target>(
                 }
                 if len == 3
                     && o + 2 <= out_len
-                    && cx.t.narrow_ok(&inb[i..i + 3], &out[o..o + 2], loose)
+                    && cx.t.narrow_ok(&inb[i..i + 3], &out[o..o + 2], &inp.mask[i..i + 3])
                 {
                     f(i + 3, o + 2, COST_TRANSFORM, Act::Narrow);
                 }
                 if len == 2
                     && o + 3 <= out_len
-                    && cx.t.widen_ok(&inb[i..i + 2], &out[o..o + 3], loose)
+                    && cx.t.widen_ok(&inb[i..i + 2], &out[o..o + 3], &inp.mask[i..i + 2])
                 {
                     f(i + 2, o + 3, COST_TRANSFORM, Act::Widen);
                 }
@@ -574,10 +581,10 @@ mod tests {
         fn free_bits(&self, _: &[u8]) -> [u8; 3] {
             [0; 3]
         }
-        fn narrow_ok(&self, _: &[u8], _: &[u8], _: bool) -> bool {
+        fn narrow_ok(&self, _: &[u8], _: &[u8], _: &[bool]) -> bool {
             false
         }
-        fn widen_ok(&self, _: &[u8], _: &[u8], _: bool) -> bool {
+        fn widen_ok(&self, _: &[u8], _: &[u8], _: &[bool]) -> bool {
             false
         }
         fn longcall(&self, _: &[u8], _: &[u8]) -> Option<(usize, usize, bool)> {
@@ -594,7 +601,50 @@ mod tests {
             mask: vec![false; bytes.len()],
             regions: Vec::new(),
             flex_points: HashSet::new(),
+            longcall_points: HashSet::new(),
             lit_expect: HashMap::new(),
+        }
+    }
+
+
+    /// Longcall edges are offered ONLY at ASM_EXPAND/ASM_SIMPLIFY
+    /// offsets (ld's do_asm_simplify converts nowhere else). A target
+    /// whose longcall matcher would fire everywhere must still refuse
+    /// an unmarked site.
+    #[test]
+    fn longcall_gated_on_marked_offsets() {
+        /// Insn-less target that "converts" input [7,7,7] → output [9].
+        struct LC;
+        impl Target for LC {
+            fn insn_len(&self, _: u8) -> Option<usize> {
+                None
+            }
+            fn free_bits(&self, _: &[u8]) -> [u8; 3] {
+                [0; 3]
+            }
+            fn narrow_ok(&self, _: &[u8], _: &[u8], _: &[bool]) -> bool {
+                false
+            }
+            fn widen_ok(&self, _: &[u8], _: &[u8], _: &[bool]) -> bool {
+                false
+            }
+            fn longcall(&self, i: &[u8], o: &[u8]) -> Option<(usize, usize, bool)> {
+                (i.len() >= 3 && i[..3] == [7, 7, 7] && !o.is_empty() && o[0] == 9)
+                    .then_some((3, 1, false))
+            }
+            fn nop_len(&self, _: &[u8]) -> Option<usize> {
+                None
+            }
+        }
+        // Unmarked: the 3→1 shrink has no explanation → not Reconciled.
+        let inp = input(&[7, 7, 7]);
+        assert!(!matches!(reconcile(&inp, &[9], &LC), Verdict::Reconciled(_)));
+        // Marked at offset 0: the longcall edge explains it.
+        let mut inp = input(&[7, 7, 7]);
+        inp.longcall_points.insert(0);
+        match reconcile(&inp, &[9], &LC) {
+            Verdict::Reconciled(c) => assert_eq!(c.longcall, 1),
+            _ => panic!("expected reconciled at the marked site"),
         }
     }
 

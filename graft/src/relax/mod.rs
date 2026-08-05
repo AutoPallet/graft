@@ -53,6 +53,12 @@ pub struct InputSection {
     /// output word (named-symbol R_XTENSA_32 + unique address in the
     /// linked image). Kills masked-word-eats-code (docs/16 §4).
     pub lit_expect: HashMap<usize, u32>,
+    /// Offsets carrying an R_XTENSA_ASM_EXPAND / ASM_SIMPLIFY marker —
+    /// the ONLY sites ld's do_asm_simplify converts a longcall at.
+    /// The engine offers longcall edges only here; matching the byte
+    /// shape anywhere else (any `l32r; callx` vs `call`) admitted
+    /// parses ld could never have produced.
+    pub longcall_points: HashSet<usize>,
 }
 
 /// Tallies over the min-cost path, one bump per edge (words for

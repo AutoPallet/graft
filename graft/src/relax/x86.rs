@@ -31,11 +31,11 @@ impl Target for X86 {
         [0; 3]
     }
 
-    fn narrow_ok(&self, _: &[u8], _: &[u8], _: bool) -> bool {
+    fn narrow_ok(&self, _: &[u8], _: &[u8], _: &[bool]) -> bool {
         false
     }
 
-    fn widen_ok(&self, _: &[u8], _: &[u8], _: bool) -> bool {
+    fn widen_ok(&self, _: &[u8], _: &[u8], _: &[bool]) -> bool {
         false
     }
 
@@ -104,6 +104,7 @@ pub fn extract_input(sec: &object::Section) -> Result<InputSection, String> {
         mask,
         regions: vec![(0..len, RegionKind::Data)],
         flex_points: Default::default(),
+            longcall_points: Default::default(),
         lit_expect: Default::default(),
     })
 }

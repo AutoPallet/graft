@@ -193,6 +193,7 @@ mod tests {
             mask: vec![false, true, false, false],
             regions: vec![(0..4, crate::relax::RegionKind::Data)],
             flex_points: Default::default(),
+            longcall_points: Default::default(),
             lit_expect: Default::default(),
         };
         // masked byte differs → still identical
