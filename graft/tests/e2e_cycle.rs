@@ -586,6 +586,86 @@ fn ctor_edit_refuses_overlay() {
     );
 }
 
+/// Overlay unwind coverage (the eh_frame merge): a panic raised in an
+/// EDITED function must unwind through overlay frames — the drop guard
+/// runs and `catch_unwind` catches. Pre-merge, `/DISCARD/` dropped the
+/// overlay's FDEs and the unwinder aborted the process at the first
+/// slack-resident frame. The guard's marker value is versioned (1 in
+/// base, 2 in the edit) so the output proves the OVERLAY's cleanup
+/// path executed, not base's stale copy.
+#[test]
+#[ignore]
+fn overlay_unwind_through_edited_code() {
+    let fx = Fixture::new();
+    // Install the panicking path before the base build (same pattern
+    // as the ctor guard test).
+    fx.edit(
+        "base/src/lib.rs",
+        "pub fn greet",
+        concat!(
+            "pub static GUARD_MARK: core::sync::atomic::AtomicU32 =\n",
+            "    core::sync::atomic::AtomicU32::new(0);\n\n",
+            "pub fn risky(n: u32) -> u32 {\n",
+            "    struct G;\n",
+            "    impl Drop for G {\n",
+            "        fn drop(&mut self) {\n",
+            "            GUARD_MARK.store(1, core::sync::atomic::Ordering::SeqCst);\n",
+            "        }\n",
+            "    }\n",
+            "    let _g = G;\n",
+            "    if n > 2 {\n",
+            "        panic!(\"risky boom {n}\");\n",
+            "    }\n",
+            "    n\n",
+            "}\n\n",
+            "pub fn greet",
+        ),
+    );
+    fx.edit(
+        "app/src/main.rs",
+        "    println!(\"{msg}\");",
+        concat!(
+            "    let unwound = std::panic::catch_unwind(|| base::risky(black_box(9))).is_err();\n",
+            "    let mark = base::GUARD_MARK.load(std::sync::atomic::Ordering::SeqCst);\n",
+            "    println!(\"unwind = {unwound},{mark}\");\n",
+            "    println!(\"{msg}\");",
+        ),
+    );
+
+    fx.cargo_build(&[("GRAFT", "base")]);
+    let base_elf = std::env::temp_dir().join("graft-e2e-unwind-base.elf");
+    std::fs::copy(fx.app_bin(), &base_elf).unwrap();
+    make_executable(&base_elf);
+    // Environment sanity: unwinding works in the vanilla base image.
+    let base_out = run_combined(&base_elf);
+    assert!(base_out.contains("unwind = true,1"), "base unwind broken: {base_out}");
+
+    let base_env = base_elf.to_string_lossy().into_owned();
+    let log_env = fx.graft_log_path().to_string_lossy().into_owned();
+
+    // Edit the cleanup path: the drop glue (and with it `risky` and its
+    // caller) re-emits into slack; the panic now unwinds through
+    // overlay frames only the merged .eh_frame_hdr describes.
+    fx.edit("base/src/lib.rs", "GUARD_MARK.store(1,", "GUARD_MARK.store(2,");
+    fx.cargo_build(&[
+        ("GRAFT", "overlay"),
+        ("GRAFT_BASE_ELF", base_env.as_str()),
+        ("GRAFT_LOG", log_env.as_str()),
+    ]);
+    let out = run_combined(&fx.app_bin());
+    assert!(
+        out.contains("unwind = true,2"),
+        "overlay unwind must catch AND run the overlay's drop guard: {out}"
+    );
+    // The mechanism, not just the outcome: combine must have written a
+    // merged lookup table.
+    let log = fx.graft_summary();
+    assert!(
+        log.contains("merged .eh_frame_hdr"),
+        "no eh_frame_hdr merge in graft log:\n{log}"
+    );
+}
+
 /// Argv guard (schema v11): a linker-flag change between base and
 /// overlay must refuse — the recorded base layout was produced under
 /// the old flags, and graft can't prove flag-equivalence. Flags are

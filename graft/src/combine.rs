@@ -36,7 +36,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use object::{
     Object, ObjectSection, ObjectSymbol, SectionFlags,
-    elf::{PT_LOAD, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_PROGBITS},
+    elf::{PT_GNU_EH_FRAME, PT_LOAD, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_PROGBITS},
 };
 
 use crate::{elf_attach, metadata};
@@ -172,7 +172,7 @@ fn combine_splice(
     class: ElfClass,
     output_path: &Path,
 ) -> Result<Stats> {
-    let base_phdrs = read_program_headers(base_bytes, class)?;
+    let mut base_phdrs = read_program_headers(base_bytes, class)?;
     let base_loads: Vec<Phdr> = base_phdrs
         .iter()
         .copied()
@@ -363,6 +363,23 @@ fn combine_splice(
             trimmed.p_memsz = trimmed.p_memsz.saturating_sub(trim);
         }
         append_loads.push(trimmed);
+    }
+
+    // Unwind coverage: overlay FDEs were spliced into the rodata slack
+    // above; the runtime finds FDEs through the single PT_GNU_EH_FRAME
+    // table, which was built at base link and can't know them. Merge
+    // base's and overlay's `.eh_frame_hdr` tables into a fresh table in
+    // free rodata slack and repoint the phdr. No-op when either side
+    // has nothing (xtensa/bare-metal: no PT_GNU_EH_FRAME).
+    if let Some((base_n, ov_n)) =
+        merge_unwind_tables(&mut out, &mut base_phdrs, class, &overlay_obj, &slack_regions)?
+    {
+        crate::telemetry::note(
+            output_path,
+            &format!(
+                "graft combine: merged .eh_frame_hdr — {base_n} base + {ov_n} overlay FDE entries"
+            ),
+        );
     }
 
     // Trampoline on the entry symbol, applied to the splice-modified
@@ -700,6 +717,126 @@ fn read_slack_regions(base: &object::File, base_bytes: &[u8]) -> Result<Vec<Slac
         );
     }
     Ok(regions)
+}
+
+/// Merge base's and the overlay's `.eh_frame_hdr` lookup tables and
+/// repoint `PT_GNU_EH_FRAME` at the merged copy (written into free
+/// rodata slack). See `ehframe.rs` for the design. Returns
+/// `(base_entries, overlay_entries_kept)` when a merge happened.
+///
+/// Overlay entries are filtered to pcs inside the *text slack*: prune
+/// keeps whole object-granular `.eh_frame` sections, so the overlay's
+/// table also lists FDEs whose pc anchored to base addresses (unchanged
+/// functions of edited objects) — coverage base's own table already
+/// provides. Slack membership, not base coverage, is the filter, so
+/// FDEs for genuinely new code always survive it.
+fn merge_unwind_tables(
+    out: &mut [u8],
+    base_phdrs: &mut [Phdr],
+    class: ElfClass,
+    overlay_obj: &object::File,
+    slack_regions: &[SlackRegion],
+) -> Result<Option<(usize, usize)>> {
+    use object::ObjectSection;
+    let Some(eh_idx) = base_phdrs.iter().position(|p| p.p_type == PT_GNU_EH_FRAME) else {
+        return Ok(None); // no unwinder lookup path in this image
+    };
+    let Some(ov_hdr_sec) = overlay_obj.section_by_name(".eh_frame_hdr") else {
+        return Ok(None); // overlay carries no unwind info
+    };
+    if ov_hdr_sec.size() == 0 {
+        return Ok(None);
+    }
+    let Some(text) = slack_regions.iter().find(|r| r.name == "text") else {
+        return Ok(None); // nothing re-emitted into slack ⇒ nothing to cover
+    };
+    let ov_table = crate::ehframe::parse_hdr(ov_hdr_sec.data()?, ov_hdr_sec.address())?;
+    let ov_entries: Vec<(u64, u64)> = ov_table
+        .entries
+        .iter()
+        .copied()
+        .filter(|&(pc, _)| pc >= text.start && pc < text.start + text.len)
+        .collect();
+    if ov_entries.is_empty() {
+        return Ok(None); // every overlay FDE describes base-resident code
+    }
+    let Some(rodata) = slack_regions.iter().find(|r| r.name == "rodata") else {
+        bail!("unwind merge needs a rodata slack region for the merged table");
+    };
+    // The kept entries' FDE records must live in the combined image —
+    // i.e. inside the spliced rodata slack. Anywhere else means the
+    // overlay layout drifted from the splice design; refuse.
+    for &(pc, fde) in &ov_entries {
+        if fde < rodata.start || fde >= rodata.start + rodata.len {
+            bail!(
+                "overlay FDE at {fde:#x} (pc {pc:#x}) lies outside the rodata \
+                 slack — its bytes were not spliced into the combined image"
+            );
+        }
+    }
+
+    let base_eh = base_phdrs[eh_idx];
+    let hdr_range = base_eh.p_offset as usize..(base_eh.p_offset + base_eh.p_filesz) as usize;
+    let base_table = crate::ehframe::parse_hdr(&out[hdr_range], base_eh.p_vaddr)?;
+
+    // Place the merged table after the last overlay byte spliced into
+    // the rodata slack.
+    let mut place = rodata.start;
+    for sec in overlay_obj.sections() {
+        let SectionFlags::Elf { sh_flags } = sec.flags() else { continue };
+        if sh_flags & u64::from(SHF_ALLOC) == 0 || sec.size() == 0 {
+            continue;
+        }
+        let (s, e) = (sec.address(), sec.address() + sec.size());
+        if s >= rodata.start && e <= rodata.start + rodata.len {
+            place = place.max(e);
+        }
+    }
+    let table_vaddr = (place + 3) & !3;
+    let merged = crate::ehframe::merge_entries(&base_table.entries, &ov_entries);
+    let bytes = crate::ehframe::build_hdr(base_table.eh_frame_ptr, &merged, table_vaddr)?;
+    if table_vaddr + bytes.len() as u64 > rodata.start + rodata.len {
+        bail!(
+            "merged .eh_frame_hdr ({} bytes at {table_vaddr:#x}) overflows the rodata \
+             slack — raise rodata= in GRAFT_SLACK_LEN and rebuild base",
+            bytes.len()
+        );
+    }
+    let load = base_phdrs
+        .iter()
+        .find(|p| {
+            p.p_type == PT_LOAD
+                && table_vaddr >= p.p_vaddr
+                && table_vaddr + bytes.len() as u64 <= p.p_vaddr + p.p_filesz
+        })
+        .ok_or_else(|| {
+            anyhow!("merged .eh_frame_hdr vaddr {table_vaddr:#x} not inside a base PT_LOAD")
+        })?;
+    let off = (load.p_offset + (table_vaddr - load.p_vaddr)) as usize;
+    out[off..off + bytes.len()].copy_from_slice(&bytes);
+
+    // Repoint the phdr — in the caller's vec (used if the PHT gets
+    // rewritten later by append_pt_loads) AND in the in-file PHT.
+    let patched = Phdr {
+        p_offset: off as u64,
+        p_vaddr: table_vaddr,
+        p_paddr: table_vaddr,
+        p_filesz: bytes.len() as u64,
+        p_memsz: bytes.len() as u64,
+        ..base_eh
+    };
+    base_phdrs[eh_idx] = patched;
+    let ho = class.header_offsets();
+    let e_phoff = match ho.e_phoff_size {
+        4 => u32::from_le_bytes(out[ho.e_phoff..ho.e_phoff + 4].try_into().unwrap()) as usize,
+        8 => u64::from_le_bytes(out[ho.e_phoff..ho.e_phoff + 8].try_into().unwrap()) as usize,
+        n => bail!("unexpected e_phoff_size {n}"),
+    };
+    let entsize = class.phdr_size();
+    let slot = e_phoff + eh_idx * entsize;
+    out[slot..slot + entsize].copy_from_slice(&patched.to_le_bytes(class));
+
+    Ok(Some((base_table.entries.len(), ov_entries.len())))
 }
 
 /// Canonical 64-bit-wide program header. ELF32 fields are zero-extended

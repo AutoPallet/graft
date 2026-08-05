@@ -12,6 +12,7 @@ pub mod base;
 pub mod basemap;
 pub mod combine;
 pub mod debug_dump;
+pub mod ehframe;
 pub mod debug_flags;
 pub mod elf;
 pub mod elf_attach;

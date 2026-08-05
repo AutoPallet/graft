@@ -322,7 +322,12 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
 
     // Prune each source object; collect the pruned-.o paths.
     let t_prune_start = std::time::Instant::now();
-    let pruned = prune_all(&scan, &closure, &resolver, &work_dir)?;
+    // Hosted x86: pruned objects also keep their unwind sections so
+    // overlay code gets FDE coverage in the combined image (see
+    // ehframe.rs). Not on xtensa (panic=abort targets, no unwinder;
+    // linkall.x owns layout).
+    let keep_unwind = base.e_machine == object::elf::EM_X86_64;
+    let pruned = prune_all(&scan, &closure, &resolver, &work_dir, keep_unwind)?;
     let t_prune = t_prune_start.elapsed();
     let anchor_rewrites_total: usize = pruned.iter().map(|p| p.anchor_rewrites).sum();
     let kept_sec_total: usize = pruned.iter().map(|p| p.kept_sections).sum();
@@ -705,6 +710,7 @@ fn prune_all(
     closure: &Closure,
     resolver: &crate::resolve::Resolver<'_>,
     work_dir: &Path,
+    keep_unwind: bool,
 ) -> Result<Vec<PrunedEntry>> {
     // Group closure sections by object.
     let mut by_obj: HashMap<u32, HashSet<u32>> = HashMap::new();
@@ -712,6 +718,32 @@ fn prune_all(
         let nm = &scan.graph.nodes[nid as usize];
         for seg in &nm.segments {
             by_obj.entry(seg.object).or_default().insert(seg.section);
+        }
+    }
+
+    // Unwind coverage for re-emitted code (hosted x86): every pruned
+    // object additionally keeps its `.eh_frame` / `.gcc_except_table*`
+    // sections. These are physical keep-set additions, NOT closure
+    // members — closure semantics (and every hash) are untouched. An
+    // rcgu's `.eh_frame` is object-granular and references *all* of the
+    // object's functions; prune's normal reloc disposition sorts the
+    // targets out: kept text wires internally (FDE pc = slack address),
+    // unchanged text anchors to base's copy (FDE pc = base address —
+    // redundant coverage that combine's slack filter drops from the
+    // merged lookup table), and the CIE's personality slot
+    // (`.data.DW.ref.rust_eh_personality`) anchors like any other
+    // unchanged data. ld then FDE-edits and builds the overlay's
+    // `.eh_frame_hdr` exactly as it would in a full link.
+    if keep_unwind {
+        for (&obj_idx, keep_set) in by_obj.iter_mut() {
+            for (idx, sec) in scan.objects[obj_idx as usize].sections.iter().enumerate() {
+                if sec.name == ".eh_frame"
+                    || sec.name.starts_with(".eh_frame.")
+                    || sec.name.starts_with(".gcc_except_table")
+                {
+                    keep_set.insert(idx as u32);
+                }
+            }
         }
     }
 
@@ -929,6 +961,9 @@ fn write_overlay_layout_ld_splice(
             "  . = {:#x};\n  .rodata : {{ *(.rodata .rodata.* .rodata..L*) }}\n  \
              .data.rel.ro : {{ *(.data.rel.ro .data.rel.ro.* .data.rel.ro..L*) }}\n  \
              .debug_gdb_scripts : {{ *(.debug_gdb_scripts) }}\n  \
+             .gcc_except_table : {{ *(.gcc_except_table .gcc_except_table.*) }}\n  \
+             .eh_frame_hdr : {{ KEEP(*(.eh_frame_hdr)) }}\n  \
+             .eh_frame : {{ KEEP(*(.eh_frame)) }}\n  \
              _graft_rodata_end = .;\n",
             slack.rodata_start
         ),
@@ -1000,9 +1035,6 @@ fn write_overlay_layout_ld_splice(
          *(.preinit_array*) *(.ctors*) *(.dtors*) }\n",
     ));
     // Deliberate discards — each entry has an argument, not a wildcard:
-    //   .eh_frame/.eh_frame_hdr/.gcc_except_table: overlay unwind is a
-    //     known gap (README limitations); legitimately differs from base
-    //     so no equality audit is possible.
     //   .note.gnu.build-id: ld synthesizes overlay.elf's own id when the
     //     forwarded argv carries --build-id; overlay identity is
     //     graft-composed (blake3(base‖overlay)), the ld one is noise.
@@ -1013,8 +1045,8 @@ fn write_overlay_layout_ld_splice(
     // orphan and is refused by check_overlay_sections — "we didn't think
     // about this" must fail loud, not vanish into a wildcard.
     script.push_str(
-        "  /DISCARD/ : { *(.eh_frame .eh_frame_hdr .gcc_except_table*) \
-         *(.note.gnu.build-id) *(.note.GNU-stack) *(.comment) *(.gnu_debuglink) }\n}\n",
+        "  /DISCARD/ : { *(.note.gnu.build-id) *(.note.GNU-stack) *(.comment) \
+         *(.gnu_debuglink) }\n}\n",
     );
     script.push_str(
         "ASSERT(SIZEOF(.graft.audit.initfini) == 0, \"overlay emitted \
@@ -1085,8 +1117,8 @@ fn check_overlay_sections(overlay_bytes: &[u8], base_bytes: &[u8]) -> Result<()>
     // base-map prefix). Keep in lockstep with
     // `write_overlay_layout_ld_splice`.
     const PLACED: &[&str] = &[
-        ".text", ".rodata", ".data.rel.ro", ".debug_gdb_scripts", ".got", ".data", ".bss",
-        ".tdata", ".tbss",
+        ".text", ".rodata", ".data.rel.ro", ".debug_gdb_scripts", ".gcc_except_table",
+        ".eh_frame_hdr", ".eh_frame", ".got", ".data", ".bss", ".tdata", ".tbss",
     ];
     let overlay = object::File::parse(overlay_bytes).context("parse overlay ELF for audit")?;
     let base = object::File::parse(base_bytes).context("parse base ELF for audit")?;

@@ -460,7 +460,13 @@ relink, so the build never breaks. The main refusal classes:
 
 The combined image keeps base's `.symtab` and DWARF byte-for-byte, and
 base's bytes never move, so everything *unchanged* debugs exactly as
-before. The costs concentrate in what changed:
+before. Unwinding through changed code works (hosted x86): pruned
+objects keep their `.eh_frame`/`.gcc_except_table` FDE-filtered to the
+kept functions, the overlay links them at final slack addresses, and
+combine merges base's and overlay's `.eh_frame_hdr` binary-search
+tables into fresh rodata slack, repointing `PT_GNU_EH_FRAME`
+(`ehframe.rs`; pinned by the `overlay_unwind_through_edited_code`
+e2e). The remaining costs concentrate in what changed:
 
 - **Overlay code has symbols but no line info.** Prune keeps only
   closure sections, so `.debug_*` never reaches the pruned objects;

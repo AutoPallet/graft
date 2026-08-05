@@ -90,14 +90,14 @@ Other things are currently unsupported entirely
 - `--whole-archive` link lines (refused; use `GRAFT=passthrough`)
 
 Known gaps in the combined output:
-- Overlay code has no unwind tables (`.eh_frame` is dropped from
-  overlays): a panic that unwinds through edited code aborts instead
-  of unwinding. Irrelevant with `panic = "abort"` (the embedded
-  targets); on hosted x86 builds panics still stop the program safely,
-  but `catch_unwind` and drop cleanups don't run through overlay
-  frames. Debug info for overlay code is likewise absent (base keeps
-  its own symbols/DWARF; overlay code has symbols only), so name
-  breakpoints on edited functions land on the stale base copy.
+- Debug info for overlay code is absent (base keeps its own
+  symbols/DWARF; overlay code has symbols only), so name breakpoints
+  on edited functions land on the stale base copy. (Unwinding is NOT a
+  gap on hosted x86: overlay FDEs are carried into the image and
+  combine merges base's and overlay's `.eh_frame_hdr` lookup tables,
+  so panics through edited code run cleanups and `catch_unwind`
+  catches. On the embedded targets `panic = "abort"` makes unwind
+  tables moot and overlays still drop them.)
 - The combined image inherits base's non-LOAD program headers
   (`PT_GNU_STACK` &c). An edit that changes such requirements — not
   something rustc-compiled code does — would not be reflected.
