@@ -466,18 +466,22 @@ kept functions, the overlay links them at final slack addresses, and
 combine merges base's and overlay's `.eh_frame_hdr` binary-search
 tables into fresh rodata slack, repointing `PT_GNU_EH_FRAME`
 (`ehframe.rs`; pinned by the `overlay_unwind_through_edited_code`
-e2e). The remaining costs concentrate in what changed:
-
-- **Overlay code has symbols but no line info.** Prune keeps only
-  closure sections, so `.debug_*` never reaches the pruned objects;
-  `overlay.elf` carries a full symtab for the re-emitted code (so slack
-  addresses symbolize function-level — `add-symbol-file overlay.elf` in
-  gdb) but no DWARF. The combined image gets neither: splice copies
-  alloc bytes only.
-- **Breakpoints on edited functions never fire.** Base's symbol for an
-  edited function still names the old, now-unreachable copy; a
-  breakpoint set by name lands there and the live copy runs at a slack
-  address only `overlay.elf` knows.
+e2e). Source-level debug info for changed code works too: pruned
+objects keep their whole `.debug_*` sections (relocs into kept
+sections wire to true slack addresses; everything else tombstones to
+0, ld's own convention for gc'd code — base's DWARF still describes
+what didn't change), the overlay links each debug output section at
+address = size of base's counterpart (`(INFO)`, non-alloc), which
+makes ld resolve every cross-section DWARF offset as-if concatenated
+after base's — and combine then performs exactly that concatenation
+(`merge_debug_sections`: append `base ++ overlay` at EOF, repoint the
+shdr; no DWARF parsed anywhere). GDB sees an edited function as a
+multi-location breakpoint — stale base copy plus live slack copy, and
+only the live one ever fires — with correct lines on both (pinned by
+`overlay_debug_info_merges_into_combined`). The combined ELF grows by
+about the size of base's debug sections (dead file space where they
+used to live); the loaded image is untouched. The remaining costs
+concentrate in what changed:
 - **ICF skews attribution, not behavior.** With `GRAFT_ICF=1` the
   collected duplicates vanish from base's symtab, so backtraces,
   `addr2line`, and profilers credit every call to the surviving copy's

@@ -90,14 +90,17 @@ Other things are currently unsupported entirely
 - `--whole-archive` link lines (refused; use `GRAFT=passthrough`)
 
 Known gaps in the combined output:
-- Debug info for overlay code is absent (base keeps its own
-  symbols/DWARF; overlay code has symbols only), so name breakpoints
-  on edited functions land on the stale base copy. (Unwinding is NOT a
-  gap on hosted x86: overlay FDEs are carried into the image and
-  combine merges base's and overlay's `.eh_frame_hdr` lookup tables,
-  so panics through edited code run cleanups and `catch_unwind`
-  catches. On the embedded targets `panic = "abort"` makes unwind
-  tables moot and overlays still drop them.)
+- On the embedded targets, debug info and unwind tables for overlay
+  code are dropped (`panic = "abort"` makes unwind moot; debug via the
+  base ELF covers everything unchanged). On hosted x86 neither is a
+  gap: overlay FDEs are carried and the `.eh_frame_hdr` lookup tables
+  merged (panics through edited code run cleanups; `catch_unwind`
+  catches), and the overlay's DWARF CUs are concatenated after base's,
+  so breakpoints on edited functions resolve as multi-location (stale
+  base copy + live slack copy — only the live one ever fires) with
+  correct source lines. The combined ELF grows by roughly the size of
+  base's debug sections (they're re-appended; the originals become
+  dead file space) — file-level only, the loaded image is unchanged.
 - The combined image inherits base's non-LOAD program headers
   (`PT_GNU_STACK` &c). An edit that changes such requirements — not
   something rustc-compiled code does — would not be reflected.

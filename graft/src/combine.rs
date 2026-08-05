@@ -382,6 +382,27 @@ fn combine_splice(
         );
     }
 
+    // Debug info: concatenate overlay's `.debug_*` contributions after
+    // base's (the overlay linked them concatenation-addressed — see
+    // merge_debug_sections). Non-alloc: file-level only, the loaded
+    // image is untouched.
+    let (dbg_merged, dbg_bytes) = merge_debug_sections(
+        &mut out,
+        &base_obj_for_slack,
+        &overlay_obj,
+        overlay_bytes,
+        class,
+        output_path,
+    )?;
+    if dbg_merged > 0 {
+        crate::telemetry::note(
+            output_path,
+            &format!(
+                "graft combine: merged {dbg_merged} debug section(s), {dbg_bytes} bytes appended"
+            ),
+        );
+    }
+
     // Trampoline on the entry symbol, applied to the splice-modified
     // buffer.
     let manifest_bytes = elf_attach::read_section(base_bytes, metadata::SECTION_MANIFEST)?
@@ -717,6 +738,118 @@ fn read_slack_regions(base: &object::File, base_bytes: &[u8]) -> Result<Vec<Slac
         );
     }
     Ok(regions)
+}
+
+/// Merge the overlay's `.debug_*` sections into base's, byte-splice
+/// style: the overlay layout script assigned each debug output section
+/// ADDRESS = size of base's same-named section, so ld already resolved
+/// every cross-section DWARF offset (strp, stmt_list, abbrev_offset,
+/// DWARF5 bases) as-if the overlay's contribution sat concatenated
+/// after base's. This function performs exactly that concatenation:
+/// `base_bytes ++ overlay_bytes` appended at EOF, base's shdr repointed
+/// (sh_offset/sh_size patched in place — non-alloc, so no phdr or
+/// vaddr impact; the flashed/loaded image is untouched). No DWARF is
+/// parsed, here or anywhere.
+///
+/// The old base debug bytes become dead file space — the cost of never
+/// parsing DWARF. Overlay-only debug sections (base lacks the name)
+/// are skipped with a note: appending a *new* section needs an SHT
+/// rewrite, and same-toolchain links produce the same section set, so
+/// this arm should stay cold.
+///
+/// Returns `(sections_merged, bytes_appended)`.
+fn merge_debug_sections(
+    out: &mut Vec<u8>,
+    base_obj: &object::File,
+    overlay_obj: &object::File,
+    overlay_bytes: &[u8],
+    class: ElfClass,
+    output_path: &Path,
+) -> Result<(usize, u64)> {
+    use object::ObjectSection;
+    // ELF header SHT geometry (not in HeaderOffsets — phdr-only there).
+    let (e_shoff_pos, e_shoff, shentsize) = match class {
+        ElfClass::Elf32 => {
+            let off = u32::from_le_bytes(out[0x20..0x24].try_into().unwrap()) as u64;
+            let ent = u16::from_le_bytes(out[0x2e..0x30].try_into().unwrap()) as usize;
+            (0x20usize, off, ent)
+        }
+        ElfClass::Elf64 => {
+            let off = u64::from_le_bytes(out[0x28..0x30].try_into().unwrap());
+            let ent = u16::from_le_bytes(out[0x3a..0x3c].try_into().unwrap()) as usize;
+            (0x28usize, off, ent)
+        }
+    };
+    let _ = e_shoff_pos;
+    if e_shoff == 0 {
+        bail!("base ELF has no section header table — cannot merge debug sections");
+    }
+    let mut merged = 0usize;
+    let mut appended: u64 = 0;
+    for ov in overlay_obj.sections() {
+        let Ok(name) = ov.name() else { continue };
+        if !name.starts_with(".debug_") || name == ".debug_gdb_scripts" {
+            continue;
+        }
+        let Some((ov_off, ov_size)) = ov.file_range() else { continue };
+        if ov_size == 0 {
+            continue;
+        }
+        let Some(base_sec) = base_obj.section_by_name(name) else {
+            crate::telemetry::note(
+                output_path,
+                &format!(
+                    "graft combine: overlay-only debug section {name} ({ov_size} bytes) \
+                     not merged into the combined image (base lacks it; still present in \
+                     overlay.elf)"
+                ),
+            );
+            continue;
+        };
+        let base_size = base_sec.size();
+        if ov.address() != base_size {
+            bail!(
+                "debug-merge contract violated: overlay {name} linked at address {:#x} \
+                 but base's {name} is {base_size:#x} bytes — the layout script's \
+                 concatenation addresses drifted; refusing to emit misoffset DWARF",
+                ov.address()
+            );
+        }
+        let Some((base_off, base_fsize)) = base_sec.file_range() else { continue };
+        // Concatenated section content must be internally positioned
+        // exactly as the addresses claim: base at 0, overlay at
+        // base_size.
+        if base_fsize != base_size {
+            bail!("debug section {name}: base file size {base_fsize:#x} != sh_size {base_size:#x}");
+        }
+        let align = base_sec.align().max(1) as usize;
+        while out.len() % align != 0 {
+            out.push(0);
+        }
+        let new_off = out.len() as u64;
+        out.extend_from_within(base_off as usize..(base_off + base_fsize) as usize);
+        out.extend_from_slice(&overlay_bytes[ov_off as usize..(ov_off + ov_size) as usize]);
+        // Patch base's shdr in place. `SectionIndex.0` is the ELF
+        // section index (null entry included), so the entry position is
+        // direct.
+        let slot = e_shoff as usize + base_sec.index().0 * shentsize;
+        match class {
+            ElfClass::Elf32 => {
+                out[slot + 0x10..slot + 0x14]
+                    .copy_from_slice(&u32::try_from(new_off)?.to_le_bytes());
+                out[slot + 0x14..slot + 0x18]
+                    .copy_from_slice(&u32::try_from(base_size + ov_size)?.to_le_bytes());
+            }
+            ElfClass::Elf64 => {
+                out[slot + 0x18..slot + 0x20].copy_from_slice(&new_off.to_le_bytes());
+                out[slot + 0x20..slot + 0x28]
+                    .copy_from_slice(&(base_size + ov_size).to_le_bytes());
+            }
+        }
+        merged += 1;
+        appended += base_fsize + ov_size;
+    }
+    Ok((merged, appended))
 }
 
 /// Merge base's and the overlay's `.eh_frame_hdr` lookup tables and

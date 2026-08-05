@@ -258,6 +258,53 @@ pub fn prune_object(
                 None => offset,
             };
 
+            // Debug-referrer relocs never reach `dispose`: the scan
+            // deliberately records no resolutions for non-alloc
+            // sections (debug relocs dominate reloc volume by an order
+            // of magnitude), and none are needed. A target kept in
+            // this object wires internally (address attrs resolve to
+            // true slack addresses at the overlay link; str/abbrev/line
+            // offsets resolve through the concatenation-addressed
+            // debug output sections). Any other target tombstones —
+            // the reloc is dropped and the field's zero bytes read as
+            // DWARF tombstone 0, exactly what ld emits for refs into
+            // gc'd sections. Base's own DWARF still describes those
+            // unchanged/absent functions.
+            if from_section.starts_with(".debug_") {
+                let internal: Option<SymbolId> = match r.target() {
+                    RelocationTarget::Symbol(sidx) => {
+                        if let Some(&id) = sym_map.get(&sidx) {
+                            Some(id)
+                        } else {
+                            src.symbol_by_index(sidx).ok().and_then(|s| {
+                                if !matches!(s.kind(), SymbolKind::Section) {
+                                    return None;
+                                }
+                                s.section_index()
+                                    .and_then(|t| sec_map.get(&t))
+                                    .map(|&id| out.section_symbol(id))
+                            })
+                        }
+                    }
+                    RelocationTarget::Section(t) => {
+                        sec_map.get(&t).map(|&id| out.section_symbol(id))
+                    }
+                    _ => None,
+                };
+                let Some(sym_id) = internal else { continue };
+                out.add_relocation(
+                    new_sec_id,
+                    WRelocation {
+                        offset,
+                        symbol: sym_id,
+                        addend: r.addend(),
+                        flags: RelocationFlags::Elf { r_type },
+                    },
+                )
+                .with_context(|| format!("add debug reloc at {offset:#x} in {from_section}"))?;
+                continue;
+            }
+
             let disposition = match r.target() {
                 RelocationTarget::Symbol(sidx) => {
                     if let Some(&id) = sym_map.get(&sidx) {

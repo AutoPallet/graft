@@ -666,6 +666,100 @@ fn overlay_unwind_through_edited_code() {
     );
 }
 
+/// DWARF merge: the combined image's `.debug_*` sections are base's
+/// with the overlay's CUs concatenated after (combine's
+/// merge_debug_sections; the overlay linked its debug sections
+/// concatenation-addressed so no DWARF is ever parsed). Pin the
+/// structure (sizes add exactly), a real consumer parsing it (readelf
+/// walks every CU without error, sees more CUs than base), and the
+/// payoff (an appended CU carries a DW_AT_low_pc inside the text
+/// slack — source-level debug info for re-emitted code).
+#[test]
+#[ignore]
+fn overlay_debug_info_merges_into_combined() {
+    let fx = Fixture::new();
+    fx.cargo_build(&[("GRAFT", "base")]);
+    let base_elf = std::env::temp_dir().join("graft-e2e-dwarf-base.elf");
+    std::fs::copy(fx.app_bin(), &base_elf).unwrap();
+    make_executable(&base_elf);
+
+    let base_env = base_elf.to_string_lossy().into_owned();
+    let log_env = fx.graft_log_path().to_string_lossy().into_owned();
+    fx.edit("base/src/lib.rs", "wrapping_mul(7)", "wrapping_mul(11)");
+    fx.cargo_build(&[
+        ("GRAFT", "overlay"),
+        ("GRAFT_BASE_ELF", base_env.as_str()),
+        ("GRAFT_LOG", log_env.as_str()),
+    ]);
+    let out = run_combined(&fx.app_bin());
+    assert!(out.contains("sum = 165"), "edit visible: {out}");
+
+    // Structure: combined .debug_info size == base + overlay exactly.
+    let sec_size = |bytes: &[u8], name: &str| -> u64 {
+        use object::{Object, ObjectSection};
+        object::File::parse(bytes)
+            .expect("parse elf")
+            .section_by_name(name)
+            .map(|s| s.size())
+            .unwrap_or(0)
+    };
+    let base_bytes = std::fs::read(&base_elf).unwrap();
+    let combined_bytes = std::fs::read(fx.app_bin()).unwrap();
+    let overlay_bytes = std::fs::read(fx.graft_work_dir().join("overlay.elf")).unwrap();
+    let (b, o, c) = (
+        sec_size(&base_bytes, ".debug_info"),
+        sec_size(&overlay_bytes, ".debug_info"),
+        sec_size(&combined_bytes, ".debug_info"),
+    );
+    assert!(o > 0, "overlay.elf carries no .debug_info");
+    assert_eq!(c, b + o, "combined .debug_info must be base ++ overlay");
+
+    // Consumer: readelf must walk every CU (including across the
+    // concatenation boundary) without a single stderr complaint, and
+    // see the overlay's CUs appended.
+    let dump = |p: &Path| -> (usize, String, String) {
+        let out = Command::new("readelf")
+            .args(["--debug-dump=info", &p.to_string_lossy()])
+            .output()
+            .expect("spawn readelf (binutils required for this pin)");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        (stdout.matches("Compilation Unit").count(), stdout, stderr)
+    };
+    let (base_cus, _, _) = dump(&base_elf);
+    let (combined_cus, combined_dump, combined_err) = dump(&fx.app_bin());
+    assert!(combined_err.is_empty(), "readelf errors on combined DWARF:\n{combined_err}");
+    assert!(
+        combined_cus > base_cus,
+        "no overlay CUs appended ({combined_cus} vs base {base_cus})"
+    );
+
+    // Payoff: an appended-CU subprogram lives at a text-slack address.
+    let slack_start = {
+        use object::{Object, ObjectSymbol};
+        let elf = object::File::parse(&combined_bytes[..]).unwrap();
+        let sym = elf
+            .symbols()
+            .find(|s| s.name() == Ok("GRAFT_TEXT_SLACK"))
+            .expect("no GRAFT_TEXT_SLACK in combined");
+        (sym.address(), sym.address() + sym.size())
+    };
+    let has_slack_pc = combined_dump.lines().any(|l| {
+        l.contains("DW_AT_low_pc")
+            && l.rsplit(' ')
+                .next()
+                .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+                .is_some_and(|pc| pc >= slack_start.0 && pc < slack_start.1)
+    });
+    assert!(has_slack_pc, "no DW_AT_low_pc inside text slack — overlay CUs describe nothing");
+
+    let log = fx.graft_summary();
+    assert!(
+        log.contains("debug section(s)"),
+        "no debug-merge note in graft log:\n{log}"
+    );
+}
+
 /// Argv guard (schema v11): a linker-flag change between base and
 /// overlay must refuse — the recorded base layout was produced under
 /// the old flags, and graft can't prove flag-equivalence. Flags are

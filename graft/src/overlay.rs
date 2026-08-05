@@ -322,12 +322,13 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
 
     // Prune each source object; collect the pruned-.o paths.
     let t_prune_start = std::time::Instant::now();
-    // Hosted x86: pruned objects also keep their unwind sections so
-    // overlay code gets FDE coverage in the combined image (see
-    // ehframe.rs). Not on xtensa (panic=abort targets, no unwinder;
-    // linkall.x owns layout).
-    let keep_unwind = base.e_machine == object::elf::EM_X86_64;
-    let pruned = prune_all(&scan, &closure, &resolver, &work_dir, keep_unwind)?;
+    // Hosted x86: pruned objects also keep their unwind sections (FDE
+    // coverage in the combined image — see ehframe.rs) and their
+    // `.debug_*` sections (source-level debug info for re-emitted code
+    // — see combine::merge_debug_sections). Not on xtensa (panic=abort
+    // targets; linkall.x owns layout; debug merge unvalidated there).
+    let hosted_extras = base.e_machine == object::elf::EM_X86_64;
+    let pruned = prune_all(&scan, &closure, &resolver, &work_dir, hosted_extras)?;
     let t_prune = t_prune_start.elapsed();
     let anchor_rewrites_total: usize = pruned.iter().map(|p| p.anchor_rewrites).sum();
     let kept_sec_total: usize = pruned.iter().map(|p| p.kept_sections).sum();
@@ -476,7 +477,21 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
         std::fs::write(&layout_script, b"/* xtensa: linkall.x carries the layout. */\n")
             .with_context(|| format!("write {}", layout_script.display()))?;
     } else {
-        write_overlay_layout_ld_splice(&layout_script, &slack, map_sections, tls_spec)?;
+        // Base's `.debug_*` sizes drive the concatenation-address trick
+        // (see the debug stanzas in the layout writer).
+        let debug_bases: Vec<(String, u64)> = {
+            use object::{Object as _, ObjectSection as _};
+            let elf = object::File::parse(&base_bytes_for_layout[..])
+                .context("parse base ELF for debug section sizes")?;
+            elf.sections()
+                .filter_map(|s| {
+                    let n = s.name().ok()?;
+                    (n.starts_with(".debug_") && n != ".debug_gdb_scripts")
+                        .then(|| (n.to_string(), s.size()))
+                })
+                .collect()
+        };
+        write_overlay_layout_ld_splice(&layout_script, &slack, map_sections, tls_spec, &debug_bases)?;
     }
 
     let overlay_elf = work_dir.join("overlay.elf");
@@ -710,7 +725,7 @@ fn prune_all(
     closure: &Closure,
     resolver: &crate::resolve::Resolver<'_>,
     work_dir: &Path,
-    keep_unwind: bool,
+    hosted_extras: bool,
 ) -> Result<Vec<PrunedEntry>> {
     // Group closure sections by object.
     let mut by_obj: HashMap<u32, HashSet<u32>> = HashMap::new();
@@ -734,12 +749,20 @@ fn prune_all(
     // (`.data.DW.ref.rust_eh_personality`) anchors like any other
     // unchanged data. ld then FDE-edits and builds the overlay's
     // `.eh_frame_hdr` exactly as it would in a full link.
-    if keep_unwind {
+    // Debug info rides the same way: every pruned object keeps its
+    // `.debug_*` sections (whole CUs — subsetting DIE trees is
+    // dsymutil-class surgery and unnecessary: relocs into sections the
+    // closure didn't keep tombstone to 0, exactly what ld does for
+    // gc'd code, and base's own DWARF still describes those unchanged
+    // functions). `.debug_gdb_scripts` is excluded — it's SHF_ALLOC,
+    // runtime-loaded, and closure-managed like any other section.
+    if hosted_extras {
         for (&obj_idx, keep_set) in by_obj.iter_mut() {
             for (idx, sec) in scan.objects[obj_idx as usize].sections.iter().enumerate() {
                 if sec.name == ".eh_frame"
                     || sec.name.starts_with(".eh_frame.")
                     || sec.name.starts_with(".gcc_except_table")
+                    || (sec.name.starts_with(".debug_") && sec.name != ".debug_gdb_scripts")
                 {
                     keep_set.insert(idx as u32);
                 }
@@ -946,6 +969,7 @@ fn write_overlay_layout_ld_splice(
     slack: &Slack,
     maps: &[crate::basemap::MapSection],
     tls: Option<crate::basemap::TlsMapSpec>,
+    debug_bases: &[(String, u64)],
 ) -> Result<()> {
     let mut stanzas: Vec<(u64, String)> = Vec::new();
     stanzas.push((
@@ -1034,6 +1058,22 @@ fn write_overlay_layout_ld_splice(
         "  .graft.audit.initfini 0 (INFO) : { *(.init_array*) *(.fini_array*) \
          *(.preinit_array*) *(.ctors*) *(.dtors*) }\n",
     ));
+    // Debug-merge address trick: each `.debug_X` output section is
+    // assigned ADDRESS = size of base's `.debug_X` (non-alloc via
+    // `(INFO)`). Every cross-section DWARF offset — strp into
+    // .debug_str, DW_AT_stmt_list into .debug_line, abbrev_offset,
+    // DWARF5 str_offsets/addr bases — is populated by an ordinary
+    // relocation resolved as `section address + addend`, so ld emits
+    // overlay debug content whose offsets are already correct for a
+    // world where it sits concatenated AFTER base's sections. Combine
+    // then does exactly that concatenation (merge_debug_sections) —
+    // no DWARF is ever parsed. Overlay-only debug sections base lacks
+    // have no stanza and orphan-place non-alloc at 0 (self-consistent;
+    // combine skips them with a note).
+    for (name, base_len) in debug_bases {
+        use std::fmt::Write as _;
+        let _ = writeln!(script, "  {name} {base_len:#x} (INFO) : {{ *({name}) }}");
+    }
     // Deliberate discards — each entry has an argument, not a wildcard:
     //   .note.gnu.build-id: ld synthesizes overlay.elf's own id when the
     //     forwarded argv carries --build-id; overlay identity is
