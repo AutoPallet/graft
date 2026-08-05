@@ -537,6 +537,14 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
         if let Some(spec) = tls_spec {
             verify_tls_geometry(&overlay_bytes, &spec, base.tls.unwrap())?;
         }
+        // Hosted only: the generated layout script defines the closed
+        // set of output sections, so anything outside it is an orphan
+        // ld placed by guesswork — refuse. On xtensa the layout comes
+        // from linkall.x and combine's live-base landing check remains
+        // the guard.
+        if xtensa_layout.is_none() {
+            check_overlay_sections(&overlay_bytes, &base_bytes_for_layout)?;
+        }
         // Stamp which base this overlay binds to, so a standalone
         // `graft combine` against a different base (geometrically
         // plausible, semantically stale everywhere) refuses.
@@ -920,6 +928,7 @@ fn write_overlay_layout_ld_splice(
         format!(
             "  . = {:#x};\n  .rodata : {{ *(.rodata .rodata.* .rodata..L*) }}\n  \
              .data.rel.ro : {{ *(.data.rel.ro .data.rel.ro.* .data.rel.ro..L*) }}\n  \
+             .debug_gdb_scripts : {{ *(.debug_gdb_scripts) }}\n  \
              _graft_rodata_end = .;\n",
             slack.rodata_start
         ),
@@ -927,11 +936,17 @@ fn write_overlay_layout_ld_splice(
     // Re-emitted mutable statics land in the data slack. `.data`
     // (PROGBITS) splices its initializer bytes; `.bss` (NOBITS, placed
     // after — file-offset rules) gets no splice write and reads the
-    // slack's own zero fill as its initial value.
+    // slack's own zero fill as its initial value. `.got`/`.got.plt`
+    // are placed explicitly: ld relaxes most GOTPCRELX refs to direct
+    // `lea` so the section is usually absent, but a non-relaxable GOT
+    // ref would otherwise orphan-place at an ld-chosen address —
+    // deterministic placement beats orphan luck (audited by
+    // `check_overlay_sections`).
     stanzas.push((
         slack.data_start,
         format!(
-            "  . = {:#x};\n  .data : {{ *(.data .data.*) }}\n  \
+            "  . = {:#x};\n  .got : {{ *(.got .got.plt) }}\n  \
+             .data : {{ *(.data .data.*) }}\n  \
              .bss : {{ *(.bss .bss.* COMMON) }}\n  _graft_data_end = .;\n",
             slack.data_start
         ),
@@ -962,9 +977,50 @@ fn write_overlay_layout_ld_splice(
     for (_, s) in &stanzas {
         script.push_str(s);
     }
+    // Audit collectors: metadata sections the combined image does NOT
+    // take from the overlay, gathered into non-alloc (INFO) sections at
+    // address 0 instead of being /DISCARD/ed, so `check_overlay_sections`
+    // can verify post-link that dropping them is lossless (byte-equal /
+    // string-subset against base's counterpart). `(INFO)` keeps them out
+    // of every PT_LOAD; combine ignores non-alloc sections, so they ride
+    // along in overlay.elf only. The init/fini collector must be EMPTY:
+    // ctor/dtor drift is refused upstream by the boot fingerprint, and a
+    // non-empty collector here means an entry slipped past it — an
+    // appended entry would be silently outside base's baked
+    // `__init_array_start/end` walk, so fail the link instead.
+    // (`.debug_gdb_scripts` is NOT audited-and-dropped: rustc's `main`
+    // shim volatile-loads its first byte at runtime to keep it alive,
+    // so it's a closure section that must be placed at a mapped
+    // address — it gets an explicit rodata-block stanza above. Moving
+    // it to an INFO collector segfaulted the combined image.)
+    script.push_str(concat!(
+        "  .graft.audit.note.gnu.property 0 (INFO) : { *(.note.gnu.property) }\n",
+        "  .graft.audit.note.ABI-tag 0 (INFO) : { *(.note.ABI-tag) }\n",
+        "  .graft.audit.initfini 0 (INFO) : { *(.init_array*) *(.fini_array*) \
+         *(.preinit_array*) *(.ctors*) *(.dtors*) }\n",
+    ));
+    // Deliberate discards — each entry has an argument, not a wildcard:
+    //   .eh_frame/.eh_frame_hdr/.gcc_except_table: overlay unwind is a
+    //     known gap (README limitations); legitimately differs from base
+    //     so no equality audit is possible.
+    //   .note.gnu.build-id: ld synthesizes overlay.elf's own id when the
+    //     forwarded argv carries --build-id; overlay identity is
+    //     graft-composed (blake3(base‖overlay)), the ld one is noise.
+    //   .note.GNU-stack: zero-size executable-stack marker for .o files.
+    //   .comment / .gnu_debuglink: toolchain version strings / debug-file
+    //     pointer; no runtime reads, combined image keeps base's.
+    // Anything NOT named here (e.g. an unknown future .note.*) stays an
+    // orphan and is refused by check_overlay_sections — "we didn't think
+    // about this" must fail loud, not vanish into a wildcard.
     script.push_str(
-        "  /DISCARD/ : { *(.eh_frame .eh_frame_hdr .gcc_except_table* \
-         .note.* .comment .gnu_debuglink) }\n}\n",
+        "  /DISCARD/ : { *(.eh_frame .eh_frame_hdr .gcc_except_table*) \
+         *(.note.gnu.build-id) *(.note.GNU-stack) *(.comment) *(.gnu_debuglink) }\n}\n",
+    );
+    script.push_str(
+        "ASSERT(SIZEOF(.graft.audit.initfini) == 0, \"overlay emitted \
+         .init_array/.fini_array entries — ctor/dtor changes cannot be overlaid \
+         (base's aggregator walk is baked); this should have been refused by the \
+         boot fingerprint, please report\")\n",
     );
     use std::fmt::Write as _;
     let _ = writeln!(
@@ -992,6 +1048,107 @@ fn write_overlay_layout_ld_splice(
         );
     }
     std::fs::write(path, script).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+/// Post-link audit of the overlay ELF's section population (hosted
+/// splice layout only — the generated script defines a closed set of
+/// output sections, which is what makes this check meaningful).
+///
+/// Two invariants, both "verified, not argued" (same posture as
+/// GRAFT_ICF_VERIFY / GRAFT_ANCHOR_VERIFY):
+///
+/// 1. **Orphan closure.** Every SHF_ALLOC section must be one the
+///    layout script explicitly placed. An unknown alloc section means
+///    ld orphan-placed it at a guessed address — it may have landed
+///    harmlessly inside slack *this time*, but nothing audited that.
+///    (Found in the wild: `.debug_gdb_scripts` rode orphan placement
+///    into rodata slack for who knows how long — and it's genuinely
+///    load-bearing: rustc's `main` shim volatile-loads its first byte,
+///    so it now has an explicit placement stanza.)
+///
+/// 2. **Audit-equality of dropped metadata.** The script collects
+///    metadata sections the combined image won't take from the overlay
+///    into non-alloc `.graft.audit.*` sections instead of discarding
+///    them, and this check proves dropping is lossless: byte-equal to
+///    base's counterpart (absent base section == empty).
+///    `.note.gnu.property` is the
+///    motivating case: it carries x86 CET/IBT feature bits with
+///    AND-merge semantics, and the loader enforces from *base's* note —
+///    overlay code built under drifted property bits must refuse, and
+///    no other guard (toolchain_stamp is recorded-not-enforced, the
+///    argv guard covers linker argv only) would catch it.
+fn check_overlay_sections(overlay_bytes: &[u8], base_bytes: &[u8]) -> Result<()> {
+    use object::{Object, ObjectSection};
+    const SHF_ALLOC_U64: u64 = object::elf::SHF_ALLOC as u64;
+    // Output sections the generated splice script places (plus the
+    // base-map prefix). Keep in lockstep with
+    // `write_overlay_layout_ld_splice`.
+    const PLACED: &[&str] = &[
+        ".text", ".rodata", ".data.rel.ro", ".debug_gdb_scripts", ".got", ".data", ".bss",
+        ".tdata", ".tbss",
+    ];
+    let overlay = object::File::parse(overlay_bytes).context("parse overlay ELF for audit")?;
+    let base = object::File::parse(base_bytes).context("parse base ELF for audit")?;
+    let base_section = |name: &str| -> Option<Vec<u8>> {
+        base.section_by_name(name)
+            .and_then(|s| s.data().ok().map(|d| d.to_vec()))
+    };
+    for sec in overlay.sections() {
+        let Ok(name) = sec.name() else { continue };
+        let object::SectionFlags::Elf { sh_flags } = sec.flags() else { continue };
+        if sh_flags & SHF_ALLOC_U64 != 0 {
+            if PLACED.contains(&name) || name.starts_with(".graft.map.") {
+                continue;
+            }
+            bail!(
+                "graft overlay audit: alloc section `{name}` ({:#x}+{:#x}) is not \
+                 placed by the overlay layout script — ld orphan-placed it at a \
+                 guessed address. Add an explicit stanza (placement, audit \
+                 collector, or argued /DISCARD/ entry) in \
+                 write_overlay_layout_ld_splice before trusting this link.",
+                sec.address(),
+                sec.size(),
+            );
+        }
+        let Some(counterpart) = name.strip_prefix(".graft.audit.") else { continue };
+        let data = sec.data().context("read audit section")?;
+        match counterpart {
+            "initfini" => {
+                // Primary guard is the script ASSERT; this is the
+                // belt-and-braces re-check.
+                if !data.is_empty() {
+                    bail!(
+                        "graft overlay audit: overlay emitted {} byte(s) of \
+                         .init_array/.fini_array content — ctor/dtor changes \
+                         cannot be overlaid (base's aggregator walk is baked)",
+                        data.len()
+                    );
+                }
+            }
+            base_name => {
+                // Note sections: exact byte equality against base's
+                // same-named section (absent == empty). ld has already
+                // applied its note-merge semantics to the overlay's
+                // inputs, so this compares post-merge artifacts — the
+                // level the runtime consumes.
+                let expect = base_section(&format!(".{base_name}")).unwrap_or_default();
+                if data != expect.as_slice() {
+                    bail!(
+                        "graft overlay audit: .{base_name} differs between overlay \
+                         ({} bytes) and base ({} bytes) — the combined image keeps \
+                         base's copy, and it would misdescribe overlay code (for \
+                         .note.gnu.property: the loader enforces base's CET/IBT \
+                         claims on overlay code that was built differently). \
+                         Rebuild the base (GRAFT_REBASE=1) with the current \
+                         toolchain instead.",
+                        data.len(),
+                        expect.len(),
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2350,6 +2507,67 @@ fn render_blockers_ld_esp_idf(ram: &RamUsage) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal ELF with exactly-controlled section names, sh_flags and
+    /// bytes, for exercising `check_overlay_sections`.
+    fn fake_elf(sections: &[(&str, u64, &[u8])]) -> Vec<u8> {
+        use object::write::Object as WObject;
+        let mut obj = WObject::new(
+            object::BinaryFormat::Elf,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        for (name, sh_flags, data) in sections {
+            let id = obj.add_section(Vec::new(), name.as_bytes().to_vec(), object::SectionKind::Data);
+            obj.section_mut(id).set_data(data.to_vec(), 1);
+            obj.section_mut(id).flags = object::write::SectionFlags::Elf { sh_flags: *sh_flags };
+        }
+        obj.write().unwrap()
+    }
+
+    const ALLOC: u64 = object::elf::SHF_ALLOC as u64;
+
+    #[test]
+    fn audit_placed_sections_and_empty_audits_pass() {
+        let base = fake_elf(&[(".text", ALLOC, b"\x90")]);
+        let overlay = fake_elf(&[
+            (".text", ALLOC, b"\x90"),
+            (".got", ALLOC, b"\0\0\0\0\0\0\0\0"),
+            (".graft.map.0", ALLOC, b""),
+            (".graft.audit.note.gnu.property", 0, b""),
+            (".graft.audit.initfini", 0, b""),
+        ]);
+        check_overlay_sections(&overlay, &base).unwrap();
+    }
+
+    #[test]
+    fn audit_orphan_alloc_section_refuses() {
+        let base = fake_elf(&[(".text", ALLOC, b"\x90")]);
+        let overlay = fake_elf(&[(".note.mystery", ALLOC, b"\x01")]);
+        let err = check_overlay_sections(&overlay, &base).unwrap_err().to_string();
+        assert!(err.contains(".note.mystery") && err.contains("orphan"), "{err}");
+    }
+
+    #[test]
+    fn audit_note_property_drift_refuses_and_equality_passes() {
+        // Base lacks the note, overlay carries one → refuse.
+        let base = fake_elf(&[(".text", ALLOC, b"\x90")]);
+        let overlay =
+            fake_elf(&[(".graft.audit.note.gnu.property", 0, b"\x04\0\0\0feat")]);
+        let err = check_overlay_sections(&overlay, &base).unwrap_err().to_string();
+        assert!(err.contains("note.gnu.property"), "{err}");
+        // Byte-identical counterpart in base → pass.
+        let base_eq = fake_elf(&[(".note.gnu.property", ALLOC, b"\x04\0\0\0feat")]);
+        check_overlay_sections(&overlay, &base_eq).unwrap();
+    }
+
+    #[test]
+    fn audit_initfini_content_refuses() {
+        let base = fake_elf(&[(".text", ALLOC, b"\x90")]);
+        let overlay = fake_elf(&[(".graft.audit.initfini", 0, b"\0\0\0\0\0\0\0\0")]);
+        let err = check_overlay_sections(&overlay, &base).unwrap_err().to_string();
+        assert!(err.contains("init_array"), "{err}");
+    }
 
     /// Build a scan over one synthesized object: changed `main`
     /// (`.text.main`, reloc → X) plus mutable static X (`.bss.X`,
