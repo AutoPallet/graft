@@ -323,12 +323,21 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
     // Prune each source object; collect the pruned-.o paths.
     let t_prune_start = std::time::Instant::now();
     // Hosted x86: pruned objects also keep their unwind sections (FDE
-    // coverage in the combined image — see ehframe.rs) and their
-    // `.debug_*` sections (source-level debug info for re-emitted code
-    // — see combine::merge_debug_sections). Not on xtensa (panic=abort
-    // targets; linkall.x owns layout; debug merge unvalidated there).
-    let hosted_extras = base.e_machine == object::elf::EM_X86_64;
-    let pruned = prune_all(&scan, &closure, &resolver, &work_dir, hosted_extras)?;
+    // coverage in the combined image — see ehframe.rs). Unwind stays
+    // x86-only: the panic=abort embedded targets have no unwinder and
+    // no PT_GNU_EH_FRAME to merge into.
+    let keep_unwind = base.e_machine == object::elf::EM_X86_64;
+    // Both targets: pruned objects keep their `.debug_*` sections
+    // (source-level debug info for re-emitted code — see
+    // combine::merge_debug_sections). On xtensa this is what makes a
+    // coredump/JTAG gdb resolve symbols+lines inside overlaid
+    // functions; rcgu debug relocs there are plain R_XTENSA_32, the
+    // same absolute S+A shape the concatenation trick relies on.
+    let keep_dwarf = matches!(
+        base.e_machine,
+        object::elf::EM_X86_64 | object::elf::EM_XTENSA
+    );
+    let pruned = prune_all(&scan, &closure, &resolver, &work_dir, keep_unwind, keep_dwarf)?;
     let t_prune = t_prune_start.elapsed();
     let anchor_rewrites_total: usize = pruned.iter().map(|p| p.anchor_rewrites).sum();
     let kept_sec_total: usize = pruned.iter().map(|p| p.kept_sections).sum();
@@ -479,18 +488,7 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
     } else {
         // Base's `.debug_*` sizes drive the concatenation-address trick
         // (see the debug stanzas in the layout writer).
-        let debug_bases: Vec<(String, u64)> = {
-            use object::{Object as _, ObjectSection as _};
-            let elf = object::File::parse(&base_bytes_for_layout[..])
-                .context("parse base ELF for debug section sizes")?;
-            elf.sections()
-                .filter_map(|s| {
-                    let n = s.name().ok()?;
-                    (n.starts_with(".debug_") && n != ".debug_gdb_scripts")
-                        .then(|| (n.to_string(), s.size()))
-                })
-                .collect()
-        };
+        let debug_bases = debug_section_bases(&base_bytes_for_layout)?;
         write_overlay_layout_ld_splice(&layout_script, &slack, map_sections, tls_spec, &debug_bases)?;
     }
 
@@ -725,7 +723,8 @@ fn prune_all(
     closure: &Closure,
     resolver: &crate::resolve::Resolver<'_>,
     work_dir: &Path,
-    hosted_extras: bool,
+    keep_unwind: bool,
+    keep_dwarf: bool,
 ) -> Result<Vec<PrunedEntry>> {
     // Group closure sections by object.
     let mut by_obj: HashMap<u32, HashSet<u32>> = HashMap::new();
@@ -736,9 +735,9 @@ fn prune_all(
         }
     }
 
-    // Unwind coverage for re-emitted code (hosted x86): every pruned
-    // object additionally keeps its `.eh_frame` / `.gcc_except_table*`
-    // sections. These are physical keep-set additions, NOT closure
+    // Unwind coverage for re-emitted code (keep_unwind, hosted x86):
+    // every pruned object additionally keeps its `.eh_frame` /
+    // `.gcc_except_table*` sections. These are physical keep-set additions, NOT closure
     // members — closure semantics (and every hash) are untouched. An
     // rcgu's `.eh_frame` is object-granular and references *all* of the
     // object's functions; prune's normal reloc disposition sorts the
@@ -749,21 +748,23 @@ fn prune_all(
     // (`.data.DW.ref.rust_eh_personality`) anchors like any other
     // unchanged data. ld then FDE-edits and builds the overlay's
     // `.eh_frame_hdr` exactly as it would in a full link.
-    // Debug info rides the same way: every pruned object keeps its
+    // Debug info rides the same way (keep_dwarf, x86 + xtensa): every
+    // pruned object keeps its
     // `.debug_*` sections (whole CUs — subsetting DIE trees is
     // dsymutil-class surgery and unnecessary: relocs into sections the
     // closure didn't keep tombstone to 0, exactly what ld does for
     // gc'd code, and base's own DWARF still describes those unchanged
     // functions). `.debug_gdb_scripts` is excluded — it's SHF_ALLOC,
     // runtime-loaded, and closure-managed like any other section.
-    if hosted_extras {
+    if keep_unwind || keep_dwarf {
         for (&obj_idx, keep_set) in by_obj.iter_mut() {
             for (idx, sec) in scan.objects[obj_idx as usize].sections.iter().enumerate() {
-                if sec.name == ".eh_frame"
+                let unwind = sec.name == ".eh_frame"
                     || sec.name.starts_with(".eh_frame.")
-                    || sec.name.starts_with(".gcc_except_table")
-                    || (sec.name.starts_with(".debug_") && sec.name != ".debug_gdb_scripts")
-                {
+                    || sec.name.starts_with(".gcc_except_table");
+                let dwarf =
+                    sec.name.starts_with(".debug_") && sec.name != ".debug_gdb_scripts";
+                if (keep_unwind && unwind) || (keep_dwarf && dwarf) {
                     keep_set.insert(idx as u32);
                 }
             }
@@ -1058,22 +1059,8 @@ fn write_overlay_layout_ld_splice(
         "  .graft.audit.initfini 0 (INFO) : { *(.init_array*) *(.fini_array*) \
          *(.preinit_array*) *(.ctors*) *(.dtors*) }\n",
     ));
-    // Debug-merge address trick: each `.debug_X` output section is
-    // assigned ADDRESS = size of base's `.debug_X` (non-alloc via
-    // `(INFO)`). Every cross-section DWARF offset — strp into
-    // .debug_str, DW_AT_stmt_list into .debug_line, abbrev_offset,
-    // DWARF5 str_offsets/addr bases — is populated by an ordinary
-    // relocation resolved as `section address + addend`, so ld emits
-    // overlay debug content whose offsets are already correct for a
-    // world where it sits concatenated AFTER base's sections. Combine
-    // then does exactly that concatenation (merge_debug_sections) —
-    // no DWARF is ever parsed. Overlay-only debug sections base lacks
-    // have no stanza and orphan-place non-alloc at 0 (self-consistent;
-    // combine skips them with a note).
-    for (name, base_len) in debug_bases {
-        use std::fmt::Write as _;
-        let _ = writeln!(script, "  {name} {base_len:#x} (INFO) : {{ *({name}) }}");
-    }
+    // Debug-merge address trick — see `render_debug_stanzas`.
+    script.push_str(&render_debug_stanzas(debug_bases));
     // Deliberate discards — each entry has an argument, not a wildcard:
     //   .note.gnu.build-id: ld synthesizes overlay.elf's own id when the
     //     forwarded argv carries --build-id; overlay identity is
@@ -2285,6 +2272,47 @@ fn collect_l_paths(argv: &[String]) -> Vec<PathBuf> {
     paths
 }
 
+/// Names + sizes of base's `.debug_*` sections (sans
+/// `.debug_gdb_scripts` — SHF_ALLOC, runtime-loaded, closure-managed).
+/// Each size becomes the ADDRESS assigned to the same-named overlay
+/// debug output section so ld resolves every cross-section DWARF
+/// offset concatenation-correct (see `render_debug_stanzas`).
+fn debug_section_bases(base_bytes: &[u8]) -> Result<Vec<(String, u64)>> {
+    use object::{Object as _, ObjectSection as _};
+    let elf =
+        object::File::parse(base_bytes).context("parse base ELF for debug section sizes")?;
+    Ok(elf
+        .sections()
+        .filter_map(|s| {
+            let n = s.name().ok()?;
+            (n.starts_with(".debug_") && n != ".debug_gdb_scripts")
+                .then(|| (n.to_string(), s.size()))
+        })
+        .collect())
+}
+
+/// Output-section statements (SECTIONS-body context) implementing the
+/// debug-merge address trick: each `.debug_X` output section is
+/// assigned ADDRESS = size of base's `.debug_X`, non-alloc via
+/// `(INFO)`. Every cross-section DWARF offset — strp into .debug_str,
+/// DW_AT_stmt_list into .debug_line, abbrev_offset, DWARF5
+/// str_offsets/addr bases — is populated by an ordinary relocation
+/// resolved as `section address + addend`, so ld emits overlay debug
+/// content whose offsets are already correct for a world where it sits
+/// concatenated AFTER base's sections. Combine then does exactly that
+/// concatenation (merge_debug_sections) — no DWARF is ever parsed.
+/// Overlay-only debug sections base lacks have no stanza and
+/// orphan-place non-alloc at 0 (self-consistent; combine skips them
+/// with a note).
+fn render_debug_stanzas(debug_bases: &[(String, u64)]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for (name, base_len) in debug_bases {
+        let _ = writeln!(out, "  {name} {base_len:#x} (INFO) : {{ *({name}) }}");
+    }
+    out
+}
+
 fn setup_xtensa_layout(
     work_dir: &Path,
     base_bytes: &[u8],
@@ -2292,6 +2320,7 @@ fn setup_xtensa_layout(
 ) -> Result<XtensaLayout> {
     let slack = compute_slack(base_bytes)?;
     let ram = compute_xtensa_ram_usage(base_bytes)?;
+    let debug_stanzas = render_debug_stanzas(&debug_section_bases(base_bytes)?);
     let (layout, search_paths) = Layout::detect(argv)?;
 
     match &layout {
@@ -2308,7 +2337,7 @@ fn setup_xtensa_layout(
             std::fs::write(work_dir.join("esp32s3.x"), esp_mutated)
                 .with_context(|| format!("write {}/esp32s3.x", work_dir.display()))?;
 
-            let blockers = render_blockers_ld_esp_hal(&ram);
+            let blockers = render_blockers_ld_esp_hal(&ram, &debug_stanzas);
             std::fs::write(work_dir.join("graft_blockers.ld"), blockers)
                 .with_context(|| format!("write {}/graft_blockers.ld", work_dir.display()))?;
         }
@@ -2325,7 +2354,7 @@ fn setup_xtensa_layout(
             std::fs::write(work_dir.join("sections.ld"), sections_mutated)
                 .with_context(|| format!("write {}/sections.ld", work_dir.display()))?;
 
-            let blockers = render_blockers_ld_esp_idf(&ram);
+            let blockers = render_blockers_ld_esp_idf(&ram, &debug_stanzas);
             std::fs::write(work_dir.join("graft_blockers.ld"), blockers)
                 .with_context(|| format!("write {}/graft_blockers.ld", work_dir.display()))?;
         }
@@ -2547,14 +2576,17 @@ fn compute_xtensa_ram_usage(base_bytes: &[u8]) -> Result<RamUsage> {
 /// is handled by `mutate_esp32s3_x` INCLUDEing this script before
 /// the SECTIONS block that pulls in `rwtext.x`. (DRAM uses slack-
 /// reservation via `mutate_memory_x`; no IRAM-style blocker.)
-fn render_blockers_ld_esp_hal(ram: &RamUsage) -> String {
+fn render_blockers_ld_esp_hal(ram: &RamUsage, debug_stanzas: &str) -> String {
     format!(
         "/* graft overlay (esp-hal): reserve base's used IRAM bytes \
-         so overlay's `.rwtext` lands at a fresh vaddr past base. */\n\
+         so overlay's `.rwtext` lands at a fresh vaddr past base. \
+         Debug stanzas: concatenation-addressed `.debug_*` — see \
+         render_debug_stanzas. */\n\
          SECTIONS {{\n  \
          .graft_iram_blocker (NOLOAD) : {{\n    \
          . = . + {iram:#x};\n  \
          }} > iram_seg\n\
+         {debug_stanzas}\
          }}\n",
         iram = ram.iram_blocker_bytes,
     )
@@ -2564,14 +2596,21 @@ fn render_blockers_ld_esp_hal(ram: &RamUsage) -> String {
 /// BEFORE `.iram0.vectors` (the first section in iram0_0_seg in
 /// esp-idf's sections.ld). Same effect as the esp-hal blocker — eat
 /// base's used IRAM so overlay's IRAM clauses land past it.
-fn render_blockers_ld_esp_idf(ram: &RamUsage) -> String {
+fn render_blockers_ld_esp_idf(ram: &RamUsage, debug_stanzas: &str) -> String {
+    // This file is INCLUDEd inside sections.ld's SECTIONS block
+    // (mutate_sections_ld), so statements here are SECTIONS-body
+    // context — no SECTIONS wrapper. The vendor script has no
+    // `.debug_*` rules of its own, so the stanzas conflict with
+    // nothing (base's debug sections were orphan-placed).
     format!(
         "/* graft overlay (esp-idf): reserve base's used IRAM bytes \
          so overlay's `.iram0.text` / `.iram0.vectors` etc. land at \
-         fresh vaddrs past base. */\n\
+         fresh vaddrs past base. Debug stanzas: concatenation-addressed \
+         `.debug_*` — see render_debug_stanzas. */\n\
          .graft_iram_blocker (NOLOAD) : {{\n  \
          . = . + {iram:#x};\n\
-         }} > iram0_0_seg\n",
+         }} > iram0_0_seg\n\
+         {debug_stanzas}",
         iram = ram.iram_blocker_bytes,
     )
 }
@@ -2814,6 +2853,25 @@ MEMORY
             tls: None,
         };
         assert!(mutate_memory_x(input, &slack).is_err());
+    }
+
+    #[test]
+    fn blockers_carry_concatenation_addressed_debug_stanzas() {
+        let ram = RamUsage { iram_blocker_bytes: 0x100 };
+        let stanzas = render_debug_stanzas(&[
+            (".debug_info".to_string(), 0x232def),
+            (".debug_str".to_string(), 0x182cb8),
+        ]);
+        // esp-hal: blockers file is INCLUDEd at top level — stanzas
+        // must sit inside its own SECTIONS wrapper.
+        let hal = render_blockers_ld_esp_hal(&ram, &stanzas);
+        assert!(hal.contains(".debug_info 0x232def (INFO) : { *(.debug_info) }"));
+        assert!(hal.find("SECTIONS {").unwrap() < hal.find(".debug_info").unwrap());
+        // esp-idf: blockers content is INCLUDEd inside sections.ld's
+        // SECTIONS block — raw statements, no SECTIONS wrapper.
+        let idf = render_blockers_ld_esp_idf(&ram, &stanzas);
+        assert!(idf.contains(".debug_str 0x182cb8 (INFO) : { *(.debug_str) }"));
+        assert!(!idf.contains("SECTIONS"));
     }
 
     #[test]

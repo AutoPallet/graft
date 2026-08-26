@@ -466,7 +466,8 @@ kept functions, the overlay links them at final slack addresses, and
 combine merges base's and overlay's `.eh_frame_hdr` binary-search
 tables into fresh rodata slack, repointing `PT_GNU_EH_FRAME`
 (`ehframe.rs`; pinned by the `overlay_unwind_through_edited_code`
-e2e). Source-level debug info for changed code works too: pruned
+e2e). Source-level debug info for changed code works on both targets
+(x86 and xtensa): pruned
 objects keep their whole `.debug_*` sections (relocs into kept
 sections wire to true slack addresses; everything else tombstones to
 0, ld's own convention for gc'd code — base's DWARF still describes
@@ -475,12 +476,20 @@ address = size of base's counterpart (`(INFO)`, non-alloc), which
 makes ld resolve every cross-section DWARF offset as-if concatenated
 after base's — and combine then performs exactly that concatenation
 (`merge_debug_sections`: append `base ++ overlay` at EOF, repoint the
-shdr; no DWARF parsed anywhere). GDB sees an edited function as a
+shdr; no DWARF parsed anywhere). On hosted x86 the stanzas live in
+graft's own layout script; on xtensa they're injected through
+`graft_blockers.ld` into the (mutated) vendor scripts, which carry no
+`.debug_*` rules of their own — and xtensa rcgu debug relocs are
+plain `R_XTENSA_32`, the same absolute `S+A` shape the trick relies
+on. GDB sees an edited function as a
 multi-location breakpoint — stale base copy plus live slack copy, and
 only the live one ever fires — with correct lines on both (pinned by
-`overlay_debug_info_merges_into_combined`). The combined ELF grows by
+`overlay_debug_info_merges_into_combined`), and a coredump or JTAG
+session resolves a crash address inside an edited function to the
+right symbol and line through the overlay's CUs. The combined ELF
+grows by
 about the size of base's debug sections (dead file space where they
-used to live); the loaded image is untouched. The remaining costs
+used to live); the loaded/flashed image is untouched. The remaining costs
 concentrate in what changed:
 - **ICF skews attribution, not behavior.** With `GRAFT_ICF=1` the
   collected duplicates vanish from base's symtab, so backtraces,
