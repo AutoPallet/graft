@@ -486,8 +486,12 @@ multi-location breakpoint — stale base copy plus live slack copy, and
 only the live one ever fires — with correct lines on both (pinned by
 `overlay_debug_info_merges_into_combined`), and a coredump or JTAG
 session resolves a crash address inside an edited function to the
-right symbol and line through the overlay's CUs. The combined ELF
-grows by
+right symbol and line through the overlay's CUs. The `.symtab` is
+merged the same way (`merge_symtab`: rebuild `symtab ++ strtab` at
+EOF, repoint the shdrs, locals-before-globals preserved), so
+symtab-only consumers — nm, `addr2line -f`, nearest-preceding-symbol
+sweeps — also name grafted code instead of whatever base symbol
+precedes the slack region. The combined ELF grows by
 about the size of base's debug sections (dead file space where they
 used to live); the loaded/flashed image is untouched. The remaining costs
 concentrate in what changed:

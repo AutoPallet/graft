@@ -758,6 +758,56 @@ fn overlay_debug_info_merges_into_combined() {
         log.contains("debug section(s)"),
         "no debug-merge note in graft log:\n{log}"
     );
+
+    // Symtab merge (the symtab twin of the DWARF merge): the edited
+    // function's overlay copy must be a named FUNC symbol at its slack
+    // address, alongside base's stale copy — so nm/addr2line-class
+    // tools (which never read DWARF) name grafted code.
+    {
+        use object::{Object, ObjectSymbol, SymbolKind};
+        let elf = object::File::parse(&combined_bytes[..]).unwrap();
+        let computes: Vec<(u64, SymbolKind)> = elf
+            .symbols()
+            .filter(|s| s.name().is_ok_and(|n| n.contains("compute")))
+            .map(|s| (s.address(), s.kind()))
+            .collect();
+        let in_slack = |a: u64| a >= slack_start.0 && a < slack_start.1;
+        assert!(
+            computes.iter().any(|&(a, k)| k == SymbolKind::Text && in_slack(a)),
+            "no compute FUNC symbol at a slack address: {computes:x?}"
+        );
+        assert!(
+            computes.iter().any(|&(a, _)| !in_slack(a)),
+            "base's stale compute symbol vanished: {computes:x?}"
+        );
+    }
+    // The complaint-driving consumer: addr2line -f on a slack pc must
+    // name the function, not whatever base symbol precedes the slack.
+    let slack_compute_addr = {
+        use object::{Object, ObjectSymbol};
+        let elf = object::File::parse(&combined_bytes[..]).unwrap();
+        elf.symbols()
+            .find(|s| {
+                s.name().is_ok_and(|n| n.contains("compute"))
+                    && s.address() >= slack_start.0
+                    && s.address() < slack_start.1
+            })
+            .map(|s| s.address())
+            .unwrap()
+    };
+    let a2l = Command::new("addr2line")
+        .args(["-f", "-e", &fx.app_bin().to_string_lossy(), &format!("{slack_compute_addr:#x}")])
+        .output()
+        .expect("spawn addr2line (binutils required for this pin)");
+    let a2l_out = String::from_utf8_lossy(&a2l.stdout).into_owned();
+    assert!(
+        a2l_out.contains("compute"),
+        "addr2line names a slack pc wrong:\n{a2l_out}"
+    );
+    assert!(
+        log.contains("overlay symbol(s) into .symtab"),
+        "no symtab-merge note in graft log:\n{log}"
+    );
 }
 
 /// Argv guard (schema v11): a linker-flag change between base and

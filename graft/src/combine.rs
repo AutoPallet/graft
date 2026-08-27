@@ -36,7 +36,10 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use object::{
     Object, ObjectSection, ObjectSymbol, SectionFlags,
-    elf::{PT_GNU_EH_FRAME, PT_LOAD, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_PROGBITS},
+    elf::{
+        PT_GNU_EH_FRAME, PT_LOAD, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_ABS, SHN_LORESERVE,
+        SHN_UNDEF, SHT_NULL, SHT_PROGBITS, SHT_SYMTAB, STT_FILE, STT_SECTION, STT_TLS,
+    },
 };
 
 use crate::{elf_attach, metadata};
@@ -399,6 +402,27 @@ fn combine_splice(
             output_path,
             &format!(
                 "graft combine: merged {dbg_merged} debug section(s), {dbg_bytes} bytes appended"
+            ),
+        );
+    }
+
+    // Symbol table: append the overlay's slack/appended-load symbols so
+    // symtab-only consumers (nm, addr2line -f, nearest-symbol sweeps)
+    // name grafted code — see merge_symtab. Non-alloc, file-level only.
+    let (syms_added, sym_bytes) = merge_symtab(
+        &mut out,
+        overlay_bytes,
+        class,
+        &slack_regions,
+        &append_loads,
+        output_path,
+    )?;
+    if syms_added > 0 {
+        crate::telemetry::note(
+            output_path,
+            &format!(
+                "graft combine: merged {syms_added} overlay symbol(s) into .symtab \
+                 ({sym_bytes} bytes appended)"
             ),
         );
     }
@@ -850,6 +874,320 @@ fn merge_debug_sections(
         appended += base_fsize + ov_size;
     }
     Ok((merged, appended))
+}
+
+/// Raw class-aware section header, read straight from the file bytes.
+/// The object crate's parsed view is deliberately not used here: symtab
+/// surgery needs exact field offsets for in-place patching, and the
+/// same decode must run against both the combined buffer and
+/// overlay.elf.
+struct RawShdr {
+    sh_type: u32,
+    sh_flags: u64,
+    sh_addr: u64,
+    sh_offset: u64,
+    sh_size: u64,
+    sh_link: u32,
+    sh_entsize: u64,
+}
+
+fn read_shdrs(bytes: &[u8], class: ElfClass) -> Result<(u64, usize, Vec<RawShdr>)> {
+    let (e_shoff, shentsize, shnum) = match class {
+        ElfClass::Elf32 => (
+            u32::from_le_bytes(bytes[0x20..0x24].try_into().unwrap()) as u64,
+            u16::from_le_bytes(bytes[0x2e..0x30].try_into().unwrap()) as usize,
+            u16::from_le_bytes(bytes[0x30..0x32].try_into().unwrap()) as usize,
+        ),
+        ElfClass::Elf64 => (
+            u64::from_le_bytes(bytes[0x28..0x30].try_into().unwrap()),
+            u16::from_le_bytes(bytes[0x3a..0x3c].try_into().unwrap()) as usize,
+            u16::from_le_bytes(bytes[0x3c..0x3e].try_into().unwrap()) as usize,
+        ),
+    };
+    if e_shoff == 0 || shnum == 0 {
+        bail!("ELF has no section header table");
+    }
+    let mut shdrs = Vec::with_capacity(shnum);
+    for i in 0..shnum {
+        let s = e_shoff as usize + i * shentsize;
+        let w32 = |a: usize| u32::from_le_bytes(bytes[s + a..s + a + 4].try_into().unwrap());
+        let w64 = |a: usize| u64::from_le_bytes(bytes[s + a..s + a + 8].try_into().unwrap());
+        shdrs.push(match class {
+            ElfClass::Elf32 => RawShdr {
+                sh_type: w32(0x4),
+                sh_flags: w32(0x8) as u64,
+                sh_addr: w32(0xc) as u64,
+                sh_offset: w32(0x10) as u64,
+                sh_size: w32(0x14) as u64,
+                sh_link: w32(0x18),
+                sh_entsize: w32(0x24) as u64,
+            },
+            ElfClass::Elf64 => RawShdr {
+                sh_type: w32(0x4),
+                sh_flags: w64(0x8),
+                sh_addr: w64(0x10),
+                sh_offset: w64(0x18),
+                sh_size: w64(0x20),
+                sh_link: w32(0x28),
+                sh_entsize: w64(0x38),
+            },
+        });
+    }
+    Ok((e_shoff, shentsize, shdrs))
+}
+
+/// Raw symtab entry, class-independent in-memory form.
+#[derive(Clone, Copy)]
+struct RawSym {
+    name_off: u32,
+    value: u64,
+    size: u64,
+    info: u8,
+    other: u8,
+    shndx: u16,
+}
+
+fn sym_entsize(class: ElfClass) -> u64 {
+    match class {
+        ElfClass::Elf32 => 16,
+        ElfClass::Elf64 => 24,
+    }
+}
+
+fn decode_syms(table: &[u8], class: ElfClass) -> Vec<RawSym> {
+    let ent = sym_entsize(class) as usize;
+    table
+        .chunks_exact(ent)
+        .map(|c| match class {
+            ElfClass::Elf32 => RawSym {
+                name_off: u32::from_le_bytes(c[0..4].try_into().unwrap()),
+                value: u32::from_le_bytes(c[4..8].try_into().unwrap()) as u64,
+                size: u32::from_le_bytes(c[8..12].try_into().unwrap()) as u64,
+                info: c[12],
+                other: c[13],
+                shndx: u16::from_le_bytes(c[14..16].try_into().unwrap()),
+            },
+            ElfClass::Elf64 => RawSym {
+                name_off: u32::from_le_bytes(c[0..4].try_into().unwrap()),
+                info: c[4],
+                other: c[5],
+                shndx: u16::from_le_bytes(c[6..8].try_into().unwrap()),
+                value: u64::from_le_bytes(c[8..16].try_into().unwrap()),
+                size: u64::from_le_bytes(c[16..24].try_into().unwrap()),
+            },
+        })
+        .collect()
+}
+
+fn encode_sym(out: &mut Vec<u8>, s: &RawSym, class: ElfClass) {
+    match class {
+        ElfClass::Elf32 => {
+            out.extend_from_slice(&s.name_off.to_le_bytes());
+            out.extend_from_slice(&(s.value as u32).to_le_bytes());
+            out.extend_from_slice(&(s.size as u32).to_le_bytes());
+            out.push(s.info);
+            out.push(s.other);
+            out.extend_from_slice(&s.shndx.to_le_bytes());
+        }
+        ElfClass::Elf64 => {
+            out.extend_from_slice(&s.name_off.to_le_bytes());
+            out.push(s.info);
+            out.push(s.other);
+            out.extend_from_slice(&s.shndx.to_le_bytes());
+            out.extend_from_slice(&s.value.to_le_bytes());
+            out.extend_from_slice(&s.size.to_le_bytes());
+        }
+    }
+}
+
+/// Merge the overlay's defined symbols into the combined `.symtab` so
+/// symtab-only consumers — nm, `addr2line -f`, nearest-preceding-symbol
+/// sweeps — resolve slack/appended pcs to real names instead of
+/// whatever base symbol happens to precede the slack region. DWARF
+/// answers gdb/coredump queries (`merge_debug_sections`); this answers
+/// every tool that never reads DWARF.
+///
+/// Mechanics mirror the debug merge: rebuild `.symtab` and `.strtab`
+/// at EOF and repoint their shdrs (both non-alloc — the loaded/flashed
+/// image is untouched; the old tables become dead file space). The
+/// rebuilt table is `[base locals] ++ [overlay locals] ++
+/// [base globals] ++ [overlay globals]` with `sh_info` recomputed, so
+/// the locals-before-globals invariant holds. Base entries are copied
+/// verbatim — including the stale symbols of edited functions' base
+/// copies, the same two-copy semantics the DWARF merge ships.
+///
+/// Overlay symbols come raw from overlay.elf's symtab (full
+/// st_info/st_other fidelity), filtered to: defined, not
+/// SECTION/FILE, not TLS (template-relative st_value would need
+/// PT_TLS translation and the consumers this serves sweep text/data),
+/// name not graft-internal, and st_value inside a slack region or an
+/// appended past-base PT_LOAD. st_shndx is retargeted to the combined
+/// section covering the address; SHN_ABS when nothing does (appended
+/// loads have segment identity, not section identity).
+///
+/// Skipped with a note when any section references the symtab via
+/// sh_link (REL/RELA/GROUP/SYMTAB_SHNDX/HASH): those hold symbol
+/// *indices*, which the rebuild shifts. Fully linked static
+/// executables — the only input combine accepts — don't carry them.
+///
+/// Returns `(symbols_added, bytes_appended)`.
+fn merge_symtab(
+    out: &mut Vec<u8>,
+    overlay_bytes: &[u8],
+    class: ElfClass,
+    slack_regions: &[SlackRegion],
+    append_loads: &[Phdr],
+    output_path: &Path,
+) -> Result<(usize, u64)> {
+    let (e_shoff, shentsize, shdrs) = read_shdrs(out, class).context("combined SHT")?;
+    let Some(symtab_idx) = shdrs.iter().position(|s| s.sh_type == SHT_SYMTAB) else {
+        crate::telemetry::note(output_path, "graft combine: base has no .symtab — symbol merge skipped");
+        return Ok((0, 0));
+    };
+    if let Some(referrer) = shdrs
+        .iter()
+        .position(|s| s.sh_type != SHT_NULL && s.sh_link as usize == symtab_idx)
+    {
+        crate::telemetry::note(
+            output_path,
+            &format!(
+                "graft combine: section {referrer} references .symtab by index \
+                 (sh_link) — symbol merge skipped to keep indices stable"
+            ),
+        );
+        return Ok((0, 0));
+    }
+    let symtab = &shdrs[symtab_idx];
+    let strtab_idx = symtab.sh_link as usize;
+    let strtab = shdrs
+        .get(strtab_idx)
+        .ok_or_else(|| anyhow!(".symtab sh_link {strtab_idx} out of range"))?;
+    if symtab.sh_entsize != sym_entsize(class) {
+        bail!(
+            ".symtab entsize {} != expected {} — refusing symbol merge",
+            symtab.sh_entsize,
+            sym_entsize(class)
+        );
+    }
+    let base_syms = decode_syms(
+        &out[symtab.sh_offset as usize..(symtab.sh_offset + symtab.sh_size) as usize],
+        class,
+    );
+    let base_strtab =
+        out[strtab.sh_offset as usize..(strtab.sh_offset + strtab.sh_size) as usize].to_vec();
+
+    // Overlay side: raw symtab + strtab from overlay.elf.
+    let (_, _, ov_shdrs) = read_shdrs(overlay_bytes, class).context("overlay SHT")?;
+    let Some(ov_symtab) = ov_shdrs.iter().find(|s| s.sh_type == SHT_SYMTAB) else {
+        return Ok((0, 0));
+    };
+    let ov_strtab = ov_shdrs
+        .get(ov_symtab.sh_link as usize)
+        .ok_or_else(|| anyhow!("overlay .symtab sh_link out of range"))?;
+    let ov_syms = decode_syms(
+        &overlay_bytes
+            [ov_symtab.sh_offset as usize..(ov_symtab.sh_offset + ov_symtab.sh_size) as usize],
+        class,
+    );
+    let ov_names =
+        &overlay_bytes[ov_strtab.sh_offset as usize..(ov_strtab.sh_offset + ov_strtab.sh_size) as usize];
+    let name_of = |off: u32| -> Option<&str> {
+        let start = off as usize;
+        let end = ov_names[start..].iter().position(|&b| b == 0)? + start;
+        std::str::from_utf8(&ov_names[start..end]).ok()
+    };
+
+    let in_span = |v: u64| {
+        slack_regions.iter().any(|r| v >= r.start && v < r.start + r.len)
+            || append_loads.iter().any(|p| v >= p.p_vaddr && v < p.p_vaddr + p.p_memsz)
+    };
+    // Combined section covering an address → st_shndx retarget.
+    let covering = |v: u64| -> u16 {
+        shdrs
+            .iter()
+            .position(|s| {
+                s.sh_flags & u64::from(SHF_ALLOC) != 0
+                    && v >= s.sh_addr
+                    && v < s.sh_addr + s.sh_size
+            })
+            .map_or(SHN_ABS, |i| i as u16)
+    };
+
+    let mut adds: Vec<RawSym> = Vec::new();
+    let mut new_strtab = base_strtab;
+    for s in ov_syms.iter().skip(1) {
+        let ty = s.info & 0xf;
+        if ty == STT_SECTION || ty == STT_FILE || ty == STT_TLS {
+            continue;
+        }
+        if s.shndx == SHN_UNDEF as u16 || s.shndx >= SHN_LORESERVE as u16 {
+            continue;
+        }
+        if !in_span(s.value) {
+            continue;
+        }
+        let Some(name) = name_of(s.name_off) else { continue };
+        if name.is_empty() || name.starts_with("__graft") || name.starts_with("_graft") {
+            continue;
+        }
+        let name_off = u32::try_from(new_strtab.len())?;
+        new_strtab.extend_from_slice(name.as_bytes());
+        new_strtab.push(0);
+        adds.push(RawSym { name_off, shndx: covering(s.value), ..*s });
+    }
+    if adds.is_empty() {
+        return Ok((0, 0));
+    }
+
+    // Rebuild: locals (base order, null entry first) ++ overlay locals
+    // ++ base globals ++ overlay globals.
+    let is_local = |s: &RawSym| s.info >> 4 == 0;
+    let mut table: Vec<u8> = Vec::with_capacity(
+        (base_syms.len() + adds.len()) * sym_entsize(class) as usize,
+    );
+    let mut n_locals = 0usize;
+    for s in base_syms.iter().filter(|s| is_local(s)).chain(adds.iter().filter(|s| is_local(s))) {
+        encode_sym(&mut table, s, class);
+        n_locals += 1;
+    }
+    for s in base_syms.iter().filter(|s| !is_local(s)).chain(adds.iter().filter(|s| !is_local(s))) {
+        encode_sym(&mut table, s, class);
+    }
+
+    // Append both tables at EOF; patch the two shdrs in place.
+    while out.len() % 8 != 0 {
+        out.push(0);
+    }
+    let symtab_off = out.len() as u64;
+    out.extend_from_slice(&table);
+    let strtab_off = out.len() as u64;
+    out.extend_from_slice(&new_strtab);
+    let appended = (table.len() + new_strtab.len()) as u64;
+
+    let patch = |out: &mut Vec<u8>, idx: usize, off: u64, size: u64, info: Option<u32>| -> Result<()> {
+        let slot = e_shoff as usize + idx * shentsize;
+        match class {
+            ElfClass::Elf32 => {
+                out[slot + 0x10..slot + 0x14].copy_from_slice(&u32::try_from(off)?.to_le_bytes());
+                out[slot + 0x14..slot + 0x18].copy_from_slice(&u32::try_from(size)?.to_le_bytes());
+                if let Some(i) = info {
+                    out[slot + 0x1c..slot + 0x20].copy_from_slice(&i.to_le_bytes());
+                }
+            }
+            ElfClass::Elf64 => {
+                out[slot + 0x18..slot + 0x20].copy_from_slice(&off.to_le_bytes());
+                out[slot + 0x20..slot + 0x28].copy_from_slice(&size.to_le_bytes());
+                if let Some(i) = info {
+                    out[slot + 0x2c..slot + 0x30].copy_from_slice(&i.to_le_bytes());
+                }
+            }
+        }
+        Ok(())
+    };
+    patch(out, symtab_idx, symtab_off, table.len() as u64, Some(u32::try_from(n_locals)?))?;
+    patch(out, strtab_idx, strtab_off, new_strtab.len() as u64, None)?;
+
+    Ok((adds.len(), appended))
 }
 
 /// Merge base's and the overlay's `.eh_frame_hdr` lookup tables and

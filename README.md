@@ -101,7 +101,9 @@ Known gaps in the combined output:
   crash addresses inside edited functions to correct symbols and
   source lines, and breakpoints on edited functions resolve as
   multi-location (stale base copy + live slack copy — only the live
-  one ever fires). The combined ELF grows by roughly the size of
+  one ever fires). The overlay's symbols are also merged into the
+  combined `.symtab`, so symtab-only tools (nm, `addr2line -f`,
+  nearest-symbol sweeps) name grafted code too. The combined ELF grows by roughly the size of
   base's debug sections (they're re-appended; the originals become
   dead file space) — file-level only, the loaded/flashed image is
   unchanged.
