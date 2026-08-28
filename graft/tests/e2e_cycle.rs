@@ -808,6 +808,39 @@ fn overlay_debug_info_merges_into_combined() {
         log.contains("overlay symbol(s) into .symtab"),
         "no symtab-merge note in graft log:\n{log}"
     );
+
+    // Marker hygiene: the overlay link's script mints its own copies
+    // of zero-size NOTYPE layout markers (`__bss_start`, `_end`, …; on
+    // esp-idf also `__build_id_start`) at slack addresses. Those must
+    // NOT merge — name-keyed consumers assume marker names are unique,
+    // and a duplicate silently shadows base's (real fleet-OTA
+    // incident: the duplicated `__build_id_start` made the updater
+    // read the wrong build-id window and refuse every vehicle). Only
+    // FUNC/OBJECT content symbols may appear more than once (the
+    // intended two-copy semantics for edited functions).
+    {
+        use object::{Object, ObjectSymbol, SymbolKind};
+        let elf = object::File::parse(&combined_bytes[..]).unwrap();
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for s in elf.symbols() {
+            // Global scope only: local names (per-object labels like
+            // GCC_except_tableN, STT_FILE names) legitimately collide
+            // in any linked binary, base's included. Script markers
+            // are global — that's where a duplicate shadows.
+            if s.is_global() && s.kind() != SymbolKind::Text && s.kind() != SymbolKind::Data {
+                if let Ok(n) = s.name()
+                    && !n.is_empty()
+                {
+                    *counts.entry(n.to_string()).or_default() += 1;
+                }
+            }
+        }
+        let dups: Vec<_> = counts.iter().filter(|&(_, &c)| c > 1).collect();
+        assert!(
+            dups.is_empty(),
+            "non-content symbol names duplicated in combined symtab: {dups:?}"
+        );
+    }
 }
 
 /// Argv guard (schema v11): a linker-flag change between base and

@@ -38,7 +38,7 @@ use object::{
     Object, ObjectSection, ObjectSymbol, SectionFlags,
     elf::{
         PT_GNU_EH_FRAME, PT_LOAD, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_ABS, SHN_LORESERVE,
-        SHN_UNDEF, SHT_NULL, SHT_PROGBITS, SHT_SYMTAB, STT_FILE, STT_SECTION, STT_TLS,
+        SHN_UNDEF, SHT_NULL, SHT_PROGBITS, SHT_SYMTAB, STT_FUNC, STT_OBJECT,
     },
 };
 
@@ -1017,11 +1017,10 @@ fn encode_sym(out: &mut Vec<u8>, s: &RawSym, class: ElfClass) {
 /// copies, the same two-copy semantics the DWARF merge ships.
 ///
 /// Overlay symbols come raw from overlay.elf's symtab (full
-/// st_info/st_other fidelity), filtered to: defined, not
-/// SECTION/FILE, not TLS (template-relative st_value would need
-/// PT_TLS translation and the consumers this serves sweep text/data),
-/// name not graft-internal, and st_value inside a slack region or an
-/// appended past-base PT_LOAD. st_shndx is retargeted to the combined
+/// st_info/st_other fidelity), filtered to: defined **content**
+/// symbols only (STT_FUNC/STT_OBJECT — see the filter comment for why
+/// script markers must never merge), name not graft-internal, and
+/// st_value inside a slack region or an appended past-base PT_LOAD. st_shndx is retargeted to the combined
 /// section covering the address; SHN_ABS when nothing does (appended
 /// loads have segment identity, not section identity).
 ///
@@ -1116,8 +1115,20 @@ fn merge_symtab(
     let mut adds: Vec<RawSym> = Vec::new();
     let mut new_strtab = base_strtab;
     for s in ov_syms.iter().skip(1) {
+        // Content symbols ONLY — functions and data objects, the two
+        // kinds the merge exists to name. Everything else is excluded
+        // by construction, most importantly zero-size NOTYPE
+        // linker-script markers (`__build_id_start`, `__bss_start`,
+        // `_end`, …): the overlay link's script mints its own copies
+        // of those at slack addresses, and name-keyed consumers assume
+        // marker names are unique — a duplicate silently shadows
+        // base's. (Real case: the overlay's `__build_id_start` made a
+        // fleet OTA updater read the overlay's raw ld build-id window
+        // instead of base's composed one and refuse every vehicle.)
+        // STT_TLS also lands here: template-relative st_value would
+        // need PT_TLS translation the consumers this serves don't do.
         let ty = s.info & 0xf;
-        if ty == STT_SECTION || ty == STT_FILE || ty == STT_TLS {
+        if ty != STT_FUNC && ty != STT_OBJECT {
             continue;
         }
         if s.shndx == SHN_UNDEF as u16 || s.shndx >= SHN_LORESERVE as u16 {
