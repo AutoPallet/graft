@@ -43,17 +43,16 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
             .with_context(|| format!("chdir to --ldproxy-cwd {cwd}"))?;
     }
 
-    let link_args = argv::parse(&argv);
+    let argv = argv::expand_response_files(&argv)?;
+    let driver = crate::argv::driver_path(&argv);
+    let linker_argv = argv::driver_link_argv(&argv, &driver)?;
+    let link_args = argv::parse(&linker_argv);
     let output = link_args.output.clone().ok_or_else(|| anyhow!("no -o <path> in argv"))?;
 
-    // Record the flag surface AS RECEIVED, before graft's own additions
-    // below (slack object, --undefined= GC roots, -Map). Overlay
-    // computes its surface over the raw rustc argv too — recording the
-    // augmented argv here would make every overlay refuse. Same for the
-    // -T script content hashes (overlay adds its own layout script
-    // later, after its guard compare).
-    let argv_flags = argv::semantic_flags(&argv);
-    let script_hashes = argv::script_content_hashes(&argv, &link_args.library_paths);
+    // Record the driver's effective flags and scripts before Graft adds slack,
+    // roots or map output. Overlay compares the same expanded command.
+    let argv_flags = argv::semantic_flags(&linker_argv);
+    let script_hashes = argv::script_content_hashes(&linker_argv, &link_args.library_paths);
 
     let t_start = std::time::Instant::now();
 
@@ -61,9 +60,7 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
     // same files (read-only), so there's no contention. Scan sees only
     // the user-supplied inputs — the synthetic slack `.o` (if any) is
     // pure linker-side machinery and shouldn't appear in the call graph.
-    let driver = crate::argv::driver_path(&argv);
-    let (eager_inputs, deferred_inputs) =
-        crate::overlay::resolve_scan_inputs(&link_args, &driver)?;
+    let scan_inputs = crate::overlay::resolve_scan_inputs(&link_args)?;
     let extra_roots = link_args.undefined.clone();
     let wrapped = link_args.wrapped.clone();
     // The trampoline target (from GRAFT_ENTRY_SYMBOL, default `main`).
@@ -74,9 +71,8 @@ pub(crate) fn run(argv: Vec<String>) -> Result<()> {
     let entry_clone = entry_for_scan.clone();
     let scan_handle = std::thread::spawn(move || {
         let t = std::time::Instant::now();
-        let r = scan::run(
-            &eager_inputs,
-            &deferred_inputs,
+        let r = scan::run_ordered(
+            &scan_inputs,
             &extra_roots,
             &wrapped,
             entry_clone.as_deref(),
@@ -347,13 +343,13 @@ pub(crate) fn dup_stats(
         std::env::set_current_dir(&cwd)
             .with_context(|| format!("chdir to --ldproxy-cwd {cwd}"))?;
     }
-    let link_args = argv::parse(&argv);
     let driver = crate::argv::driver_path(&argv);
-    let (eager, deferred) = crate::overlay::resolve_scan_inputs(&link_args, &driver)?;
+    let linker_argv = argv::driver_link_argv(&argv, &driver)?;
+    let link_args = argv::parse(&linker_argv);
+    let scan_inputs = crate::overlay::resolve_scan_inputs(&link_args)?;
     let entry = find_entry_symbol(&[]);
-    let scan_result = scan::run(
-        &eager,
-        &deferred,
+    let scan_result = scan::run_ordered(
+        &scan_inputs,
         &link_args.undefined,
         &link_args.wrapped,
         entry.as_deref(),

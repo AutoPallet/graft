@@ -85,7 +85,10 @@ pub const SCHEMA_VERSION: u16 = 12;
 /// writes into base's smaller slot — silent corruption of whatever ld
 /// placed next. Alignment likewise: byte-identical content demanding
 /// stricter alignment must not anchor to base's placement.
-pub const HASH_ALGO_VERSION: u16 = 2;
+///
+/// v3: archive selection follows the compiler driver's search paths and input
+/// order, including repeated archives, groups and archive-index order.
+pub const HASH_ALGO_VERSION: u16 = 3;
 
 pub const SECTION_MANIFEST: &str = ".graft.manifest";
 pub const SECTION_SECTIONS: &str = ".graft.sections";

@@ -5,9 +5,19 @@
 
 use std::path::{Path, PathBuf};
 
+/// Inputs and archive-group delimiters in linker command-line order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkInput {
+    Path(PathBuf),
+    Library(String),
+    StartGroup,
+    EndGroup,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct LinkArgs {
     pub inputs: Vec<PathBuf>,
+    pub ordered_inputs: Vec<LinkInput>,
     pub output: Option<PathBuf>,
     /// Symbols the link driver has declared "forced undefined" via `-u`
     /// / `--undefined` (either directly or via `-Wl,`). ld treats these
@@ -39,6 +49,15 @@ pub struct LinkArgs {
 }
 
 pub fn parse(argv: &[String]) -> LinkArgs {
+    // Normalize linker-driver spellings before interpreting order-sensitive
+    // inputs. Keep the original argv for forwarding to the compiler driver.
+    let argv: Vec<String> = argv.iter().enumerate().flat_map(|(i, arg)| {
+        if i != 0 && let Some(flags) = arg.strip_prefix("-Wl,") {
+            flags.split(',').map(str::to_owned).collect()
+        } else {
+            vec![arg.clone()]
+        }
+    }).collect();
     let mut out = LinkArgs::default();
     let mut i = 0;
     // argv[0] is graft itself when invoked as a command, or the linker
@@ -48,6 +67,15 @@ pub fn parse(argv: &[String]) -> LinkArgs {
     }
     while i < argv.len() {
         let a = &argv[i];
+        if matches!(a.as_str(), "--start-group" | "-(" | "--end-group" | "-)") {
+            out.ordered_inputs.push(if matches!(a.as_str(), "--start-group" | "-(") {
+                LinkInput::StartGroup
+            } else {
+                LinkInput::EndGroup
+            });
+            i += 1;
+            continue;
+        }
         if a == "-o" {
             if let Some(v) = argv.get(i + 1) {
                 out.output = Some(PathBuf::from(v));
@@ -74,6 +102,7 @@ pub fn parse(argv: &[String]) -> LinkArgs {
         if a == "-l" {
             if let Some(v) = argv.get(i + 1) {
                 out.libs.push(v.clone());
+                out.ordered_inputs.push(LinkInput::Library(v.clone()));
                 i += 2;
                 continue;
             }
@@ -83,6 +112,7 @@ pub fn parse(argv: &[String]) -> LinkArgs {
             && !v.starts_with('-')
         {
             out.libs.push(v.to_string());
+            out.ordered_inputs.push(LinkInput::Library(v.to_string()));
             i += 1;
             continue;
         }
@@ -117,6 +147,7 @@ pub fn parse(argv: &[String]) -> LinkArgs {
         }
         if is_input(a) {
             out.inputs.push(PathBuf::from(a));
+            out.ordered_inputs.push(LinkInput::Path(PathBuf::from(a)));
         }
         i += 1;
     }
@@ -150,6 +181,13 @@ pub fn semantic_flags(argv: &[String]) -> Vec<String> {
     let mut i = if argv.is_empty() { 0 } else { 1 };
     while i < argv.len() {
         let a = &argv[i];
+        // GCC's LTO plugin writes this scratch file during linking. Its random
+        // filename is an output location, not a semantic input.
+        if a.starts_with("-plugin-opt=-fresolution=") {
+            out.push("-plugin-opt=-fresolution=<link-output>".into());
+            i += 1;
+            continue;
+        }
         if is_input(a) {
             i += 1;
             continue;
@@ -210,12 +248,8 @@ pub fn flag_surface_diff(base: &[String], cur: &[String]) -> String {
     if parts.is_empty() { "flag order changed".into() } else { parts.join("; ") }
 }
 
-/// Resolve a `-l<name>` flag to the archive path the linker would
-/// pick. Walks `library_paths` in order, returning the first
-/// `lib<name>.a` that exists. Falls back to the C compiler driver's
-/// `-print-file-name=lib<name>.a` for archives that live in gcc's
-/// own sysroot (libc, libm, libgcc, libstdc++ — not exposed via
-/// argv `-L` flags). Returns `None` if neither finds a match.
+/// Resolve a library against the effective linker search paths supplied by the
+/// compiler driver. Driver specs and multilib choices must already be expanded.
 pub fn resolve_lib(name: &str, library_paths: &[PathBuf]) -> Option<PathBuf> {
     for dir in library_paths {
         let candidate = dir.join(format!("lib{name}.a"));
@@ -224,27 +258,6 @@ pub fn resolve_lib(name: &str, library_paths: &[PathBuf]) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// Like `resolve_lib`, but for archives in the C compiler's own
-/// sysroot (libc / libgcc / libm / libstdc++). Falls through to
-/// `<driver> -print-file-name=lib<name>.a`. The returned path
-/// exists on disk; `None` means the driver couldn't resolve.
-pub fn resolve_lib_via_driver(name: &str, driver: &Path) -> Option<PathBuf> {
-    let out = std::process::Command::new(driver)
-        .arg(format!("-print-file-name=lib{name}.a"))
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let line = std::str::from_utf8(&out.stdout).ok()?.trim();
-    if line.is_empty() || line == format!("lib{name}.a") {
-        // gcc echoes the input back when it can't find it.
-        return None;
-    }
-    let p = PathBuf::from(line);
-    p.is_file().then_some(p)
 }
 
 /// Pull the real-linker path out of the argv. Today this is the
@@ -264,12 +277,108 @@ pub fn driver_path(argv: &[String]) -> PathBuf {
     PathBuf::from(std::env::var("GRAFT_REAL_LD").unwrap_or_else(|_| "cc".into()))
 }
 
+/// Ask the compiler driver to expand response files, specs and multilib options
+/// without executing the linker. This supplies the same ordered inputs and
+/// library search paths that the real link will use.
+pub fn driver_link_argv(argv: &[String], driver: &Path) -> anyhow::Result<Vec<String>> {
+    use anyhow::{Context, bail};
+    // With an @file on its command line, GCC can hide inputs in a temporary
+    // response file that is deleted before -### returns.
+    let argv = expand_response_files(argv)?;
+    let mut command = std::process::Command::new(driver);
+    let mut index = 1;
+    while index < argv.len() {
+        if matches!(argv[index].as_str(), "--ldproxy-linker" | "--ldproxy-cwd") {
+            index += 2;
+            continue;
+        }
+        command.arg(&argv[index]);
+        index += 1;
+    }
+    let output = command.arg("-###").output()
+        .with_context(|| format!("query linker command from {}", driver.display()))?;
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        bail!("compiler driver query failed: {diagnostic}");
+    }
+    for line in diagnostic.lines().rev() {
+        let Some(args) = shlex::split(line) else { continue; };
+        let Some(program) = args.first() else { continue; };
+        let name = Path::new(program).file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if name == "collect2" || name == "ld" || name.starts_with("ld.") || name.ends_with("-ld") {
+            return expand_response_files(&args);
+        }
+    }
+    bail!("compiler driver did not report a linker command: {diagnostic}")
+}
+
+/// Expand nested GNU response files before scanning or rewriting inputs.
+/// Relative paths are resolved against the linker's working directory.
+pub fn expand_response_files(argv: &[String]) -> anyhow::Result<Vec<String>> {
+    use anyhow::{Context, bail};
+    let mut args = argv.to_vec();
+    let mut index = 1;
+    let mut expanded = 0;
+    while index < args.len() {
+        let Some(path) = args[index].strip_prefix('@') else {
+            index += 1;
+            continue;
+        };
+        expanded += 1;
+        if expanded > 2000 { bail!("too many nested response files"); }
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("read linker response file {path}"))?;
+        let tokens = response_tokens(&contents)
+            .with_context(|| format!("parse linker response file {path}"))?;
+        args.splice(index..=index, tokens);
+    }
+    Ok(args)
+}
+
+fn response_tokens(contents: &str) -> anyhow::Result<Vec<String>> {
+    use anyhow::bail;
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut started = false;
+    let mut chars = contents.chars();
+    while let Some(c) = chars.next() {
+        if c == '\0' { bail!("NUL in response file"); }
+        if c == '\\' {
+            // GCC versions disagree on backslashes inside quotes and escaped
+            // newlines. Refuse these forms instead of changing their meaning.
+            if quote.is_some() { bail!("backslash inside quoted response-file argument is unsupported"); }
+            let escaped = chars.next().ok_or_else(|| anyhow::anyhow!("trailing response-file backslash"))?;
+            if matches!(escaped, '\n' | '\r' | '\0') { bail!("escaped newline or NUL in response file is unsupported"); }
+            token.push(escaped);
+            started = true;
+        } else if quote == Some(c) {
+            quote = None;
+        } else if quote.is_none() && matches!(c, '\'' | '"') {
+            quote = Some(c);
+            started = true;
+        } else if quote.is_none() && c.is_ascii_whitespace() {
+            if started { tokens.push(std::mem::take(&mut token)); }
+            started = false;
+        } else {
+            token.push(c);
+            started = true;
+        }
+    }
+    if quote.is_some() { bail!("unterminated quote in response file"); }
+    if started { tokens.push(token); }
+    Ok(tokens)
+}
+
 struct Undefined<'a> {
     rhs: std::borrow::Cow<'a, str>,
     consumed_next: bool,
 }
 
-fn extract_wrap<'a>(cur: &'a str, _next: Option<&'a str>) -> Option<Undefined<'a>> {
+fn extract_wrap<'a>(cur: &'a str, next: Option<&'a str>) -> Option<Undefined<'a>> {
+    if cur == "--wrap" {
+        return next.map(|s| Undefined { rhs: s.into(), consumed_next: true });
+    }
     if let Some(s) = cur.strip_prefix("--wrap=") {
         return Some(Undefined { rhs: s.into(), consumed_next: false });
     }
@@ -360,14 +469,22 @@ pub fn is_input(s: &str) -> bool {
 /// Stub `-l<name>` archives (linker scripts with `.a` extension, e.g.
 /// `libesp_rom_sys.a`) are NOT in `stripped_libs` and therefore stay
 /// forwarded — ld processes them as scripts, the same as a `-T` arg.
-pub fn forwarded_link_args<'a>(
-    argv: &'a [String],
+pub fn forwarded_link_args(
+    argv: &[String],
     stripped_libs: &std::collections::HashSet<String>,
-) -> Vec<&'a str> {
+) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = if argv.is_empty() { 0 } else { 1 };
     while i < argv.len() {
         let a = &argv[i];
+        if let Some(flags) = a.strip_prefix("-Wl,") {
+            let nested: Vec<_> = std::iter::once("ld".to_owned())
+                .chain(flags.split(',').map(str::to_owned)).collect();
+            let kept = forwarded_link_args(&nested, stripped_libs);
+            if !kept.is_empty() { out.push(format!("-Wl,{}", kept.join(","))); }
+            i += 1;
+            continue;
+        }
         if is_input(a) {
             i += 1;
             continue;
@@ -402,7 +519,7 @@ pub fn forwarded_link_args<'a>(
         // `-T esp32s3.peripherals.ld -L .../soc/esp32s3/ld`). With every
         // walked `-l<name>` stripped above, archive search is moot;
         // the `-L`s only matter for script and stub-`-l` resolution.
-        out.push(a.as_str());
+        out.push(a.clone());
         i += 1;
     }
     out
@@ -504,6 +621,75 @@ mod tests {
         // -T<attached> spelling matches the two-token spelling.
         let attached = s(&["ld", &format!("-T{}", dir.path().join("periph.ld").display())]);
         assert_eq!(resolved, script_content_hashes(&attached, &[]));
+    }
+
+    #[test]
+    fn preserves_paths_libraries_repeats_and_groups_in_order() {
+        use LinkInput::*;
+        let args = parse(&s(&["cc", "main.o", "first.a", "-l", "middle",
+            "-Wl,--start-group,-llast,first.a,--end-group", "-lmiddle"]));
+        assert_eq!(args.ordered_inputs, vec![Path("main.o".into()), Path("first.a".into()),
+            Library("middle".into()), StartGroup, Library("last".into()),
+            Path("first.a".into()), EndGroup, Library("middle".into())]);
+    }
+
+    #[test]
+    fn parses_multiple_wrapped_roots_and_wraps() {
+        let args = parse(&s(&["cc", "-Wl,-u,first,--undefined=second,--wrap,rand,--wrap=other"]));
+        assert_eq!(args.undefined, s(&["first", "second"]));
+        assert_eq!(args.wrapped, s(&["rand", "other"]));
+    }
+
+    #[test]
+    fn forwarding_removes_scanned_inputs_inside_driver_flags() {
+        let args = s(&["cc", "main.o", "-Wl,--start-group,-lfirst,other.a,-lstub,--end-group", "-o", "app"]);
+        let stripped = std::collections::HashSet::from(["first".to_owned()]);
+        assert_eq!(forwarded_link_args(&args, &stripped), s(&["-Wl,--start-group,-lstub,--end-group"]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compiler_specs_and_response_files_select_library_search_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let selected = dir.path().join("selected");
+        std::fs::create_dir(&selected).unwrap();
+        std::fs::write(selected.join("libchoice.a"), b"").unwrap();
+        let specs = dir.path().join("selection.specs");
+        std::fs::write(&specs, format!("%rename link original_link\n*link:\n-L{} %(original_link)\n", selected.display())).unwrap();
+        let response = dir.path().join("flags with spaces");
+        std::fs::write(&response, format!("\"-specs={}\" -nostdlib -lchoice", specs.display())).unwrap();
+        let output = dir.path().join("must_not_be_created");
+        let args = vec!["graft".into(), "--ldproxy-linker".into(), "gcc".into(),
+            "--ldproxy-cwd".into(), dir.path().display().to_string(),
+            format!("@{}", response.display()), "missing.o".into(),
+            "-o".into(), output.display().to_string()];
+        let expanded = driver_link_argv(&args, Path::new("gcc")).unwrap();
+        let parsed = parse(&expanded);
+        assert_eq!(resolve_lib("choice", &parsed.library_paths), Some(selected.join("libchoice.a")));
+        assert!(parsed.libs.contains(&"choice".to_owned()));
+        assert!(!output.exists(), "driver query must not execute the linker");
+        let before = semantic_flags(&expanded);
+        let repeated = driver_link_argv(&args, Path::new("gcc")).unwrap();
+        assert_eq!(before, semantic_flags(&repeated), "compiler scratch paths must not invalidate the base");
+        std::fs::write(&response, format!("\"-specs={}\" -nostdlib -lchoice -Wl,--defsym=changed=1", specs.display())).unwrap();
+        let after = driver_link_argv(&args, Path::new("gcc")).unwrap();
+        assert_ne!(before, semantic_flags(&after), "response-file flag edits must invalidate the base");
+    }
+
+    #[test]
+    fn response_file_quoting_and_nesting() {
+        assert_eq!(response_tokens("'two words' escaped\\ space #literal \"\" plain").unwrap(),
+            s(&["two words", "escaped space", "#literal", "", "plain"]));
+        assert!(response_tokens("'ambiguous\\quote'").is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("inner");
+        let outer = dir.path().join("outer");
+        std::fs::write(&inner, "-lfirst main.o").unwrap();
+        std::fs::write(&outer, format!("@{} -lsecond", inner.display())).unwrap();
+        assert_eq!(expand_response_files(&s(&["cc", &format!("@{}", outer.display())])).unwrap(),
+            s(&["cc", "-lfirst", "main.o", "-lsecond"]));
+        std::fs::write(&inner, format!("@{}", outer.display())).unwrap();
+        assert!(expand_response_files(&s(&["cc", &format!("@{}", outer.display())])).is_err());
     }
 
     #[test]

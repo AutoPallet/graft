@@ -63,7 +63,10 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
             .with_context(|| format!("chdir to --ldproxy-cwd {cwd}"))?;
     }
 
-    let link_args = argv::parse(&argv);
+    let argv = argv::expand_response_files(&argv)?;
+    let driver = crate::argv::driver_path(&argv);
+    let linker_argv = argv::driver_link_argv(&argv, &driver)?;
+    let link_args = argv::parse(&linker_argv);
     let output = link_args
         .output
         .clone()
@@ -77,7 +80,7 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
     // a -T script swap, a --wrap addition, …) alters link semantics
     // invisibly to the content hashes, so a mismatch refuses before
     // the scan; auto converts that into a full relink.
-    let cur_flags = crate::argv::semantic_flags(&argv);
+    let cur_flags = crate::argv::semantic_flags(&linker_argv);
     if cur_flags != base.manifest.argv_flags {
         bail!(
             "overlay refused: linker flags changed since the base link \
@@ -89,9 +92,9 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
     }
     // Script-content guard: the flag surface records -T script NAMES;
     // an in-place edit (memory.x PROVIDE/KEEP/placement changes) needs
-    // the content hashes. Computed over the raw rustc argv, before
+    // the content hashes. Computed over the expanded linker argv, before
     // graft's own layout-script additions — same basis as base.
-    let cur_scripts = crate::argv::script_content_hashes(&argv, &link_args.library_paths);
+    let cur_scripts = crate::argv::script_content_hashes(&linker_argv, &link_args.library_paths);
     if cur_scripts != base.manifest.script_hashes {
         bail!(
             "overlay refused: a -T linker script's content changed since the \
@@ -116,12 +119,10 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
         );
     }
 
-    let driver = crate::argv::driver_path(&argv);
-    let (eager_inputs, deferred_inputs) = resolve_scan_inputs(&link_args, &driver)?;
+    let scan_inputs = resolve_scan_inputs(&link_args)?;
     let t_scan_start = std::time::Instant::now();
-    let scan = scan::run(
-        &eager_inputs,
-        &deferred_inputs,
+    let scan = scan::run_ordered(
+        &scan_inputs,
         &link_args.undefined,
         &link_args.wrapped,
         Some(base.manifest.entry_symbol.as_str()),
@@ -351,8 +352,7 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
         .libs
         .iter()
         .filter_map(|name| {
-            let path = crate::argv::resolve_lib(name, &link_args.library_paths)
-                .or_else(|| crate::argv::resolve_lib_via_driver(name, &driver))?;
+            let path = crate::argv::resolve_lib(name, &link_args.library_paths)?;
             let canon = std::fs::canonicalize(&path).unwrap_or(path);
             scan.walked_archives.contains(&canon).then(|| name.clone())
         })
@@ -651,18 +651,13 @@ pub(crate) fn run_with_base(argv: Vec<String>, base_path: PathBuf) -> Result<()>
     Ok(())
 }
 
-/// Compose the scan inputs, split into eager and deferred buckets:
-///   - **eager**: `.o` and `.rlib` paths that always parse fully.
-///   - **deferred**: `.a` archives (direct paths from argv + every
-///     `-l<name>` resolved against `-L` paths or the driver sysroot)
-///     where members get parsed only when reachability demands it.
-/// `-l<name>` flags that don't resolve are skipped (e.g. linker-script
-/// stubs that ld processes directly); the link step still gets them
-/// via forwarded argv.
+/// Resolve library flags without changing their positions relative to explicit
+/// paths, repeated archives, or group delimiters.
 pub(crate) fn resolve_scan_inputs(
     args: &crate::argv::LinkArgs,
-    driver: &Path,
-) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+) -> Result<Vec<crate::scan::ScanInput>> {
+    use crate::argv::LinkInput;
+    use crate::scan::ScanInput;
     if args.whole_archive {
         bail!(
             "graft: link argv uses --whole-archive, which force-loads archive \
@@ -671,23 +666,22 @@ pub(crate) fn resolve_scan_inputs(
              GRAFT=passthrough (or unset GRAFT) for this link."
         );
     }
-    let mut eager: Vec<PathBuf> = Vec::new();
-    let mut deferred: Vec<PathBuf> = Vec::new();
-    for p in &args.inputs {
-        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
-        match ext {
-            "a" => deferred.push(p.clone()),
-            _ => eager.push(p.clone()),
+    let mut inputs = Vec::new();
+    let mut libraries = HashMap::new();
+    for input in &args.ordered_inputs {
+        match input {
+            LinkInput::Path(path) => inputs.push(ScanInput::File(path.clone())),
+            LinkInput::Library(name) => {
+                let resolved = libraries.entry(name).or_insert_with(|| {
+                    crate::argv::resolve_lib(name, &args.library_paths)
+                });
+                if let Some(path) = resolved { inputs.push(ScanInput::File(path.clone())); }
+            }
+            LinkInput::StartGroup => inputs.push(ScanInput::StartGroup),
+            LinkInput::EndGroup => inputs.push(ScanInput::EndGroup),
         }
     }
-    for name in &args.libs {
-        let resolved = crate::argv::resolve_lib(name, &args.library_paths)
-            .or_else(|| crate::argv::resolve_lib_via_driver(name, driver));
-        if let Some(path) = resolved {
-            deferred.push(path);
-        }
-    }
-    Ok((eager, deferred))
+    Ok(inputs)
 }
 
 fn work_dir_for(output: &Path) -> PathBuf {
@@ -2678,6 +2672,22 @@ mod tests {
         let overlay = fake_elf(&[(".graft.audit.initfini", 0, b"\0\0\0\0\0\0\0\0")]);
         let err = check_overlay_sections(&overlay, &base).unwrap_err().to_string();
         assert!(err.contains("init_array"), "{err}");
+    }
+
+    #[test]
+    fn resolved_libraries_keep_their_command_line_positions() {
+        use crate::scan::ScanInput::*;
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.a");
+        let middle = dir.path().join("libmiddle.a");
+        std::fs::write(&middle, b"").unwrap();
+        let args = crate::argv::parse(&["cc".into(), "main.o".into(),
+            first.display().to_string(), format!("-L{}", dir.path().display()),
+            "-Wl,--start-group,-lmiddle".into(), first.display().to_string(),
+            "-Wl,--end-group".into()]);
+        let resolved = resolve_scan_inputs(&args).unwrap();
+        assert_eq!(resolved, vec![File("main.o".into()), File(first.clone()),
+            StartGroup, File(middle), File(first), EndGroup]);
     }
 
     /// Build a scan over one synthesized object: changed `main`
