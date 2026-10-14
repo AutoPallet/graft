@@ -789,6 +789,10 @@ pub fn rebuild_archive_for_tests(
 pub fn substitute_argv(argv: Vec<String>, replacements: &HashMap<PathBuf, PathBuf>) -> Vec<String> {
     argv.into_iter()
         .map(|tok| {
+            if let Some(flags) = tok.strip_prefix("-Wl,") {
+                let nested = flags.split(',').map(str::to_owned).collect();
+                return format!("-Wl,{}", substitute_argv(nested, replacements).join(","));
+            }
             if tok.starts_with('-') {
                 return tok;
             }

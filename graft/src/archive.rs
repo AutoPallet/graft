@@ -125,7 +125,7 @@ pub fn collect_eager<P: AsRef<Path> + Sync>(paths: &[P]) -> Result<CollectResult
 
 /// A `.a` archive opened for on-demand member parsing. We've read the
 /// archive's symbol-index (the `/` member in System V format) into
-/// `symbol_to_offset` but haven't parsed any individual `.o` member
+/// `symbols` but haven't parsed any individual `.o` member
 /// yet — `parse_member` does that lazily as the scan reachability
 /// walk discovers references.
 pub struct DeferredArchive {
@@ -139,9 +139,9 @@ pub struct DeferredArchive {
     /// `data()` results into `ObjectInput::bytes` as `to_vec()`s
     /// later.
     pub bytes: Vec<u8>,
-    /// `symbol_name → archive_offset` of the member that defines it.
-    /// Built once at open time from the archive's index.
-    pub symbol_to_offset: std::collections::HashMap<String, u64>,
+    /// Symbol names and member offsets in archive-index order, including
+    /// duplicate definitions. Member extraction follows this order.
+    pub symbols: Vec<(String, u64)>,
 }
 
 impl DeferredArchive {
@@ -156,18 +156,13 @@ impl DeferredArchive {
         }
         let archive = ArchiveFile::parse(&*bytes)
             .map_err(|e| anyhow!("parse archive {}: {e}", path.display()))?;
-        let mut sym_to_off: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut indexed_symbols = Vec::new();
         match archive.symbols().map_err(|e| anyhow!("{e}"))? {
             Some(symbols) => {
                 for sym_result in symbols {
                     let sym = sym_result.map_err(|e| anyhow!("{e}"))?;
                     if let Ok(name) = std::str::from_utf8(sym.name()) {
-                        // First defining member wins. Mirrors ld's
-                        // archive-resolution semantics (left-to-right
-                        // search, first hit binds).
-                        sym_to_off
-                            .entry(name.to_string())
-                            .or_insert(sym.offset().0);
+                        indexed_symbols.push((name.to_string(), sym.offset().0));
                     }
                 }
             }
@@ -199,12 +194,12 @@ impl DeferredArchive {
             path: path.to_path_buf(),
             canon_path,
             bytes,
-            symbol_to_offset: sym_to_off,
+            symbols: indexed_symbols,
         }))
     }
 
     /// Parse the archive member located at `member_offset` (typically
-    /// obtained from `symbol_to_offset`) and return it as a regular
+    /// obtained from `symbols`) and return it as a regular
     /// `ObjectInput` ready for `elf::parse`.
     pub fn parse_member(&self, member_offset: u64) -> Result<ObjectInput> {
         let archive = ArchiveFile::parse(&*self.bytes)

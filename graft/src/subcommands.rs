@@ -227,11 +227,8 @@ pub fn scan_dump(args: &[String]) -> ExitCode {
         eprintln!("usage: graft scan-dump <input>...");
         return ExitCode::from(2);
     }
-    let inputs: Vec<_> = args.iter().map(std::path::PathBuf::from).collect();
-    let (eager, deferred): (Vec<_>, Vec<_>) = inputs.into_iter().partition(|p| {
-        p.extension().and_then(|e| e.to_str()) != Some("a")
-    });
-    let scan_result = match scan::run(&eager, &deferred, &[], &[], None) {
+    let inputs: Vec<_> = args.iter().map(|p| scan::ScanInput::File(p.into())).collect();
+    let scan_result = match scan::run_ordered(&inputs, &[], &[], None) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("graft scan-dump: {e:#}");
